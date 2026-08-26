@@ -16,12 +16,11 @@
 //! `general_LumaToYUV444` / `general_ChromaV1ToYUV444`
 //! (`libfreerdp/primitives/prim_YUV.c`, Apache-2.0); they're the canonical
 //! reference because every real AVC444 client in the wild today is FreeRDP- or
-//! mstsc-based and decodes against the same scheme. The split is *not* a
-//! verbatim port: FreeRDP's `general_YUV444SplitToYUV420` swaps U and V in the
-//! main view's chroma (writes `pU[x] = pSrcV[2*x]`) which contradicts both the
-//! §3.3.8.3.2 pseudo-code and FreeRDP's own combine, and is unreachable through
-//! their normal RGB→AVC444YUV server path. This implementation follows the spec
-//! pseudo-code instead, verified by the roundtrip test below.
+//! mstsc-based and decodes against the same scheme. The production RGB→AVC444
+//! paths in FreeRDP and other interoperable servers apply a 2×2 box filter for
+//! B2/B3. This is important: the decoder's optional reverse filter is designed
+//! around that average. The generic FreeRDP split primitive has a historical
+//! U/V swap and is not the production RGB path, so it is not copied here.
 //!
 //! Buffer-size contract:
 //! - **Width and height MUST be even.** [MS-RDPEGFX] §2.2.4.4 requires
@@ -34,7 +33,7 @@
 //! - All planes are tightly packed with `stride = plane_width` in the test
 //!   helpers; the production API takes explicit strides.
 
-#![allow(dead_code)] // wired into the h264 pipeline in a follow-up commit
+#![allow(dead_code)] // decoder-side combine helpers are retained for roundtrip validation
 
 /// Height the auxiliary Y plane must be allocated to. Matches FreeRDP's
 /// `padHeigth = height + 16 - height % 16`. Adds 16 when already aligned, which
@@ -85,16 +84,30 @@ pub fn split_yuv444_to_yuv420_v1(
         dst_row.copy_from_slice(src_row);
     }
 
-    // B2, B3: main U/V = even-row even-column samples (the standard 4:2:0
-    // subsample). Per §3.3.8.3.2 pseudo-code: B2[x,y] = U444[2x, 2y].
+    // B2, B3: main U/V = a 2x2 box-filtered sample. This matches FreeRDP's
+    // production RGBToAVC444YUV path and the decoder's reverse-filter model;
+    // selecting only the top-left sample produces unstable colored edges once
+    // the auxiliary view is quantized by H.264.
     for y in 0..half_height {
-        let src_u_row = &src_u[2 * y * src_stride_u..2 * y * src_stride_u + width];
-        let src_v_row = &src_v[2 * y * src_stride_v..2 * y * src_stride_v + width];
+        let src_u_top = &src_u[2 * y * src_stride_u..2 * y * src_stride_u + width];
+        let src_u_bottom = &src_u[(2 * y + 1) * src_stride_u..(2 * y + 1) * src_stride_u + width];
+        let src_v_top = &src_v[2 * y * src_stride_v..2 * y * src_stride_v + width];
+        let src_v_bottom = &src_v[(2 * y + 1) * src_stride_v..(2 * y + 1) * src_stride_v + width];
         let dst_u_row = &mut main_u[y * main_stride_u..y * main_stride_u + half_width];
         let dst_v_row = &mut main_v[y * main_stride_v..y * main_stride_v + half_width];
         for x in 0..half_width {
-            dst_u_row[x] = src_u_row[2 * x];
-            dst_v_row[x] = src_v_row[2 * x];
+            let left = 2 * x;
+            let right = left + 1;
+            dst_u_row[x] = ((u16::from(src_u_top[left])
+                + u16::from(src_u_top[right])
+                + u16::from(src_u_bottom[left])
+                + u16::from(src_u_bottom[right]))
+                / 4) as u8;
+            dst_v_row[x] = ((u16::from(src_v_top[left])
+                + u16::from(src_v_top[right])
+                + u16::from(src_v_bottom[left])
+                + u16::from(src_v_bottom[right]))
+                / 4) as u8;
         }
     }
 
@@ -326,8 +339,10 @@ mod tests {
         (y, u, v)
     }
 
-    /// End-to-end roundtrip: split full-res YUV444 → main + aux YUV420 →
-    /// combine back to YUV444 → assert pixel-equality with the source.
+    /// End-to-end packing check. B2/B3 intentionally contain a 2×2 chroma
+    /// average; the three samples carried by the auxiliary view remain exact.
+    /// A real client may reverse-filter the remaining even/even sample during
+    /// YUV→RGB conversion.
     fn roundtrip(width: usize, height: usize) {
         let (src_y, src_u, src_v) = synthetic_yuv444(width, height);
 
@@ -383,17 +398,39 @@ mod tests {
         // Y is sent at full resolution; every byte must match.
         assert_eq!(dst_y, src_y, "Y plane mismatch ({width}x{height})");
 
-        // U/V: every sample participated in the split — even-even via B2/B3,
-        // even-odd via B6/B7, odd-* via B4/B5. The whole plane must roundtrip.
+        // U/V: auxiliary-carried samples are exact. The even/even position is
+        // the box-filtered B2/B3 value by design.
         for j in 0..height {
             for i in 0..width {
                 let idx = j * width + i;
+                let expected_u = if i.is_multiple_of(2) && j.is_multiple_of(2) {
+                    let right = idx + 1;
+                    let bottom = idx + width;
+                    ((u16::from(src_u[idx])
+                        + u16::from(src_u[right])
+                        + u16::from(src_u[bottom])
+                        + u16::from(src_u[bottom + 1]))
+                        / 4) as u8
+                } else {
+                    src_u[idx]
+                };
+                let expected_v = if i.is_multiple_of(2) && j.is_multiple_of(2) {
+                    let right = idx + 1;
+                    let bottom = idx + width;
+                    ((u16::from(src_v[idx])
+                        + u16::from(src_v[right])
+                        + u16::from(src_v[bottom])
+                        + u16::from(src_v[bottom + 1]))
+                        / 4) as u8
+                } else {
+                    src_v[idx]
+                };
                 assert_eq!(
-                    dst_u[idx], src_u[idx],
+                    dst_u[idx], expected_u,
                     "U mismatch at ({i},{j}) for {width}x{height}"
                 );
                 assert_eq!(
-                    dst_v[idx], src_v[idx],
+                    dst_v[idx], expected_v,
                     "V mismatch at ({i},{j}) for {width}x{height}"
                 );
             }

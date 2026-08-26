@@ -21,7 +21,7 @@ const RLE_LONG_ESCAPE: u8 = 0xFF;
 ///
 /// `color_loss_level` (1..=7 per MS-RDPNSC) shifts the chroma planes right
 /// by that many bits — higher values lose more chroma precision for smaller
-/// output. We currently advertise CLL=3 in the server caps; the value passed
+/// output. macrdp advertises CLL=1 in the server caps for maximum fidelity; the value passed
 /// here must match what was sent in the `NsCodec` capability or the client
 /// won't decode correctly.
 pub(crate) fn encode(bitmap: &BitmapUpdate, color_loss_level: u8) -> Vec<u8> {

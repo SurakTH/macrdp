@@ -222,11 +222,14 @@ impl RdpServerOptions {
             .any(|codec| matches!(codec.property, CodecProperty::QoiZ))
     }
 
-    fn has_nscodec(&self) -> bool {
+    fn nscodec_color_loss_level(&self) -> Option<u8> {
         self.codecs
             .0
             .iter()
-            .any(|codec| matches!(codec.property, CodecProperty::NsCodec(_)))
+            .find_map(|codec| match &codec.property {
+                CodecProperty::NsCodec(ns) => Some(ns.color_loss_level),
+                _ => None,
+            })
     }
 }
 
@@ -1910,12 +1913,28 @@ impl RdpServer {
                 // connection's RTT-dependent behavior (blank-recovery gating,
                 // adaptive-bitrate seeding) falls back to whatever was last
                 // observed rather than a fresh sample.
-                if let Entry::Fresh(stream, _) = &entry
-                    && let Some(cell) = &self.link_rtt_ms
-                {
-                    let rtt = tcp_srtt_ms(stream).unwrap_or(0);
-                    cell.store(rtt, Ordering::Relaxed);
-                    debug!(?peer, rtt_ms = rtt, "sampled TCP link RTT at accept");
+                if let Entry::Fresh(stream, _) = &entry {
+                    let _ = stream.set_nodelay(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::fd::AsRawFd;
+                        let fd = stream.as_raw_fd();
+                        let sndbuf: libc::c_int = 512 * 1024;
+                        unsafe {
+                            libc::setsockopt(
+                                fd,
+                                libc::SOL_SOCKET,
+                                libc::SO_SNDBUF,
+                                &sndbuf as *const _ as *const libc::c_void,
+                                std::mem::size_of_val(&sndbuf) as libc::socklen_t,
+                            );
+                        }
+                    }
+                    if let Some(cell) = &self.link_rtt_ms {
+                        let rtt = tcp_srtt_ms(stream).unwrap_or(0);
+                        cell.store(rtt, Ordering::Relaxed);
+                        debug!(?peer, rtt_ms = rtt, "sampled TCP link RTT at accept");
+                    }
                 }
                 let started = tokio::time::Instant::now();
 
@@ -3529,13 +3548,17 @@ impl RdpServer {
                                     update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
                                 }
                             }
-                            CodecProperty::NsCodec(client_ns) if self.opts.has_nscodec() => {
-                                // Re-use the client's confirmed color-loss
-                                // level so we encode at the same shift the
-                                // client decodes against.
-                                update_codecs.set_nscodec(Some((codec.id, client_ns.color_loss_level)));
+                            CodecProperty::NsCodec(client_ns) => {
+                                if let Some(server_cll) = self.opts.nscodec_color_loss_level() {
+                                    // Each capability value is the maximum CLL
+                                    // that endpoint supports. Choose the lower
+                                    // maximum so the encoded frame is valid for
+                                    // both peers; macrdp advertises 1 to request
+                                    // the highest-fidelity NSCodec output.
+                                    let negotiated_cll = server_cll.min(client_ns.color_loss_level);
+                                    update_codecs.set_nscodec(Some((codec.id, negotiated_cll)));
+                                }
                             }
-                            CodecProperty::NsCodec(_) => (),
                             #[cfg(feature = "qoi")]
                             CodecProperty::Qoi if self.opts.has_qoi() => {
                                 update_codecs.set_qoi(Some(codec.id));

@@ -10,9 +10,33 @@ Cargo.lock.bak
 /dev-certs/
 *.pem
 *.key
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Local configuration and secrets (examples stay tracked)
+**/.env
+**/.env.*
+!**/.env.example
+/packaging/config.env
+
+# Local logs and generated release bundles
+*.log
+*.log.*
+/dist/*.tar.gz
+/dist/*.tar.gz.sha256
+/dist/*.zip
+/dist/*.zip.sha256
+/artifacts/
+/out/
 
 # macOS
 .DS_Store
+
+# Editors / local tooling
+.idea/
+.vscode/
 
 # SwiftPM build output for the menu-bar controller (gui/)
 /gui/.build/

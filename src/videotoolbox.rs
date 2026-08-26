@@ -1,11 +1,10 @@
-//! VideoToolbox H.264 encoder, fed from `BitmapUpdate`s and producing
-//! compressed H.264 sample buffers for the EGFX (AVC420) path.
+//! VideoToolbox H.264 encoder, fed from captured BGRA frames and producing
+//! compressed H.264 sample buffers for the EGFX AVC420 and AVC444 paths.
 //!
-//! Scoped to "Phase 2 Step 1" of the H.264 plan: get a working
-//! `VTCompressionSession`, push BGRA frames in, collect compressed bytes
-//! out via the output callback. Wiring the output into
-//! `Avc420BitmapStream` and the `GfxServerFactory` bridge is the next
-//! step and lives in `src/h264.rs`.
+//! `Encoder` owns one `VTCompressionSession`; `Avc444Encoder` submits the main
+//! and auxiliary views consecutively through that same session, as required by
+//! MS-RDPEGFX, and owns reusable YUV444 split scratch storage.
+//! The EGFX bridge and wire framing live in `src/h264.rs`.
 //!
 //! Conventions follow `src/auth.rs::pam_impl`: direct `extern "C"`,
 //! no wrapper crate — the call surface here is small. macOS-only.
@@ -26,13 +25,15 @@ use std::sync::mpsc;
 
 use anyhow::{anyhow, bail, Result};
 
+use crate::avc444::split_yuv444_to_yuv420_v1;
+
 /// One H.264 sample as emitted by VideoToolbox. The payload is AVCC-
 /// formatted (length-prefixed NAL units, no start codes). When this is
 /// a keyframe (`is_keyframe = true`), `parameter_sets` carries the
 /// SPS/PPS NALs that the client needs to decode it — these come out of
 /// the `CMFormatDescription` and are required only on keyframes for
 /// Annex-B conversion downstream.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub is_keyframe: bool,
@@ -69,6 +70,134 @@ pub struct Encoder {
     full_range: bool,
 }
 
+/// One VideoToolbox H.264 session plus reusable conversion storage for an RDP
+/// AVC444 v1 frame. AVC444 carries a normal 4:2:0 main view and a second 4:2:0
+/// auxiliary view containing the chroma samples that the main view cannot
+/// represent. MS-RDPEGFX requires both views to be encoded by the *same* H.264
+/// encoder and decoded as one stream; using independent sessions corrupts the
+/// reference chain as soon as inter frames begin.
+pub struct Avc444Encoder {
+    encoder: Encoder,
+    scratch: Avc444Scratch,
+    visible_width: u16,
+    visible_height: u16,
+    /// Stability-first mode: make both pictures in every logical frame IDRs.
+    /// This removes all temporal references from AVC444 while retaining the
+    /// protocol-required single encoder/decoder stream. It costs bandwidth and
+    /// frame rate, but is the safest path for strict Microsoft decoders.
+    all_intra: bool,
+    /// Main uses an even PTS and its matching auxiliary view the following odd
+    /// PTS. The single-session output path uses this invariant to pair views.
+    next_pair_pts: i64,
+}
+
+struct Avc444Scratch {
+    encoded_width: usize,
+    encoded_height: usize,
+    y444: Vec<u8>,
+    u444: Vec<u8>,
+    v444: Vec<u8>,
+    main_y: Vec<u8>,
+    main_u: Vec<u8>,
+    main_v: Vec<u8>,
+    aux_y: Vec<u8>,
+    aux_u: Vec<u8>,
+    aux_v: Vec<u8>,
+}
+
+impl Avc444Scratch {
+    fn new(width: u16, height: u16) -> Result<Self> {
+        let encoded_width = align_16(usize::from(width));
+        let encoded_height = align_16(usize::from(height));
+        let full = encoded_width
+            .checked_mul(encoded_height)
+            .ok_or_else(|| anyhow!("AVC444 dimensions overflow"))?;
+        let chroma = full / 4;
+        Ok(Self {
+            encoded_width,
+            encoded_height,
+            y444: vec![0; full],
+            u444: vec![128; full],
+            v444: vec![128; full],
+            main_y: vec![0; full],
+            main_u: vec![128; chroma],
+            main_v: vec![128; chroma],
+            aux_y: vec![0; full],
+            aux_u: vec![128; chroma],
+            aux_v: vec![128; chroma],
+        })
+    }
+
+    fn prepare(&mut self, bgra: &[u8], stride: usize, width: usize, height: usize) -> Result<()> {
+        // Neutral full-range black in the macroblock padding.  The visible
+        // rectangle is overwritten below; padding is encoded but never mapped
+        // to the RDP surface.
+        self.y444.fill(0);
+        self.u444.fill(128);
+        self.v444.fill(128);
+        self.aux_y.fill(0);
+        self.aux_u.fill(128);
+        self.aux_v.fill(128);
+
+        if ffi::bgra_to_yuv444_planar_vimage(
+            bgra,
+            stride,
+            width,
+            height,
+            &mut self.y444,
+            self.encoded_width,
+            &mut self.u444,
+            self.encoded_width,
+            &mut self.v444,
+            self.encoded_width,
+        )
+        .is_err()
+        {
+            ffi::bgra_to_yuv444_planar_scalar(
+                bgra,
+                stride,
+                width,
+                height,
+                &mut self.y444,
+                self.encoded_width,
+                &mut self.u444,
+                self.encoded_width,
+                &mut self.v444,
+                self.encoded_width,
+            );
+        }
+
+        let half_width = self.encoded_width / 2;
+        split_yuv444_to_yuv420_v1(
+            &self.y444,
+            &self.u444,
+            &self.v444,
+            self.encoded_width,
+            self.encoded_width,
+            self.encoded_width,
+            &mut self.main_y,
+            &mut self.main_u,
+            &mut self.main_v,
+            self.encoded_width,
+            half_width,
+            half_width,
+            &mut self.aux_y,
+            &mut self.aux_u,
+            &mut self.aux_v,
+            self.encoded_width,
+            half_width,
+            half_width,
+            self.encoded_width,
+            self.encoded_height,
+        );
+        Ok(())
+    }
+}
+
+fn align_16(value: usize) -> usize {
+    value.saturating_add(15) & !15
+}
+
 impl Encoder {
     /// Create a new H.264 encoder. `bitrate_bps` is the target average
     /// bitrate; `fps` sets the frame-duration hint used by VT's rate
@@ -80,13 +209,6 @@ impl Encoder {
         bitrate_bps: u32,
         keyframe_secs: f32,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::channel::<EncodedFrame>();
-        // The callback receives the raw `*mut Sender` and clones it per
-        // delivery — see `ffi::output_callback`. Keep the original Box
-        // alive on the Encoder so the pointer stays valid.
-        let tx_box = Box::new(tx);
-        let tx_ptr = Box::as_ref(&tx_box) as *const mpsc::Sender<EncodedFrame> as *mut c_void;
-
         // Default to full-range NV12 — verified to fix mstsc's washed/lighter
         // image while keeping FreeRDP correct. Opt back out to video-range (let
         // VT convert from BGRA) with MACRDP_H264_FULL_RANGE=0 for debugging.
@@ -94,10 +216,35 @@ impl Encoder {
             std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
             Ok("0") | Ok("false") | Ok("FALSE")
         );
+        Self::new_with_range(width, height, fps, bitrate_bps, keyframe_secs, full_range)
+    }
+
+    fn new_with_range(
+        width: u16,
+        height: u16,
+        fps: u32,
+        bitrate_bps: u32,
+        keyframe_secs: f32,
+        full_range: bool,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::channel::<EncodedFrame>();
+        // The callback receives the raw `*mut Sender` and clones it per
+        // delivery — see `ffi::output_callback`. Keep the original Box
+        // alive on the Encoder so the pointer stays valid.
+        let tx_box = Box::new(tx);
+        let tx_ptr = Box::as_ref(&tx_box) as *const mpsc::Sender<EncodedFrame> as *mut c_void;
+
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
+        let session = ffi::create_session(
+            width,
+            height,
+            bitrate_bps,
+            keyframe_frames,
+            tx_ptr,
+            full_range,
+        )?;
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -150,6 +297,15 @@ impl Encoder {
     /// `drain()`. VT calls our output callback on its own thread, so
     /// the channel decouples producer and consumer cleanly.
     pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
+        let row_bytes = usize::from(self.width)
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("width*4 overflows usize"))?;
+        if stride < row_bytes {
+            bail!(
+                "BGRA stride too small: have {stride}, need at least {row_bytes} for width {}",
+                self.width
+            );
+        }
         let expected = stride
             .checked_mul(self.height.into())
             .ok_or_else(|| anyhow!("stride*height overflows usize"))?;
@@ -177,6 +333,46 @@ impl Encoder {
         )
     }
 
+    /// Submit planar YUV420 with an explicit PTS. AVC444 uses this to label
+    /// main/auxiliary views as adjacent even/odd frames in one H.264 stream.
+    fn encode_yuv420_at_pts(
+        &self,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        pts: i64,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        let width = usize::from(self.width);
+        let height = usize::from(self.height);
+        let y_len = width
+            .checked_mul(height)
+            .ok_or_else(|| anyhow!("YUV420 dimensions overflow"))?;
+        let chroma_len = y_len / 4;
+        if y.len() < y_len || u.len() < chroma_len || v.len() < chroma_len {
+            bail!(
+                "YUV420 buffer too small: Y/U/V={}/{}/{}, need {}/{}/{}",
+                y.len(),
+                u.len(),
+                v.len(),
+                y_len,
+                chroma_len,
+                chroma_len
+            );
+        }
+        ffi::encode_yuv420_frame(
+            &self.inner,
+            y,
+            u,
+            v,
+            self.width,
+            self.height,
+            pts,
+            self.fps,
+            force_keyframe,
+        )
+    }
+
     /// Pull every encoded frame the callback has produced so far.
     /// Non-blocking; returns an empty vec if nothing is ready (or the receiver
     /// has been taken for the push pipeline).
@@ -201,6 +397,128 @@ impl Encoder {
     }
 }
 
+impl Avc444Encoder {
+    /// Create a dual-view AVC444 encoder. `bitrate_bps` is the combined wire
+    /// target for the one continuous H.264 stream.
+    pub fn new(
+        width: u16,
+        height: u16,
+        fps: u32,
+        bitrate_bps: u32,
+        keyframe_secs: f32,
+    ) -> Result<Self> {
+        let scratch = Avc444Scratch::new(width, height)?;
+        let encoded_width = u16::try_from(scratch.encoded_width)
+            .map_err(|_| anyhow!("AVC444 padded width exceeds u16"))?;
+        let encoded_height = u16::try_from(scratch.encoded_height)
+            .map_err(|_| anyhow!("AVC444 padded height exceeds u16"))?;
+        // Each logical desktop frame becomes two consecutive H.264 pictures.
+        // Double the session rate so PTS duration and VT's rate-control model
+        // still represent the requested logical frame rate.
+        let stream_fps = fps
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("AVC444 frame rate overflow"))?;
+        // AVC444 is defined in YUV, so it always uses full-range NV12 input;
+        // the AVC420-only debug override must not change its buffer contract.
+        let encoder = Encoder::new_with_range(
+            encoded_width,
+            encoded_height,
+            stream_fps,
+            bitrate_bps,
+            keyframe_secs,
+            true,
+        )?;
+        let all_intra_env = std::env::var("MACRDP_AVC444_ALL_INTRA").ok();
+        let all_intra = avc444_all_intra_setting(all_intra_env.as_deref());
+        Ok(Self {
+            encoder,
+            scratch,
+            visible_width: width,
+            visible_height: height,
+            all_intra,
+            next_pair_pts: 0,
+        })
+    }
+
+    pub fn all_intra(&self) -> bool {
+        self.all_intra
+    }
+
+    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodedFrame>> {
+        self.encoder.take_receiver()
+    }
+
+    pub fn set_bitrate(&self, bitrate_bps: u32) -> Result<()> {
+        self.encoder.set_bitrate(bitrate_bps)
+    }
+
+    pub fn set_keyframe_interval(&self, keyframe_frames: u32) -> Result<()> {
+        self.encoder
+            .set_keyframe_interval(keyframe_frames.saturating_mul(2))
+    }
+
+    pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
+        let width = usize::from(self.visible_width);
+        let height = usize::from(self.visible_height);
+        let row_bytes = width
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("width*4 overflows usize"))?;
+        if stride < row_bytes {
+            bail!("BGRA stride too small for AVC444: have {stride}, need {row_bytes}");
+        }
+        let expected = stride
+            .checked_mul(height)
+            .ok_or_else(|| anyhow!("stride*height overflows usize"))?;
+        if bgra.len() < expected {
+            bail!(
+                "BGRA buffer too small for AVC444: have {}, need {expected}",
+                bgra.len()
+            );
+        }
+
+        self.scratch.prepare(bgra, stride, width, height)?;
+        let (main_pts, auxiliary_pts, next_pair_pts) = avc444_pair_pts(self.next_pair_pts);
+        let (main_keyframe, auxiliary_keyframe) =
+            avc444_pair_keyframes(force_keyframe, self.all_intra);
+        self.encoder.encode_yuv420_at_pts(
+            &self.scratch.main_y,
+            &self.scratch.main_u,
+            &self.scratch.main_v,
+            main_pts,
+            main_keyframe,
+        )?;
+        let auxiliary_result = self.encoder.encode_yuv420_at_pts(
+            &self.scratch.aux_y,
+            &self.scratch.aux_u,
+            &self.scratch.aux_v,
+            auxiliary_pts,
+            auxiliary_keyframe,
+        );
+        // Advance to the next even PTS even if the second submission fails: the
+        // ship loop can then detect and discard the unmatched main picture,
+        // rather than misclassifying the next main picture as auxiliary.
+        self.next_pair_pts = next_pair_pts;
+        auxiliary_result
+    }
+}
+
+fn avc444_pair_pts(next_pair_pts: i64) -> (i64, i64, i64) {
+    (
+        next_pair_pts,
+        next_pair_pts.wrapping_add(1),
+        next_pair_pts.wrapping_add(2),
+    )
+}
+
+fn avc444_pair_keyframes(force_keyframe: bool, all_intra: bool) -> (bool, bool) {
+    let force_pair = force_keyframe || all_intra;
+    (force_pair, force_pair)
+}
+
+fn avc444_all_intra_setting(value: Option<&str>) -> bool {
+    !matches!(value, Some("0" | "false" | "FALSE" | "no" | "NO"))
+}
+
 // VT's compression session is thread-safe according to Apple's docs
 // (frames can be submitted from any thread). The Receiver is !Sync but
 // that's fine — we only call `drain()` from the owning thread.
@@ -223,6 +541,7 @@ mod ffi {
     pub(super) type CFDictionaryRef = CFTypeRef;
     pub(super) type CFArrayRef = CFTypeRef;
     pub(super) type CVPixelBufferRef = CFTypeRef;
+    pub(super) type CVPixelBufferPoolRef = CFTypeRef;
     pub(super) type CVImageBufferRef = CFTypeRef;
     pub(super) type CMSampleBufferRef = CFTypeRef;
     pub(super) type CMBlockBufferRef = CFTypeRef;
@@ -316,6 +635,9 @@ mod ffi {
         pub(super) static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
         pub(super) static kCFBooleanTrue: CFBooleanRef;
         pub(super) static kCFBooleanFalse: CFBooleanRef;
+        pub(super) static kCVPixelBufferWidthKey: CFStringRef;
+        pub(super) static kCVPixelBufferHeightKey: CFStringRef;
+        pub(super) static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
 
         // CFDictionary creation for VT frame-properties payloads.
         // `CFDictionaryKeyCallBacks` / `CFDictionaryValueCallBacks` are
@@ -340,6 +662,11 @@ mod ffi {
             height: usize,
             pixel_format_type: OSType,
             pixel_buffer_attributes: CFDictionaryRef,
+            pixel_buffer_out: *mut CVPixelBufferRef,
+        ) -> i32;
+        pub(super) fn CVPixelBufferPoolCreatePixelBuffer(
+            allocator: CFAllocatorRef,
+            pixel_buffer_pool: CVPixelBufferPoolRef,
             pixel_buffer_out: *mut CVPixelBufferRef,
         ) -> i32;
         pub(super) fn CVPixelBufferLockBaseAddress(
@@ -417,6 +744,9 @@ mod ffi {
         pub(super) fn VTCompressionSessionPrepareToEncodeFrames(
             session: VTCompressionSessionRef,
         ) -> OSStatus;
+        pub(super) fn VTCompressionSessionGetPixelBufferPool(
+            session: VTCompressionSessionRef,
+        ) -> CVPixelBufferPoolRef;
         pub(super) fn VTCompressionSessionEncodeFrame(
             session: VTCompressionSessionRef,
             image_buffer: CVImageBufferRef,
@@ -459,7 +789,76 @@ mod ffi {
         bitrate_bps: u32,
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
+        full_range: bool,
     ) -> Result<SessionGuard> {
+        // Supplying explicit source attributes makes VideoToolbox expose a
+        // matching CVPixelBufferPool. Allocating frames from that pool lets VT
+        // recycle its large backing stores after each asynchronous encode,
+        // instead of asking CoreVideo for a fresh 1080p/4K allocation at 60 Hz.
+        let pixel_format = if full_range {
+            K_CV_PIXEL_FORMAT_TYPE_420F
+        } else {
+            K_CV_PIXEL_FORMAT_TYPE_32_BGRA
+        };
+        let width_i32 = i32::from(width);
+        let height_i32 = i32::from(height);
+        let pixel_format_i32 = pixel_format as i32;
+        let width_number = unsafe {
+            CFNumberCreate(
+                ptr::null(),
+                KCF_NUMBER_INT32_TYPE,
+                &width_i32 as *const i32 as *const c_void,
+            )
+        };
+        let height_number = unsafe {
+            CFNumberCreate(
+                ptr::null(),
+                KCF_NUMBER_INT32_TYPE,
+                &height_i32 as *const i32 as *const c_void,
+            )
+        };
+        let pixel_format_number = unsafe {
+            CFNumberCreate(
+                ptr::null(),
+                KCF_NUMBER_INT32_TYPE,
+                &pixel_format_i32 as *const i32 as *const c_void,
+            )
+        };
+        if width_number.is_null() || height_number.is_null() || pixel_format_number.is_null() {
+            unsafe {
+                for number in [width_number, height_number, pixel_format_number] {
+                    if !number.is_null() {
+                        CFRelease(number);
+                    }
+                }
+            }
+            bail!("CFNumberCreate failed for source pixel-buffer attributes");
+        }
+        let source_attributes = unsafe {
+            let keys = [
+                kCVPixelBufferWidthKey,
+                kCVPixelBufferHeightKey,
+                kCVPixelBufferPixelFormatTypeKey,
+            ];
+            let values = [width_number, height_number, pixel_format_number];
+            CFDictionaryCreate(
+                ptr::null(),
+                keys.as_ptr().cast(),
+                values.as_ptr().cast(),
+                keys.len() as isize,
+                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+            )
+        };
+        unsafe {
+            CFRelease(width_number);
+            CFRelease(height_number);
+            CFRelease(pixel_format_number);
+        }
+        if source_attributes.is_null() {
+            bail!("CFDictionaryCreate failed for source pixel-buffer attributes");
+        }
+
         let mut session: VTCompressionSessionRef = ptr::null();
         let status = unsafe {
             VTCompressionSessionCreate(
@@ -468,14 +867,21 @@ mod ffi {
                 i32::from(height),
                 K_CM_VIDEO_CODEC_TYPE_H264,
                 ptr::null(),
-                ptr::null(),
+                source_attributes,
                 ptr::null(),
                 Some(output_callback),
                 tx_ctx,
                 &mut session,
             )
         };
+        unsafe { CFRelease(source_attributes) };
         if status != 0 || session.is_null() {
+            if !session.is_null() {
+                unsafe {
+                    VTCompressionSessionInvalidate(session);
+                    CFRelease(session);
+                }
+            }
             bail!("VTCompressionSessionCreate failed: OSStatus {status}");
         }
         let guard = SessionGuard { session };
@@ -847,21 +1253,11 @@ mod ffi {
         Ok(())
     }
 
-    // --- BGRA -> full-range YUV444 planar (AVC444 scoping benchmark) ---------
-    //
-    // Two reference implementations of full-resolution chroma conversion, kept
-    // side-by-side for an A/B perf decision before committing to AVC444's
-    // 2-encoder pipeline. Same BT.709 full-range matrix as the NV12 path.
-    // Neither is wired into encode_frame; they exist for the bench in
-    // videotoolbox::tests::bench_yuv444_full_range.
-    //
-    // Gated behind cfg(test) until AVC444 is actually wired up — they're
-    // dead code in a production build today.
+    // --- BGRA -> full-range YUV444 planar (AVC444) ----------------------------
 
     /// Scalar BGRA -> three full-resolution planar Y/Cb/Cr buffers. The matrix
     /// matches `bgra_to_nv12_full_range` exactly — the only difference is no
     /// 2x2 averaging.
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bgra_to_yuv444_planar_scalar(
         bgra: &[u8],
@@ -897,7 +1293,6 @@ mod ffi {
         }
     }
 
-    #[cfg(test)]
     extern "C" {
         /// `vImageMatrixMultiply_ARGB8888ToPlanar8` (vImage Transform.h). One call
         /// per output plane. The matrix is `int16_t[4]` in source byte order; we
@@ -921,30 +1316,22 @@ mod ffi {
     /// - Y  =  0.2126 R + 0.7152 G + 0.0722 B
     /// - Cb = -0.114572 R - 0.385428 G + 0.500000 B + 128
     /// - Cr =  0.500000 R - 0.454153 G - 0.045847 B + 128
-    #[cfg(test)]
     const DIVISOR: i32 = 16384; // 2^14
 
     // Y plane coefficients: [B, G, R, A] * Q14, no post-bias.
-    #[cfg(test)]
     const Y_MATRIX: [i16; 4] = [1183, 11718, 3483, 0]; // 0.0722, 0.7152, 0.2126, 0
-    #[cfg(test)]
     const Y_POST_BIAS: i32 = DIVISOR / 2; // rounding offset
 
     // Cb plane coefficients + 128*Q14 bias to recenter.
-    #[cfg(test)]
     const CB_MATRIX: [i16; 4] = [8192, -6315, -1877, 0]; // 0.5, -0.385428, -0.114572, 0
-    #[cfg(test)]
     const CB_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     // Cr plane.
-    #[cfg(test)]
     const CR_MATRIX: [i16; 4] = [-751, -7440, 8192, 0]; // -0.045847, -0.454153, 0.5, 0
-    #[cfg(test)]
     const CR_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     /// vImage BGRA -> three full-resolution planar Y/Cb/Cr buffers via three
     /// `vImageMatrixMultiply_ARGB8888ToPlanar8` calls (one per plane).
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bgra_to_yuv444_planar_vimage(
         bgra: &[u8],
@@ -1013,18 +1400,30 @@ mod ffi {
             K_CV_PIXEL_FORMAT_TYPE_32_BGRA
         };
         let mut pbuf: CVPixelBufferRef = ptr::null();
-        let status = unsafe {
-            CVPixelBufferCreate(
-                ptr::null(),
-                width.into(),
-                height.into(),
-                pixel_format,
-                ptr::null(),
-                &mut pbuf,
-            )
+        let pool = unsafe { VTCompressionSessionGetPixelBufferPool(guard.session) };
+        let mut status = if pool.is_null() {
+            -1
+        } else {
+            unsafe { CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &mut pbuf) }
         };
+        // A pool can be temporarily unavailable after a live property change.
+        // Fall back to the old direct allocation path so a transient pool issue
+        // costs performance for one frame rather than dropping the session.
         if status != 0 || pbuf.is_null() {
-            bail!("CVPixelBufferCreate failed: {status}");
+            pbuf = ptr::null();
+            status = unsafe {
+                CVPixelBufferCreate(
+                    ptr::null(),
+                    width.into(),
+                    height.into(),
+                    pixel_format,
+                    ptr::null(),
+                    &mut pbuf,
+                )
+            };
+        }
+        if status != 0 || pbuf.is_null() {
+            bail!("CVPixelBuffer allocation failed: {status}");
         }
 
         // Pixel buffer ownership: VTCompressionSessionEncodeFrame
@@ -1032,14 +1431,27 @@ mod ffi {
         // we release our reference right after submit. The actual
         // CFRelease lives in the cleanup path below regardless of
         // success/failure so we don't leak on errors.
-        let result = unsafe {
-            CVPixelBufferLockBaseAddress(pbuf, 0);
+        let lock_status = unsafe { CVPixelBufferLockBaseAddress(pbuf, 0) };
+        if lock_status != 0 {
+            unsafe { CFRelease(pbuf) };
+            bail!("CVPixelBufferLockBaseAddress failed: {lock_status}");
+        }
+
+        let populate_result: Result<()> = unsafe {
             if full_range {
                 // Two planes: Y (full size) + interleaved CbCr (half size).
                 let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
                 let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
                 let cbcr_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 1) as *mut u8;
                 let cbcr_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 1);
+                if y_base.is_null() || cbcr_base.is_null() {
+                    bail!("CVPixelBuffer returned a null NV12 plane");
+                }
+                if y_stride < usize::from(width) || cbcr_stride < usize::from(width) {
+                    bail!(
+                        "CVPixelBuffer NV12 stride too small: Y {y_stride}, CbCr {cbcr_stride}, width {width}"
+                    );
+                }
                 let y_plane =
                     std::slice::from_raw_parts_mut(y_base, y_stride * usize::from(height));
                 let cbcr_plane = std::slice::from_raw_parts_mut(
@@ -1077,6 +1489,14 @@ mod ffi {
                 let dst = CVPixelBufferGetBaseAddress(pbuf) as *mut u8;
                 let dst_stride = CVPixelBufferGetBytesPerRow(pbuf);
                 let row_bytes = usize::from(width) * 4;
+                if dst.is_null() {
+                    bail!("CVPixelBuffer returned a null BGRA base address");
+                }
+                if dst_stride < row_bytes {
+                    bail!(
+                        "CVPixelBuffer BGRA stride too small: have {dst_stride}, need {row_bytes}"
+                    );
+                }
                 // CVPixelBuffer may have a different stride than the source
                 // (alignment to 64 bytes is common). Copy row by row.
                 for row in 0..usize::from(height) {
@@ -1089,8 +1509,19 @@ mod ffi {
                     );
                 }
             }
-            CVPixelBufferUnlockBaseAddress(pbuf, 0);
+            Ok(())
+        };
+        let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pbuf, 0) };
+        if let Err(error) = populate_result {
+            unsafe { CFRelease(pbuf) };
+            return Err(error);
+        }
+        if unlock_status != 0 {
+            unsafe { CFRelease(pbuf) };
+            bail!("CVPixelBufferUnlockBaseAddress failed: {unlock_status}");
+        }
 
+        let result = unsafe {
             let presentation = CMTime {
                 value: pts,
                 timescale: i32::try_from(fps).unwrap_or(30),
@@ -1134,6 +1565,148 @@ mod ffi {
             if encode_status != 0 {
                 Err(anyhow!(
                     "VTCompressionSessionEncodeFrame failed: OSStatus {encode_status}"
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        unsafe { CFRelease(pbuf) };
+        result
+    }
+
+    /// Submit tightly-packed planar YUV420 as a full-range NV12 pixel buffer.
+    /// The CoreVideo allocation is recycled from the compression-session pool;
+    /// only plane copies happen per frame.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn encode_yuv420_frame(
+        guard: &SessionGuard,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        width: u16,
+        height: u16,
+        pts: i64,
+        fps: u32,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        let width_usize = usize::from(width);
+        let height_usize = usize::from(height);
+        let half_width = width_usize / 2;
+        let half_height = height_usize / 2;
+
+        let mut pbuf: CVPixelBufferRef = ptr::null();
+        let pool = unsafe { VTCompressionSessionGetPixelBufferPool(guard.session) };
+        let mut status = if pool.is_null() {
+            -1
+        } else {
+            unsafe { CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &mut pbuf) }
+        };
+        if status != 0 || pbuf.is_null() {
+            pbuf = ptr::null();
+            status = unsafe {
+                CVPixelBufferCreate(
+                    ptr::null(),
+                    width.into(),
+                    height.into(),
+                    K_CV_PIXEL_FORMAT_TYPE_420F,
+                    ptr::null(),
+                    &mut pbuf,
+                )
+            };
+        }
+        if status != 0 || pbuf.is_null() {
+            bail!("AVC444 CVPixelBuffer allocation failed: {status}");
+        }
+
+        let lock_status = unsafe { CVPixelBufferLockBaseAddress(pbuf, 0) };
+        if lock_status != 0 {
+            unsafe { CFRelease(pbuf) };
+            bail!("AVC444 CVPixelBufferLockBaseAddress failed: {lock_status}");
+        }
+
+        let populate_result: Result<()> = unsafe {
+            let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
+            let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
+            let cbcr_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 1) as *mut u8;
+            let cbcr_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 1);
+            if y_base.is_null() || cbcr_base.is_null() {
+                bail!("AVC444 CVPixelBuffer returned a null NV12 plane");
+            }
+            if y_stride < width_usize || cbcr_stride < width_usize {
+                bail!(
+                    "AVC444 NV12 stride too small: Y {y_stride}, CbCr {cbcr_stride}, width {width}"
+                );
+            }
+            for row in 0..height_usize {
+                ptr::copy_nonoverlapping(
+                    y.as_ptr().add(row * width_usize),
+                    y_base.add(row * y_stride),
+                    width_usize,
+                );
+            }
+            for row in 0..half_height {
+                let dst = cbcr_base.add(row * cbcr_stride);
+                let src_offset = row * half_width;
+                for col in 0..half_width {
+                    *dst.add(col * 2) = u[src_offset + col];
+                    *dst.add(col * 2 + 1) = v[src_offset + col];
+                }
+            }
+            Ok(())
+        };
+        let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pbuf, 0) };
+        if let Err(error) = populate_result {
+            unsafe { CFRelease(pbuf) };
+            return Err(error);
+        }
+        if unlock_status != 0 {
+            unsafe { CFRelease(pbuf) };
+            bail!("AVC444 CVPixelBufferUnlockBaseAddress failed: {unlock_status}");
+        }
+
+        let result = unsafe {
+            let presentation = CMTime {
+                value: pts,
+                timescale: i32::try_from(fps).unwrap_or(30),
+                flags: K_CM_TIME_FLAGS_VALID,
+                epoch: 0,
+            };
+            let duration = CMTime {
+                value: 1,
+                timescale: i32::try_from(fps).unwrap_or(30),
+                flags: K_CM_TIME_FLAGS_VALID,
+                epoch: 0,
+            };
+            let frame_props: CFDictionaryRef = if force_keyframe {
+                let key = kVTEncodeFrameOptionKey_ForceKeyFrame;
+                let value = kCFBooleanTrue;
+                CFDictionaryCreate(
+                    ptr::null(),
+                    &key as *const *const c_void,
+                    &value as *const *const c_void,
+                    1,
+                    &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                    &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+                )
+            } else {
+                ptr::null()
+            };
+            let mut info_flags: VTEncodeInfoFlags = 0;
+            let encode_status = VTCompressionSessionEncodeFrame(
+                guard.session,
+                pbuf,
+                presentation,
+                duration,
+                frame_props,
+                ptr::null_mut(),
+                &mut info_flags,
+            );
+            if !frame_props.is_null() {
+                CFRelease(frame_props);
+            }
+            if encode_status != 0 {
+                Err(anyhow!(
+                    "AVC444 VTCompressionSessionEncodeFrame failed: OSStatus {encode_status}"
                 ))
             } else {
                 Ok(())
@@ -1263,6 +1836,61 @@ mod ffi {
 mod tests {
     use super::*;
 
+    #[test]
+    fn avc444_alignment_and_single_stream_pts() {
+        assert_eq!(align_16(1), 16);
+        assert_eq!(align_16(1080), 1088);
+        assert_eq!(align_16(1920), 1920);
+
+        // One encoder sees main then auxiliary as adjacent pictures; the next
+        // logical frame starts at the following even PTS.
+        assert_eq!(avc444_pair_pts(0), (0, 1, 2));
+        assert_eq!(avc444_pair_pts(2), (2, 3, 4));
+    }
+
+    #[test]
+    fn avc444_keyframes_are_synchronized_across_the_pair() {
+        assert_eq!(avc444_pair_keyframes(false, false), (false, false));
+        assert_eq!(avc444_pair_keyframes(true, false), (true, true));
+        assert_eq!(avc444_pair_keyframes(false, true), (true, true));
+    }
+
+    #[test]
+    fn avc444_all_intra_is_stability_default_and_requires_explicit_opt_out() {
+        assert!(avc444_all_intra_setting(None));
+        assert!(avc444_all_intra_setting(Some("1")));
+        assert!(avc444_all_intra_setting(Some("true")));
+        assert!(!avc444_all_intra_setting(Some("0")));
+        assert!(!avc444_all_intra_setting(Some("false")));
+    }
+
+    #[test]
+    #[ignore = "requires an available VideoToolbox H.264 hardware session"]
+    fn avc444_forced_pair_emits_two_independent_idrs() {
+        const WIDTH: usize = 64;
+        const HEIGHT: usize = 64;
+        let mut encoder = Avc444Encoder::new(WIDTH as u16, HEIGHT as u16, 10, 2_000_000, 2.0)
+            .expect("AVC444 VideoToolbox session should initialize");
+        let bgra = vec![0x40u8; WIDTH * HEIGHT * 4];
+        encoder
+            .encode_bgra(&bgra, WIDTH * 4, true)
+            .expect("main and auxiliary submissions should succeed");
+        let frames = encoder
+            .encoder
+            .flush()
+            .expect("VideoToolbox should flush the complete AVC444 pair");
+        assert_eq!(frames.len(), 2, "one logical frame must emit two pictures");
+        assert_eq!((frames[0].pts, frames[1].pts), (0, 1));
+        assert!(
+            frames.iter().all(|frame| frame.is_keyframe),
+            "a forced stability pair must make both main and auxiliary independent IDRs"
+        );
+        assert!(
+            frames.iter().all(|frame| !frame.parameter_sets.is_empty()),
+            "each IDR must carry parameter sets for decoder recovery"
+        );
+    }
+
     /// Round-trip sanity test. Creates a session, encodes a single
     /// solid-color BGRA frame, drains the channel, and asserts that
     /// the first emitted frame is a keyframe carrying SPS+PPS. Doesn't
@@ -1318,7 +1946,7 @@ mod tests {
         let stride = w * 4;
         for c in colors {
             let mut bgra = vec![0u8; stride * h];
-            for px in bgra.chunks_exact_mut(4) {
+            for px in bgra.as_chunks_mut::<4>().0 {
                 px.copy_from_slice(&c);
             }
             let (mut y_s, mut cbcr_s) = (vec![0u8; w * h], vec![0u8; w * (h / 2)]);
@@ -1626,7 +2254,7 @@ mod tests {
         let stride = w * 4;
         for c in colors {
             let mut bgra = vec![0u8; stride * h];
-            for px in bgra.chunks_exact_mut(4) {
+            for px in bgra.as_chunks_mut::<4>().0 {
                 px.copy_from_slice(&c);
             }
             let mut y_s = vec![0u8; w * h];
@@ -1670,7 +2298,7 @@ mod tests {
         let h: u16 = 240;
         let stride = usize::from(w) * 4;
         let mut frame = vec![0u8; stride * usize::from(h)];
-        for px in frame.chunks_exact_mut(4) {
+        for px in frame.as_chunks_mut::<4>().0 {
             px[0] = 0x33; // B
             px[1] = 0x77; // G
             px[2] = 0xcc; // R

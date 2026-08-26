@@ -186,9 +186,58 @@ fn is_remappable_shortcut(vk: u16) -> bool {
     )
 }
 
+/// macOS actions behind the default plain `Ctrl+Arrow` Mission Control
+/// shortcuts. RDP delivers the chord correctly, but WindowServer refuses to
+/// dispatch these system shortcuts from a user-space `CGEventPost`, so the
+/// macOS backend invokes the equivalent system action explicitly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CtrlArrowAction {
+    MissionControl,
+    ApplicationWindows,
+    PreviousSpace,
+    NextSpace,
+}
+
+/// Match only the four *plain* Ctrl+Arrow chords. Extra Shift/Option/Cmd
+/// modifiers remain application-owned, and ordinary arrows are untouched.
+/// Pure so the interception boundary is regression-tested on every target.
+fn ctrl_arrow_action(
+    ctrl: bool,
+    shift: bool,
+    option: bool,
+    command: bool,
+    vk: u16,
+) -> Option<CtrlArrowAction> {
+    if !ctrl || shift || option || command {
+        return None;
+    }
+    match vk {
+        0x7E => Some(CtrlArrowAction::MissionControl), // Up
+        0x7D => Some(CtrlArrowAction::ApplicationWindows), // Down
+        0x7B => Some(CtrlArrowAction::PreviousSpace),  // Left
+        0x7C => Some(CtrlArrowAction::NextSpace),      // Right
+        _ => None,
+    }
+}
+
+/// Apple virtual keycodes consumed by the System Events fallback. Keep this
+/// mapping pure and pinned by tests: Up/Down are easy to accidentally swap
+/// because their values run in the opposite visual order.
+fn ctrl_arrow_system_events_keycode(action: CtrlArrowAction) -> u16 {
+    match action {
+        CtrlArrowAction::MissionControl => 126,
+        CtrlArrowAction::ApplicationWindows => 125,
+        CtrlArrowAction::PreviousSpace => 123,
+        CtrlArrowAction::NextSpace => 124,
+    }
+}
+
 #[cfg(test)]
 mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display};
+    use super::{
+        ctrl_arrow_action, ctrl_arrow_system_events_keycode, is_remappable_shortcut,
+        map_client_to_display, CtrlArrowAction,
+    };
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.5
@@ -204,6 +253,50 @@ mod coord_tests {
         assert!(!is_remappable_shortcut(0x0C));
         // Arrows / nav keys are untouched (e.g. left arrow 0x7B).
         assert!(!is_remappable_shortcut(0x7B));
+    }
+
+    #[test]
+    fn plain_ctrl_arrows_map_only_to_mission_control_actions() {
+        assert_eq!(
+            ctrl_arrow_action(true, false, false, false, 0x7E),
+            Some(CtrlArrowAction::MissionControl)
+        );
+        assert_eq!(
+            ctrl_arrow_action(true, false, false, false, 0x7D),
+            Some(CtrlArrowAction::ApplicationWindows)
+        );
+        assert_eq!(
+            ctrl_arrow_action(true, false, false, false, 0x7B),
+            Some(CtrlArrowAction::PreviousSpace)
+        );
+        assert_eq!(
+            ctrl_arrow_action(true, false, false, false, 0x7C),
+            Some(CtrlArrowAction::NextSpace)
+        );
+
+        // No Ctrl, an extra modifier, or a non-arrow stays application-owned.
+        assert_eq!(ctrl_arrow_action(false, false, false, false, 0x7E), None);
+        assert_eq!(ctrl_arrow_action(true, true, false, false, 0x7E), None);
+        assert_eq!(ctrl_arrow_action(true, false, true, false, 0x7E), None);
+        assert_eq!(ctrl_arrow_action(true, false, false, true, 0x7E), None);
+        assert_eq!(ctrl_arrow_action(true, false, false, false, 0x00), None);
+
+        assert_eq!(
+            ctrl_arrow_system_events_keycode(CtrlArrowAction::MissionControl),
+            126
+        );
+        assert_eq!(
+            ctrl_arrow_system_events_keycode(CtrlArrowAction::ApplicationWindows),
+            125
+        );
+        assert_eq!(
+            ctrl_arrow_system_events_keycode(CtrlArrowAction::PreviousSpace),
+            123
+        );
+        assert_eq!(
+            ctrl_arrow_system_events_keycode(CtrlArrowAction::NextSpace),
+            124
+        );
     }
 
     #[test]
@@ -370,8 +463,11 @@ mod macos {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    use super::is_remappable_shortcut;
     use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
+    use super::{
+        ctrl_arrow_action, ctrl_arrow_system_events_keycode, is_remappable_shortcut,
+        CtrlArrowAction,
+    };
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -1067,6 +1163,19 @@ mod macos {
             let shift = f.contains(CGEventFlags::CGEventFlagShift);
             let ctrl = f.contains(CGEventFlags::CGEventFlagControl);
             let opt = f.contains(CGEventFlags::CGEventFlagAlternate);
+
+            // Plain Ctrl+Arrow is the default macOS Mission Control family:
+            // Up = overview, Down = application windows, Left/Right = adjacent
+            // Space. WindowServer does not dispatch those symbolic shortcuts
+            // for our synthetic CGEvents, so invoke their system equivalents.
+            // Suppress key-repeat after the first down: the overview actions
+            // toggle, so repeating would immediately close/reopen them.
+            if let Some(action) = ctrl_arrow_action(ctrl, shift, opt, cmd, vk) {
+                if !self.consumed_keys.contains(&vk) {
+                    invoke_ctrl_arrow(action);
+                }
+                return true;
+            }
 
             // Ctrl+Option+G: on-demand "gather windows" — sweep any window stranded
             // off the session display (e.g. an app opened on the now-blanked
@@ -3059,6 +3168,73 @@ mod macos {
         }
         debug!("invoke_spotlight: AX menu-bar press failed, falling back to osascript");
         invoke_spotlight_via_osascript();
+    }
+
+    /// Invoke the default macOS Ctrl+Arrow system actions without relying on
+    /// WindowServer to accept our synthetic RDP key event.
+    fn invoke_ctrl_arrow(action: CtrlArrowAction) {
+        // Dock owns Mission Control/Spaces and exposes no public programmatic
+        // switch API. System Events can drive the user's enabled native
+        // shortcuts from a trusted Accessibility session. Use it for all four
+        // arrows: the target machine live-verified Left/Right, while directly
+        // executing Mission Control.app for Up/Down was killed by macOS with
+        // SIGKILL before it could notify Dock.
+        let label = match action {
+            CtrlArrowAction::MissionControl => "mission-control",
+            CtrlArrowAction::ApplicationWindows => "application-windows",
+            CtrlArrowAction::PreviousSpace => "previous-space",
+            CtrlArrowAction::NextSpace => "next-space",
+        };
+        let keycode = ctrl_arrow_system_events_keycode(action);
+        let script = format!(
+            r#"tell application "System Events" to key code {keycode} using {{control down}}"#
+        );
+        let mut command = Command::new("/usr/bin/osascript");
+        command.arg("-e").arg(&script);
+        spawn_symbolic_helper(&mut command, label);
+    }
+
+    /// Spawn a short-lived system shortcut helper and reap it off the input
+    /// thread. Capturing stderr makes a denied System Events request diagnosable
+    /// without ever blocking keyboard delivery.
+    fn spawn_symbolic_helper(command: &mut Command, label: &'static str) {
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        match command.spawn() {
+            Ok(child) => {
+                let child_pid = child.id();
+                debug!(label, child_pid, "symbolic shortcut helper spawned");
+                let _ = std::thread::Builder::new()
+                    .name(format!("shortcut-{label}-wait"))
+                    .spawn(move || match child.wait_with_output() {
+                        Ok(output) if output.status.success() => {
+                            debug!(label, child_pid, "symbolic shortcut helper completed");
+                        }
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            warn!(
+                                label,
+                                child_pid,
+                                status = ?output.status,
+                                stderr = %stderr.trim(),
+                                "symbolic shortcut helper failed"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                label,
+                                child_pid,
+                                error = %error,
+                                "symbolic shortcut helper wait failed"
+                            );
+                        }
+                    });
+            }
+            Err(error) => {
+                warn!(label, error = %error, "symbolic shortcut helper spawn failed");
+            }
+        }
     }
 
     /// Open Spotlight by synthesizing a real mouse click on its

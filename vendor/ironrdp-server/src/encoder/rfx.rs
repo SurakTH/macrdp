@@ -14,9 +14,24 @@ use ironrdp_pdu::rdp::capability_sets::EntropyBits;
 
 use crate::BitmapUpdate;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct RfxEncoder {
     entropy_algorithm: rfx::EntropyAlgorithm,
+    // RemoteFX needs 12 KiB of transform output per 64x64 tile. Reusing this
+    // workspace avoids allocating and zero-initializing a potentially
+    // multi-megabyte Vec for every dirty rectangle.
+    tile_scratch: Vec<u8>,
+}
+
+impl Clone for RfxEncoder {
+    fn clone(&self) -> Self {
+        Self {
+            entropy_algorithm: self.entropy_algorithm,
+            // A clone represents a new connection/encoder; don't copy a large
+            // idle scratch allocation into it.
+            tile_scratch: Vec::new(),
+        }
+    }
 }
 
 impl RfxEncoder {
@@ -25,7 +40,10 @@ impl RfxEncoder {
             EntropyBits::Rlgr1 => rfx::EntropyAlgorithm::Rlgr1,
             EntropyBits::Rlgr3 => rfx::EntropyAlgorithm::Rlgr3,
         };
-        Self { entropy_algorithm }
+        Self {
+            entropy_algorithm,
+            tile_scratch: Vec::new(),
+        }
     }
 
     pub(crate) fn encode(
@@ -75,10 +93,16 @@ impl RfxEncoder {
         let region = RegionPdu { rectangles };
         Block::CodecChannel(CodecChannel::Region(region)).encode(&mut cursor)?;
 
-        let quant = Quant::default();
+        // 6 is the highest-fidelity quantizer permitted by MS-RDPRFX. The
+        // protocol default increases high-frequency bands to 7..9, which saves
+        // bandwidth but visibly softens small text and one-pixel UI strokes.
+        // Native bitmap mode deliberately spends bandwidth on clarity and
+        // controls load with dirty rectangles + a low capture frame cap.
+        let quant = maximum_quality_quant();
 
-        let (encoder, mut data) = UpdateEncoder::new(bitmap, quant.clone(), entropy_algorithm);
-        let tiles = encoder.encode(&mut data)?;
+        let encoder = UpdateEncoder::new(bitmap, quant.clone(), entropy_algorithm);
+        self.tile_scratch.resize(encoder.required_data_len(), 0);
+        let tiles = encoder.encode(&mut self.tile_scratch)?;
 
         let quants = vec![quant];
         let tile_set = TileSetPdu {
@@ -95,13 +119,26 @@ impl RfxEncoder {
     }
 }
 
+fn maximum_quality_quant() -> Quant {
+    Quant {
+        ll3: 6,
+        lh3: 6,
+        hl3: 6,
+        hh3: 6,
+        lh2: 6,
+        hl2: 6,
+        hh2: 6,
+        lh1: 6,
+        hl1: 6,
+        hh1: 6,
+    }
+}
+
 pub(crate) struct UpdateEncoder<'a> {
     bitmap: &'a BitmapUpdate,
     quant: Quant,
     entropy_algorithm: rfx::EntropyAlgorithm,
 }
-
-struct UpdateEncoderData(Vec<u8>);
 
 struct EncodedTile<'a> {
     y_data: &'a [u8],
@@ -110,25 +147,17 @@ struct EncodedTile<'a> {
 }
 
 impl<'a> UpdateEncoder<'a> {
-    fn new(
-        bitmap: &'a BitmapUpdate,
-        quant: Quant,
-        entropy_algorithm: rfx::EntropyAlgorithm,
-    ) -> (Self, UpdateEncoderData) {
-        let this = Self {
+    fn new(bitmap: &'a BitmapUpdate, quant: Quant, entropy_algorithm: rfx::EntropyAlgorithm) -> Self {
+        Self {
             bitmap,
             quant,
             entropy_algorithm,
-        };
-        let data = this.alloc_data();
-
-        (this, data)
+        }
     }
 
-    fn alloc_data(&self) -> UpdateEncoderData {
+    fn required_data_len(&self) -> usize {
         let (tiles_x, tiles_y) = self.tiles_xy();
-
-        UpdateEncoderData(vec![0u8; 64 * 64 * 3 * tiles_x * tiles_y])
+        64 * 64 * 3 * tiles_x * tiles_y
     }
 
     fn tiles_xy(&self) -> (usize, usize) {
@@ -138,16 +167,17 @@ impl<'a> UpdateEncoder<'a> {
         )
     }
 
-    fn encode(&self, data: &'a mut UpdateEncoderData) -> EncodeResult<Vec<rfx::Tile<'a>>> {
+    fn encode(&self, data: &'a mut [u8]) -> EncodeResult<Vec<rfx::Tile<'a>>> {
         #[cfg(feature = "rayon")]
         use rayon::prelude::*;
 
         let (tiles_x, tiles_y) = self.tiles_xy();
+        debug_assert!(data.len() >= self.required_data_len());
 
         #[cfg(not(feature = "rayon"))]
-        let chunks = data.0.chunks_mut(64 * 64 * 3);
+        let chunks = data.chunks_mut(64 * 64 * 3);
         #[cfg(feature = "rayon")]
-        let chunks = data.0.par_chunks_mut(64 * 64 * 3);
+        let chunks = data.par_chunks_mut(64 * 64 * 3);
 
         let tiles: Vec<_> = (0..tiles_y).flat_map(|y| (0..tiles_x).map(move |x| (x, y))).collect();
 
@@ -231,14 +261,16 @@ pub(crate) mod bench {
         tile_x: usize,
         tile_y: usize,
     ) {
-        let (enc, mut data) = UpdateEncoder::new(bitmap, quant.clone(), algo);
+        let enc = UpdateEncoder::new(bitmap, quant.clone(), algo);
+        let mut data = vec![0; enc.required_data_len()];
 
-        enc.encode_tile(tile_x, tile_y, &mut data.0)
+        enc.encode_tile(tile_x, tile_y, &mut data)
             .expect("cannot propagate error in benchmark");
     }
 
     pub fn rfx_enc(bitmap: &BitmapUpdate, quant: &Quant, algo: rfx::EntropyAlgorithm) {
-        let (enc, mut data) = UpdateEncoder::new(bitmap, quant.clone(), algo);
+        let enc = UpdateEncoder::new(bitmap, quant.clone(), algo);
+        let mut data = vec![0; enc.required_data_len()];
 
         enc.encode(&mut data).expect("cannot propagate error in benchmark");
     }

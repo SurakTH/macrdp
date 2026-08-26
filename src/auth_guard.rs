@@ -42,7 +42,7 @@
 //! Everything is **on by default** with conservative thresholds, tunable via
 //! `MACRDP_*` env vars and fully disable-able (see [`GuardConfig::from_env`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -87,7 +87,7 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
 }
 
 /// Resolved thresholds (read once at startup from the environment).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GuardConfig {
     /// Sliding window over which connection attempts are counted.
     window: Duration,
@@ -108,12 +108,27 @@ pub struct GuardConfig {
     base_cooldown: Duration,
     /// Cap on the escalated cooldown.
     max_cooldown: Duration,
+    /// Optional allowlist of client IP addresses. If set, only connections from
+    /// these IPs (or loopback) are accepted; all others are rejected immediately.
+    pub allow_ips: Option<HashSet<IpAddr>>,
 }
 
 impl GuardConfig {
     /// Resolve thresholds from `MACRDP_GUARD_*` env vars, falling back to the
     /// conservative defaults documented in `docs/cli.md` / `config.env.example`.
     pub fn from_env() -> Self {
+        let allow_ips = std::env::var("MACRDP_ALLOW_IPS").ok().and_then(|s| {
+            let list: HashSet<IpAddr> = s
+                .split(',')
+                .filter_map(|p| p.trim().parse::<IpAddr>().ok().map(canonical_ip))
+                .collect();
+            if list.is_empty() {
+                None
+            } else {
+                Some(list)
+            }
+        });
+
         Self {
             window: Duration::from_secs(env_u64("MACRDP_GUARD_RL_WINDOW_SECS", 60)),
             max_attempts: env_u64("MACRDP_GUARD_RL_MAX", 10) as usize,
@@ -121,6 +136,16 @@ impl GuardConfig {
             failfast_window: Duration::from_secs(env_u64("MACRDP_GUARD_FAILFAST_SECS", 3)),
             base_cooldown: Duration::from_secs(env_u64("MACRDP_GUARD_COOLDOWN_BASE_SECS", 30)),
             max_cooldown: Duration::from_secs(env_u64("MACRDP_GUARD_COOLDOWN_MAX_SECS", 900)),
+            allow_ips,
+        }
+    }
+
+    pub fn set_allow_ips(&mut self, ips: Vec<IpAddr>) {
+        if ips.is_empty() {
+            self.allow_ips = None;
+        } else {
+            let set: HashSet<IpAddr> = ips.into_iter().map(canonical_ip).collect();
+            self.allow_ips = Some(set);
         }
     }
 
@@ -173,6 +198,8 @@ pub enum Decision {
     RejectRateLimit { window_attempts: usize },
     /// Reject: the IP is in an active lockout cooldown.
     RejectCooldown { retry_after: Duration },
+    /// Reject: client IP is not in the configured allowlist (--allow-ip).
+    RejectNotAllowed,
 }
 
 /// The classified result of a finished connection.
@@ -215,6 +242,7 @@ impl AuthGuardCore {
     /// Build a core from the environment, or `None` if the master switch
     /// (`MACRDP_CONN_GUARD`) is off — callers then skip the guard entirely
     /// (zero overhead, vendored default accept-all path).
+    #[allow(dead_code)]
     pub fn from_env() -> Option<Self> {
         if !env_on("MACRDP_CONN_GUARD", true) {
             return None;
@@ -241,10 +269,17 @@ impl AuthGuardCore {
             return Decision::Accept;
         }
 
+        // IP Whitelist check: if allow_ips is configured, reject any non-whitelisted IP immediately.
+        if let Some(ref allowed) = self.cfg.allow_ips {
+            if !allowed.contains(&ip) {
+                return Decision::RejectNotAllowed;
+            }
+        }
+
         self.evict_stale(now);
 
         let window = self.cfg.window;
-        let cfg = self.cfg;
+        let cfg = &self.cfg;
         let entry = self.ips.entry(ip).or_insert_with(|| PerIp::new(now));
         entry.last_touch = now;
 
@@ -290,7 +325,7 @@ impl AuthGuardCore {
         if ip.is_loopback() {
             return;
         }
-        let cfg = self.cfg;
+        let cfg = &self.cfg;
         let entry = self.ips.entry(ip).or_insert_with(|| PerIp::new(now));
         entry.last_touch = now;
 
@@ -451,6 +486,17 @@ pub fn audit_reject(ip: IpAddr, decision: Decision) {
                 retry_after_secs = retry_after.as_secs(),
             );
         }
+        Decision::RejectNotAllowed => {
+            tracing::warn!(
+                target: "macrdp::audit",
+                schema_version = AUDIT_SCHEMA_VERSION,
+                macrdp_version = env!("CARGO_PKG_VERSION"),
+                host = host(),
+                event = "reject",
+                reason = "ip_not_allowed",
+                src_ip = %ip,
+            );
+        }
         Decision::Accept => {}
     }
 }
@@ -607,15 +653,28 @@ pub struct AuthGuardHandler {
 }
 
 impl AuthGuardHandler {
-    /// Build the boxed handler, or `None` when the guard is disabled (so the
-    /// builder gets `None` and the vendored default accept-all path runs).
+    /// Build the boxed handler with optional `allow_ips` whitelist, or `None`
+    /// when the guard is disabled (and no allowlist is configured).
+    pub fn from_allow_ips(
+        allow_ips: Vec<IpAddr>,
+    ) -> Option<Box<dyn ironrdp_server::ConnectionHandler>> {
+        if !env_on("MACRDP_CONN_GUARD", true) && allow_ips.is_empty() {
+            return None;
+        }
+        let mut cfg = GuardConfig::from_env();
+        if !allow_ips.is_empty() {
+            cfg.set_allow_ips(allow_ips);
+        }
+        Some(Box::new(Self {
+            core: AuthGuardCore::with_config(cfg),
+            last_peer: None,
+        }) as Box<dyn ironrdp_server::ConnectionHandler>)
+    }
+
+    /// Build the boxed handler from environment, or `None` when disabled.
+    #[allow(dead_code)]
     pub fn from_env() -> Option<Box<dyn ironrdp_server::ConnectionHandler>> {
-        AuthGuardCore::from_env().map(|core| {
-            Box::new(Self {
-                core,
-                last_peer: None,
-            }) as Box<dyn ironrdp_server::ConnectionHandler>
-        })
+        Self::from_allow_ips(Vec::new())
     }
 }
 
@@ -688,7 +747,30 @@ mod tests {
             failfast_window: Duration::from_secs(3),
             base_cooldown: Duration::from_secs(30),
             max_cooldown: Duration::from_secs(900),
+            allow_ips: None,
         }
+    }
+
+    #[test]
+    fn allow_ips_whitelist_enforced() {
+        let mut cfg = test_cfg();
+        let allowed_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 137, 1));
+        let blocked_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 137, 2));
+        cfg.set_allow_ips(vec![allowed_ip]);
+        let mut c = AuthGuardCore::with_config(cfg);
+        let t0 = Instant::now();
+
+        // Loopback is always accepted regardless of whitelist
+        assert_eq!(
+            c.decide(t0, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Decision::Accept
+        );
+
+        // Allowed IP is accepted
+        assert_eq!(c.decide(t0, allowed_ip), Decision::Accept);
+
+        // Other IP is rejected with RejectNotAllowed
+        assert_eq!(c.decide(t0, blocked_ip), Decision::RejectNotAllowed);
     }
 
     #[test]

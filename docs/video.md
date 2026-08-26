@@ -1,6 +1,7 @@
 # Video: H.264/EGFX, display resolution, and aspect handling
 
-How macrdp draws your screen: the H.264 pipeline (`--enable-h264`), Retina
+How macrdp draws your screen: the H.264 pipeline (`--enable-h264`, optional
+`--avc444`), Retina
 capture (`--hidpi`), client-resolution auto-adopt and letterboxing, the mstsc
 reconnect quirk and its fixes, and the color-conversion implementation notes.
 
@@ -9,6 +10,14 @@ reconnect quirk and its fixes, and the color-conversion implementation notes.
 By default macrdp captures and advertises the Mac's **logical** resolution — the points it reports in System Settings (e.g. 1512×982 on a default-scaled 14" MacBook). On a Retina panel that's half the physical pixels, so any client whose window is larger upscales it and text looks soft.
 
 Pass **`--hidpi`** to capture at the display's **backing (Retina) pixel resolution** instead (e.g. 3024×1964) — clients then render crisp native pixels. It's **opt-in** because it's ~4× the pixels:
+
+The `./start.sh native` preset enables this automatically and caps the bitmap
+path at 12 FPS. It also pins capture to the 1:1 backing size so dirty-rectangle
+updates remain valid; accepting an unrelated client resolution would require a
+full-frame bitmap update on every tick.
+
+`./start.sh avc444` also enables HiDPI, but sends it as dual-view H.264 4:4:4
+at a stability-first 10 FPS instead of bitmap tiles.
 
 - **Pair it with `--enable-h264`.** H.264 compresses the higher resolution cleanly and the client downscales it sharply — that's the real "Retina remote desktop" experience. On the legacy bitmap path it just means 4× the bandwidth.
 - **mstsc feels laggy at HiDPI.** mstsc decodes 4× the pixels every frame and its ~2-frame presentation buffer now holds 4×-bigger frames, so responsiveness drops. **Thincast / FreeRDP stay snappy** — their H.264 decoders keep up. The server itself isn't the bottleneck (it encodes a 3024×1964 frame in ~10 ms, well inside the 60fps budget); the cost is client-side decode. Prefer a capable client if you want HiDPI.
@@ -34,7 +43,66 @@ How it behaves:
 - **Color.** The stream is encoded as full-range BT.709. This matters for `mstsc`, which reads AVC420 luma as full-range regardless of the bitstream flag — video-range output otherwise renders washed-out / lighter there. FreeRDP honors the flag and is correct either way. To get full range we convert each captured BGRA frame to full-range NV12 ourselves (VideoToolbox would otherwise emit video-range from a BGRA source); that conversion is **vImage**-accelerated — see [Color conversion: scalar vs vImage](#color-conversion-scalar-vs-vimage).
 - **Frame rate.** `--enable-h264` defaults to **60fps** (vs 15 for legacy). mstsc holds a fixed ~2-frame presentation buffer for the H.264 stream, so at 30fps typing lags ~2 keystrokes (~66ms) while at 60fps that buffer is ~33ms and feels immediate. FreeRDP-based clients don't buffer this way and are snappy at any rate. Set `--fps` explicitly to override (lower it to save CPU/bandwidth if your client/link doesn't need 60).
 - **Keyframes.** A keyframe (IDR) is forced on the first frame, then periodically every `--keyframe-interval` seconds (default `2`) as a safety net — some clients (mstsc) only fully recover a transient decode glitch on the next IDR, so a long interval leaves garbled regions (notably text) lingering. Lower it for faster recovery at the cost of bandwidth/quality; raise it for smoother typing. Optionally, pass **`--keyframe-on-change`** (off by default) to additionally force an IDR whenever a large area changes at once (window-to-front, scroll, app launch) and briefly after a mouse click, so big updates land immediately instead of waiting for the periodic interval (rising-edge detection keeps sustained churn like video from forcing an IDR every frame). It's off by default because the periodic interval plus the trailing flush-burst (`--flush-frames`) already drain mstsc's presentation buffer, so the extra forced IDRs mostly just spend bitrate/quality at a fixed bitrate for no typing benefit — enable it only if large updates visibly lag on your client/link. When enabled, the trigger thresholds are tunable: `--keyframe-change-pct` (default 20, the dirty-area % that fires an IDR), `--keyframe-click-pct` (default 5, the lowered threshold after a click), and `--keyframe-click-window-ms` (default 400, how long that lowered threshold lasts).
-- **Flush frames (`--flush-frames`, default `4`).** ScreenCaptureKit only delivers a frame when the screen changes, so after the last keystroke before a pause there are no further frames to push it through mstsc's ~2-frame AVC420 presentation buffer — it would strand there until the next change or periodic keyframe (the classic "typing follows the keyframe" lag). After each change the server re-submits the last frame this many times as cheap skip-P-frames, draining the buffer so the change appears within a couple of frame intervals (~33 ms at 60fps), then goes quiet. mstsc needs ≥2; raise if a slight trailing lag remains, or set `0` to disable.
+- **Flush frames (`--flush-frames`, default `4`).** ScreenCaptureKit only delivers a frame when the screen changes, so after the last keystroke before a pause there are no further frames to push it through mstsc's ~2-frame AVC420 presentation buffer — it would strand there until the next change or periodic keyframe (the classic "typing follows the keyframe" lag). After each change the server re-submits the last frame this many times as cheap skip-P-frames, draining the buffer so the change appears within a couple of frame intervals (~33 ms at 60fps), then goes quiet. mstsc needs ≥2; raise if a slight trailing lag remains, or set `0` to disable. The capture path retains exactly one CoreVideo pixel buffer until this bounded burst completes, then releases it; it does not copy the full BGRA desktop on every accepted frame.
+
+For two machines on a clean LAN, `./start.sh lan` is the maximum-practical
+AVC420 preset: HiDPI, 60 FPS, fixed 50 Mbps, stable TCP EGFX, a one-frame
+pipeline, two flush frames, and PCM audio. This is the highest bitrate already
+live-verified on the target mstsc client; 80 Mbps made mstsc build 26100 reset
+as soon as the first AVC420 frame arrived, over both TCP and UDP. Set
+`MACRDP_LAN_TRANSPORT=udp` to explicitly test reliable-UDP EGFX migration; no
+source edit or rebuild is needed.
+
+### AVC444: sharp text plus H.264 motion
+
+Pass `--enable-h264 --avc444`, or simply run `./start.sh avc444`, to prefer
+RDP AVC444 v1. The server converts the visible BGRA frame to full-range BT.709
+YUV444, applies the MS-RDPEGFX B-area split, and encodes the resulting main and
+chroma-compensation YUV420 views consecutively with one VideoToolbox session.
+The two pictures therefore share the continuous H.264 reference chain required
+by MS-RDPEGFX and are paired by adjacent even/odd timestamps before one AVC444
+PDU is sent. A pairing loss is discarded and forces an IDR on the next main
+view rather than risking persistent color corruption. Main chroma is a 2x2
+box average, matching the production FreeRDP packing path rather than selecting
+only the top-left chroma sample. The original
+two-independent-session implementation was invalid: each P-frame referenced a
+different history, producing the severe gray/color-stripe image observed in a
+live client on 2026-08-26.
+
+The internal encoder dimensions are padded to 16-pixel H.264 macroblocks;
+EGFX still maps only the real visible desktop rectangle. Both AVC metablocks
+use the protocol's exclusive right/bottom bounds (`width`, `height`), not the
+pinned IronRDP helper's former inclusive-style `width-1`, `height-1`; the latter
+turned 1920x1080 into an odd 1919x1079 reconstruction region. Conversion, split,
+and plane buffers are retained and reused across frames. `--bitrate` is the
+target for the one continuous stream; VideoToolbox allocates that budget across
+the alternating main and auxiliary pictures.
+
+AVC444 requires a positive RDPGFX V10+ AVC capability. V8.1/AVC420 clients use
+the ordinary AVC420 encoder automatically, and clients with no AVC support
+still fall back to the legacy bitmap path. The quality benefit is strongest on
+colored text, thin UI edges, and code syntax highlighting; neutral black/white
+text is already largely carried by full-resolution luma in AVC420.
+
+The trade-off is real: every logical AVC444 frame requires two consecutive
+H.264 pictures, so the one VideoToolbox session runs at twice the logical frame
+cadence. The stability preset therefore uses HiDPI, 10 FPS, a 60 Mbps ceiling,
+one logical frame in flight, and TCP. It forces both pictures in every pair to
+IDR and emits only SPS/PPS plus slice NAL units, removing temporal-reference and
+optional-SEI recovery ambiguity from the client decoder. Override with
+`MACRDP_AVC444_FPS` and `MACRDP_AVC444_BITRATE`; setting
+`MACRDP_AVC444_ALL_INTRA=0` restores the experimental inter-frame path, but is
+not recommended until that path renders correctly on the target client. This
+all-intra default also applies when `--avc444` is invoked without the launcher. 4K/60
+is not a realistic target for this path. The
+launcher also defaults `MACRDP_BLANK_RECOVERY=0`, matching the stable Ultimate
+preset; set it to `1` explicitly if the experimental reconnect-blank recovery
+is preferred.
+The first single-session correction, the stricter all-IDR/averaged-chroma/
+sanitized-NAL revision, and the subsequent exclusive-region correction all
+still produced the same gray/color-stripe image on mstsc build 26100. AVC444 is
+therefore retained for diagnostics only and must not be treated as a usable or
+recommended mode. Use AVC420 (`ultimate`/`lan`) or Native instead.
 
 ### Known limitations
 

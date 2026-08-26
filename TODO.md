@@ -604,9 +604,19 @@ then delete; promote a parked item to *In flight* when work actually starts.
   `Ctrl+Alt+Shift+R` resync hotkey (above, DONE) is the *manual* answer to this idle-audio
   drift; an *automatic* audio-only mute-on-silence is the still-parked hands-free version.
 
-- [ ] **AVC444 (4:4:4 chroma).** YUV-pack module + bench scaffold landed; `--avc444` not
-  wired. VT hw-encoder serializes → 1080p-comfortable, 4K doesn't fit. Resume only if
-  colored-text quality becomes a pain.
+- [ ] **AVC444 (4:4:4 chroma) — exclusive-region correction built; live re-verification pending.** Opt-in
+  `--avc444` + `./start.sh avc444` wire the existing B-area split into one continuous
+  VideoToolbox H.264 session (main then auxiliary), as MS-RDPEGFX requires, and EGFX AVC444 v1.
+  Includes V10+ capability gating, AVC420/bitmap fallback, 16-pixel padding, PTS pairing,
+  mismatch→synchronized-IDR recovery, reusable buffers, 2x2 main-chroma averaging,
+  slice/parameter-set-only NAL output, and a stability-first all-IDR HiDPI 10 FPS preset. The
+  initial two-session implementation corrupted inter-frame references and produced the
+  severe gray/color-stripe image reported 2026-08-26. The first single-session and stricter
+  all-IDR fixes still corrupted mstsc build 26100. The pinned IronRDP helper then proved to
+  encode a 1920x1080 RFX AVC region as the odd 1919x1079 (`width-1`/`height-1`) despite the
+  protocol's exclusive right/bottom bounds. The vendored EGFX correction now emits
+  `width`/`height` without enlarging the outer destination. Server tests pass; end-to-end
+  visual re-verification of this region correction remains.
 
 ## Not planned
 

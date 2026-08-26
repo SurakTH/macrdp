@@ -96,6 +96,12 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           hardware-encoded via VideoToolbox, instead of legacy
                           bitmaps. Falls back to legacy automatically for
                           clients that don't negotiate H.264. See [video.md](video.md).
+--avc444                  Prefer dual-view H.264 4:4:4 (requires
+                          --enable-h264 and a positive RDPGFX V10+ AVC
+                          capability). AVC420-only clients automatically use
+                          the normal single-stream path. Heavier than AVC420;
+                          use `./start.sh avc444` for the tuned preset. Config
+                          key: AVC444=1 (with ENABLE_H264=1).
 --bitrate N               Target H.264 bitrate in Mbps (default 6; only with
                           --enable-h264). Raise it (8–12) for sharper detail if
                           you have bandwidth headroom. With --adaptive-bitrate it

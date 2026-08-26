@@ -19,15 +19,16 @@
 //!        so it keeps pace with ScreenCaptureKit instead of falling behind under
 //!        heavy frames (which would queue stale frames → growing latency).
 //!
-//!   Ship thread (`ship_loop`):
+//!   Ship thread (`ship_loop`, or paired `avc444_ship_loop`):
 //!     4. Blocks on VT's output channel; for each encoded frame, frames it (see
-//!        `WireFormat`), hands it to `GraphicsPipelineServer::send_avc420_frame`
-//!        (StartFrame / WireToSurface1 / EndFrame), then ships the resulting
+//!        `WireFormat`), then hands it to the matching AVC420 or AVC444
+//!        `GraphicsPipelineServer` send method (StartFrame / WireToSurface /
+//!        EndFrame), and ships the resulting
 //!        `DvcMessage`s through DRDYNVC via `ServerEvent::Egfx(SendMessages)`,
 //!        and bumps `shipped`.
 //!
 //!   The EGFX send window is `u32::MAX` (see `GfxHandler::max_frames_in_flight`)
-//!   so `send_avc420_frame` NEVER drops an encoded frame — dropping one (a
+//!   so the EGFX send methods NEVER drop an encoded frame — dropping one (a
 //!   P-frame, or worse a keyframe) breaks the H.264 reference chain and causes
 //!   client-side artifacts. All throttling is the capture-side drop above.
 //!
@@ -69,7 +70,7 @@ use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::videotoolbox::{EncodedFrame, Encoder};
+use crate::videotoolbox::{Avc444Encoder, EncodedFrame, Encoder};
 
 /// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
 /// backpressure gate while the client's frame-ack lag is over the threshold.
@@ -164,11 +165,42 @@ impl WireFormat {
     }
 }
 
+/// The negotiated encoder for one EGFX connection. AVC444 is deliberately a
+/// separate variant so an AVC420-only client keeps the proven single-stream
+/// path byte-for-byte, while a V10+ client can opt into dual-view 4:4:4.
+enum ActiveEncoder {
+    Avc420(Encoder),
+    Avc444(Box<Avc444Encoder>),
+}
+
+impl ActiveEncoder {
+    fn set_bitrate(&self, bitrate_bps: u32) -> Result<()> {
+        match self {
+            Self::Avc420(encoder) => encoder.set_bitrate(bitrate_bps),
+            Self::Avc444(encoder) => encoder.set_bitrate(bitrate_bps),
+        }
+    }
+
+    fn set_keyframe_interval(&self, keyframe_frames: u32) -> Result<()> {
+        match self {
+            Self::Avc420(encoder) => encoder.set_keyframe_interval(keyframe_frames),
+            Self::Avc444(encoder) => encoder.set_keyframe_interval(keyframe_frames),
+        }
+    }
+
+    fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
+        match self {
+            Self::Avc420(encoder) => encoder.encode_bgra(bgra, stride, force_keyframe),
+            Self::Avc444(encoder) => encoder.encode_bgra(bgra, stride, force_keyframe),
+        }
+    }
+}
+
 /// Per-connection state, shared between the `Gfx` factory/handle (capture
 /// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
 struct ConnectionContext {
     server_handle: GfxServerHandle,
-    encoder: Option<Encoder>,
+    encoder: Option<ActiveEncoder>,
     surface_id: Option<u16>,
     is_ready: bool,
     epoch: Instant,
@@ -183,6 +215,12 @@ struct ConnectionContext {
     /// AVC420 to a client that can't decode it (which it rejects with
     /// ERROR_NOT_SUPPORTED and a dead graphics channel).
     client_supports_avc: bool,
+    /// Positive V10+ AVC capability signal. AVC444 is unavailable on V8.1,
+    /// even when AVC420 is enabled there.
+    client_supports_avc444: bool,
+    /// Set by the dual-view ship thread if asynchronous output loses pairing.
+    /// The next capture consumes it and forces the shared stream to IDR.
+    encoder_resync: Arc<AtomicBool>,
     /// Channel-level decline, shared with this connection's `GfxDvcBridge`
     /// (`with_decline_flag`). Set true in `on_ready` when the client
     /// advertised EGFX but no AVC420 support: the bridge then discards ALL
@@ -1159,6 +1197,9 @@ pub struct Gfx {
     desktop_size: crate::capture::SharedDesktopSize,
     fps: u32,
     bitrate_bps: u32,
+    /// Prefer AVC444 v1 when the client positively advertises V10+ AVC.
+    /// AVC420-only clients automatically retain the single-stream path.
+    avc444_enabled: bool,
     /// Periodic keyframe (IDR) interval in seconds (from `--keyframe-interval`).
     /// Heal-vs-smoothness knob; converted to a frame count by `Encoder::new`.
     keyframe_secs: f32,
@@ -1312,6 +1353,7 @@ impl Gfx {
         desktop_size: crate::capture::SharedDesktopSize,
         fps: u32,
         bitrate_bps: u32,
+        avc444_enabled: bool,
         keyframe_secs: f32,
         max_in_flight: u32,
         egfx_on_lossy: Arc<AtomicBool>,
@@ -1487,7 +1529,13 @@ impl Gfx {
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
-            width, height, fps, keyframe_secs, max_in_flight, "EGFX/H.264 pipeline configured"
+            width,
+            height,
+            fps,
+            keyframe_secs,
+            max_in_flight,
+            avc444_enabled,
+            "EGFX/H.264 pipeline configured"
         );
         if recovery_enabled {
             info!(
@@ -1518,6 +1566,7 @@ impl Gfx {
             desktop_size,
             fps,
             bitrate_bps,
+            avc444_enabled,
             keyframe_secs,
             max_in_flight,
             wire_format,
@@ -1996,6 +2045,8 @@ impl Gfx {
             let Some(ctx) = guard.as_mut() else {
                 return Ok(true);
             };
+            let force_keyframe =
+                force_keyframe || ctx.encoder_resync.swap(false, Ordering::Relaxed);
             // Congestion-responsive control (P1 bitrate + P2a IDR backoff): compute
             // the adjustments (mutates ctx adaptive state, may set need_keyframe)
             // BEFORE borrowing the encoder, then apply them live. No-op unless
@@ -2274,19 +2325,179 @@ impl Gfx {
     /// drop-to-latest throttle can bound the pipeline depth. Exits when the
     /// channel closes (encoder dropped on connection teardown).
     fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
+        // Reuse the batch allocation for the lifetime of the connection. VT
+        // normally yields one frame at a time, but can deliver a short burst
+        // after startup or a keyframe.
+        let mut frames = Vec::with_capacity(4);
         while let Ok(frame) = rx.recv() {
             // Sweep up any others VT delivered alongside it (keeps order).
-            let mut frames = vec![frame];
-            while let Ok(f) = rx.try_recv() {
-                frames.push(f);
-            }
+            frames.push(frame);
+            frames.extend(rx.try_iter());
             let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&frames) {
+            if let Err(e) = self.ship_frames(&mut frames) {
                 warn!(error = ?e, "EGFX ship_frames failed");
             }
+            // ship_frames normally drains the batch. It can fail before it
+            // reaches the drain (for example during teardown), so explicitly
+            // discard anything left rather than retrying stale frames later.
+            frames.clear();
             shipped.fetch_add(n, Ordering::Relaxed);
         }
         debug!("EGFX ship loop exiting (output channel closed)");
+    }
+
+    /// Pair adjacent main/auxiliary pictures from AVC444's single VideoToolbox
+    /// session and ship one AVC444 PDU per logical capture. MS-RDPEGFX requires
+    /// both pictures to form one continuous H.264 stream; even PTS values label
+    /// main pictures and the following odd PTS labels their auxiliary view.
+    /// Missing output is discarded and the next main picture is forced to IDR.
+    fn ship_loop_avc444(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodedFrame>,
+        shipped: Arc<AtomicU64>,
+        resync: Arc<AtomicBool>,
+    ) {
+        let mut pending_main: Option<EncodedFrame> = None;
+        while let Ok(frame) = rx.recv() {
+            if frame.pts & 1 == 0 {
+                if let Some(stale_main) = pending_main.replace(frame) {
+                    warn!(
+                        main_pts = stale_main.pts,
+                        "EGFX AVC444 dropped unmatched main output; forcing stream IDR"
+                    );
+                    resync.store(true, Ordering::Relaxed);
+                    shipped.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+
+            let Some(main) = pending_main.take() else {
+                warn!(
+                    auxiliary_pts = frame.pts,
+                    "EGFX AVC444 dropped orphan auxiliary output; forcing stream IDR"
+                );
+                resync.store(true, Ordering::Relaxed);
+                shipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+
+            if main.pts.wrapping_add(1) != frame.pts {
+                warn!(
+                    main_pts = main.pts,
+                    auxiliary_pts = frame.pts,
+                    "EGFX AVC444 dropped non-adjacent output pair; forcing stream IDR"
+                );
+                resync.store(true, Ordering::Relaxed);
+                shipped.fetch_add(2, Ordering::Relaxed);
+                continue;
+            }
+
+            if let Err(error) = self.ship_avc444_pair(main, frame) {
+                warn!(?error, "EGFX AVC444 ship failed");
+                resync.store(true, Ordering::Relaxed);
+            }
+            shipped.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(main) = pending_main {
+            if self.ctx.lock().unwrap().is_some() {
+                warn!(
+                    main_pts = main.pts,
+                    "EGFX AVC444 output closed with an unmatched main picture"
+                );
+            }
+        }
+        debug!("EGFX AVC444 ship loop exiting (encoder output channel closed)");
+    }
+
+    fn ship_avc444_pair(&self, main: EncodedFrame, auxiliary: EncodedFrame) -> Result<()> {
+        let (dvc_messages, egfx_channel_id) = {
+            // Preserve the same lock order as the AVC420 ship path: copy the
+            // context data first, then release ctx before locking the server.
+            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
+                let mut guard = self.ctx.lock().unwrap();
+                let ctx = guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("EGFX AVC444: ctx vanished mid-submit"))?;
+                let surface_id = ctx
+                    .surface_id
+                    .ok_or_else(|| anyhow!("EGFX AVC444: no surface_id"))?;
+                let (width, height) = ctx.dims;
+                ctx.last_ship_at = Instant::now();
+                (
+                    surface_id,
+                    width,
+                    height,
+                    ctx.epoch,
+                    ctx.server_handle.clone(),
+                    ctx.last_shipped_frame_id.clone(),
+                    ctx.ship_times.clone(),
+                )
+            };
+
+            let main_keyframe = main.is_keyframe;
+            let auxiliary_keyframe = auxiliary.is_keyframe;
+            // Keep AVC444 access units deliberately minimal. VideoToolbox may
+            // emit optional SEI/AUD/filler NALs; Microsoft decoders do not need
+            // them, and recovery-point SEI can reset the shared decoder between
+            // the main and auxiliary pictures. SPS/PPS and VCL NALs are enough.
+            let main_payload = self.frame_payload_avc444(main);
+            let auxiliary_payload = self.frame_payload_avc444(auxiliary);
+            let region = || Avc420Region::full_frame(width, height, 22);
+            let main_regions = [region()];
+            let auxiliary_regions = [region()];
+            let ts_ms =
+                u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
+
+            let mut server = server_handle.lock().unwrap();
+            let egfx_channel_id = server
+                .channel_id()
+                .ok_or_else(|| anyhow!("EGFX AVC444: channel_id not assigned"))?;
+            let sent = server.send_avc444_frame(
+                surface_id,
+                &main_payload,
+                &main_regions,
+                Some(&auxiliary_payload),
+                Some(&auxiliary_regions),
+                ts_ms,
+            );
+            if let Some(frame_id) = sent {
+                last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
+                ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
+                    (u64::from(frame_id), Instant::now());
+                if main_keyframe || auxiliary_keyframe {
+                    debug!(
+                        frame_id,
+                        main_keyframe,
+                        auxiliary_keyframe,
+                        main_bytes = main_payload.len(),
+                        auxiliary_bytes = auxiliary_payload.len(),
+                        "EGFX shipped AVC444 frame"
+                    );
+                }
+            } else {
+                debug!("send_avc444_frame returned None");
+            }
+            (server.drain_output(), egfx_channel_id)
+        };
+
+        if dvc_messages.is_empty() {
+            return Ok(());
+        }
+        let svc_messages =
+            encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                .map_err(|error| anyhow!("encode_dvc_messages failed: {error}"))?;
+        let sender = self
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("EGFX AVC444: server-event sender not set"))?;
+        sender
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages: svc_messages,
+            }))
+            .map_err(|_| anyhow!("EGFX AVC444: ServerEvent send failed (event loop closed)"))?;
+        Ok(())
     }
 
     /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
@@ -2343,38 +2554,73 @@ impl Gfx {
         // encoder (re)build can never disagree with an existing surface.
         let (width, height) = ctx.dims;
         if ctx.encoder.is_none() {
-            // Pass actual dims; VideoToolbox pads to 16-px macroblocks
-            // internally and encodes the crop in the SPS, so the client
-            // decodes back to actual dims.
             // Start at the connection's current adaptive target, not the raw
             // ceiling: equal to the ceiling unless the RTT seed lowered it
             // (slow link) or the controller already adjusted it (encoder
             // rebuild mid-connection).
-            let mut encoder = Encoder::new(
-                width,
-                height,
-                self.fps,
-                ctx.adaptive_target_bps,
-                self.keyframe_secs,
-            )?;
-            // Hand VT's output channel to a dedicated ship thread (push model),
-            // so encoded frames are sent the instant they're ready, off the
-            // capture thread. The thread exits when the encoder is dropped (on
-            // connection teardown) and its sender closes.
-            let rx = encoder
-                .take_receiver()
-                .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
-            ctx.encoder = Some(encoder);
             // Fresh throttle counters for this connection.
             ctx.submitted.store(0, Ordering::Relaxed);
             ctx.shipped.store(0, Ordering::Relaxed);
-            let gfx = self.clone();
-            let shipped = ctx.shipped.clone();
-            std::thread::Builder::new()
-                .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped))
-                .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
-            info!("EGFX VideoToolbox encoder initialized + ship thread started");
+            ctx.encoder_resync.store(false, Ordering::Relaxed);
+
+            if self.avc444_enabled && ctx.client_supports_avc444 {
+                // Both streams use 16-aligned H.264 frames internally; the EGFX
+                // region remains the actual visible desktop dimensions.
+                let mut encoder = Avc444Encoder::new(
+                    width,
+                    height,
+                    self.fps,
+                    ctx.adaptive_target_bps,
+                    self.keyframe_secs,
+                )?;
+                let all_intra = encoder.all_intra();
+                let rx = encoder
+                    .take_receiver()
+                    .ok_or_else(|| anyhow!("EGFX: AVC444 receiver already taken"))?;
+                ctx.encoder = Some(ActiveEncoder::Avc444(Box::new(encoder)));
+                let gfx = self.clone();
+                let shipped = ctx.shipped.clone();
+                let resync = ctx.encoder_resync.clone();
+                std::thread::Builder::new()
+                    .name("egfx-avc444-ship".into())
+                    .spawn(move || {
+                        gfx.ship_loop_avc444(rx, shipped, resync);
+                    })
+                    .map_err(|e| anyhow!("EGFX: failed to spawn AVC444 ship thread: {e}"))?;
+                info!(
+                    visible_w = width,
+                    visible_h = height,
+                    all_intra,
+                    "EGFX AVC444 single continuous VideoToolbox stream initialized (4:4:4 active)"
+                );
+            } else {
+                // Pass actual dims; VideoToolbox pads macroblocks internally and
+                // writes the visible crop in SPS.
+                let mut encoder = Encoder::new(
+                    width,
+                    height,
+                    self.fps,
+                    ctx.adaptive_target_bps,
+                    self.keyframe_secs,
+                )?;
+                let rx = encoder
+                    .take_receiver()
+                    .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
+                ctx.encoder = Some(ActiveEncoder::Avc420(encoder));
+                let gfx = self.clone();
+                let shipped = ctx.shipped.clone();
+                std::thread::Builder::new()
+                    .name("egfx-ship".into())
+                    .spawn(move || gfx.ship_loop(rx, shipped))
+                    .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
+                if self.avc444_enabled {
+                    info!(
+                        "EGFX client has AVC420 but no positive V10+ AVC signal — using compatible AVC420 fallback"
+                    );
+                } else {
+                    info!("EGFX VideoToolbox encoder initialized + ship thread started");
+                }
+            }
         }
         // stats: publish the per-connection baseline (no-op unless --stats-endpoint).
         if let Some(s) = crate::stats::global() {
@@ -2615,7 +2861,7 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
+    fn ship_frames(&self, frames: &mut Vec<EncodedFrame>) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -2662,18 +2908,17 @@ impl Gfx {
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
-            for f in frames {
-                // Region = full actual frame, inclusive bounds. QP 22 /
+            // Drain instead of borrowing so frame_payload can move the encoded
+            // allocation straight onto the wire. The Vec keeps its capacity
+            // for the next batch in ship_loop.
+            for f in frames.drain(..) {
+                // Region = full actual frame, exclusive right/bottom bounds. QP 22 /
                 // quality 100 are first-light defaults; tuned in M3. Rebuilt
                 // per frame because `Avc420Region` isn't `Copy`.
-                let region = Avc420Region {
-                    left: 0,
-                    top: 0,
-                    right: width.saturating_sub(1),
-                    bottom: height.saturating_sub(1),
-                    quantization_parameter: 22,
-                    quality: 100,
-                };
+                let region = Avc420Region::full_frame(width, height, 22);
+                let is_keyframe = f.is_keyframe;
+                let ps_count = f.parameter_sets.len();
+                let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
                 let payload = self.frame_payload(f);
                 let ts_ms =
                     u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
@@ -2684,8 +2929,6 @@ impl Gfx {
                 // after "EGFX surface created" is a P-frame (keyframe=false /
                 // param_sets=0), the new client has no reference to paint and
                 // the surface stays blank.
-                let ps_count = f.parameter_sets.len();
-                let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
                 let sent = server.send_avc420_frame(surface_id, &payload, &[region], ts_ms);
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
@@ -2697,7 +2940,7 @@ impl Gfx {
                         (u64::from(frame_id), Instant::now());
                 }
                 match sent {
-                    Some(frame_id) if f.is_keyframe => debug!(
+                    Some(frame_id) if is_keyframe => debug!(
                         frame_id,
                         ?self.wire_format,
                         param_sets = ps_count,
@@ -2712,7 +2955,7 @@ impl Gfx {
                         "EGFX shipped frame"
                     ),
                     None => debug!(
-                        keyframe = f.is_keyframe,
+                        keyframe = is_keyframe,
                         param_sets = ps_count,
                         bytes = payload.len(),
                         "send_avc420_frame returned None"
@@ -2745,25 +2988,39 @@ impl Gfx {
     }
 
     /// Frame the encoded NALs for the wire per the selected `WireFormat`,
-    /// prepending SPS/PPS (from VT's format description) on keyframes.
-    fn frame_payload(&self, f: &EncodedFrame) -> Vec<u8> {
+    /// prepending SPS/PPS (from VT's format description) on keyframes. Consumes
+    /// the frame so the common P-frame path can reuse VideoToolbox's allocation
+    /// instead of copying the complete encoded payload once per frame.
+    fn frame_payload(&self, f: EncodedFrame) -> Vec<u8> {
+        let EncodedFrame {
+            data,
+            is_keyframe,
+            parameter_sets,
+            ..
+        } = f;
         match self.wire_format {
             // VT data is already AVCC (length-prefixed); just prepend the
             // parameter sets as length-prefixed NALs on keyframes.
             WireFormat::LengthPrefixed => {
-                if !f.is_keyframe || f.parameter_sets.is_empty() {
-                    return f.data.clone();
+                if !is_keyframe || parameter_sets.is_empty() {
+                    return data;
                 }
-                let mut out = Vec::with_capacity(f.data.len() + 64);
-                for ps in &f.parameter_sets {
+                let prefix_bytes: usize = parameter_sets.iter().map(|ps| 4 + ps.len()).sum();
+                let mut out = Vec::with_capacity(prefix_bytes + data.len());
+                for ps in &parameter_sets {
                     out.extend_from_slice(&(ps.len() as u32).to_be_bytes());
                     out.extend_from_slice(ps);
                 }
-                out.extend_from_slice(&f.data);
+                out.extend_from_slice(&data);
                 out
             }
-            WireFormat::AnnexB => avcc_to_annex_b(&f.data, &f.parameter_sets, f.is_keyframe),
+            WireFormat::AnnexB => avcc_to_annex_b_in_place(data, &parameter_sets, is_keyframe),
         }
+    }
+
+    fn frame_payload_avc444(&self, mut frame: EncodedFrame) -> Vec<u8> {
+        frame.data = retain_avc444_nals(frame.data);
+        self.frame_payload(frame)
     }
 }
 
@@ -2843,6 +3100,8 @@ impl GfxServerFactory for Gfx {
             epoch: Instant::now(),
             need_keyframe: true,
             client_supports_avc: false,
+            client_supports_avc444: false,
+            encoder_resync: Arc::new(AtomicBool::new(false)),
             egfx_declined: egfx_declined.clone(),
             submitted: Arc::new(AtomicU64::new(0)),
             shipped: Arc::new(AtomicU64::new(0)),
@@ -2913,6 +3172,24 @@ fn caps_indicate_avc(caps: &[CapabilitySet]) -> bool {
     })
 }
 
+/// AVC444 v1 requires an RDPGFX V10+ AVC capability. As with AVC420, require
+/// a positive flagged signal instead of trusting bare V10_1: decoder-less
+/// clients may advertise the reserved/no-flags set alongside AVC_DISABLED.
+fn caps_indicate_avc444(caps: &[CapabilitySet]) -> bool {
+    caps.iter().any(|cap| match cap {
+        CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
+            !flags.contains(CapabilitiesV10Flags::AVC_DISABLED)
+        }
+        CapabilitySet::V10_3 { flags } => !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+        CapabilitySet::V10_4 { flags }
+        | CapabilitySet::V10_5 { flags }
+        | CapabilitySet::V10_6 { flags }
+        | CapabilitySet::V10_6Err { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
+        CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+        CapabilitySet::V8 { .. } | CapabilitySet::V8_1 { .. } | CapabilitySet::V10_1 => false,
+    })
+}
+
 /// Per-connection EGFX state callbacks from upstream `GraphicsPipelineServer`.
 /// MUST NOT lock `server_handle` from these — the server mutex is already held.
 struct GfxHandler {
@@ -2943,15 +3220,18 @@ impl GraphicsPipelineHandler for GfxHandler {
             .filter_map(|raw| raw.parsed().ok().flatten())
             .collect();
         let supports_avc = caps_indicate_avc(&typed);
+        let supports_avc444 = caps_indicate_avc444(&typed);
         info!(
             count = pdu.0.len(),
             parsed_count = typed.len(),
             supports_avc,
+            supports_avc444,
             caps = ?typed,
             "EGFX: client advertised capabilities"
         );
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.client_supports_avc = supports_avc;
+            ctx.client_supports_avc444 = supports_avc444;
         }
     }
 
@@ -3183,22 +3463,28 @@ impl GraphicsPipelineHandler for StubHandler {
 /// Rewrite AVCC (4-byte length-prefixed NALs) to Annex-B (`00 00 00 01` start
 /// codes), prepending SPS/PPS on keyframes. Only used when `MACRDP_H264_ANNEXB`
 /// selects Annex-B framing.
-fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -> Vec<u8> {
+fn avcc_to_annex_b_in_place(
+    mut avcc: Vec<u8>,
+    parameter_sets: &[Vec<u8>],
+    is_keyframe: bool,
+) -> Vec<u8> {
     const START_CODE: [u8; 4] = [0, 0, 0, 1];
-    let mut out = Vec::with_capacity(avcc.len() + 64);
-
-    if is_keyframe {
-        for ps in parameter_sets {
-            out.extend_from_slice(&START_CODE);
-            out.extend_from_slice(ps);
-        }
-    }
-
     let mut i = 0;
+    let mut valid_end = 0;
     while i + 4 <= avcc.len() {
+        let prefix = i;
         let nal_len = u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
         i += 4;
-        if i + nal_len > avcc.len() {
+        let Some(nal_end) = i.checked_add(nal_len) else {
+            warn!(
+                avcc_len = avcc.len(),
+                offset = i,
+                nal_len,
+                "AVCC NAL length overflows buffer; truncating"
+            );
+            break;
+        };
+        if nal_end > avcc.len() {
             warn!(
                 avcc_len = avcc.len(),
                 offset = i,
@@ -3207,16 +3493,91 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
             );
             break;
         }
-        out.extend_from_slice(&START_CODE);
-        out.extend_from_slice(&avcc[i..i + nal_len]);
-        i += nal_len;
+        // AVCC's length prefix and Annex-B's start code are both four bytes,
+        // so every non-keyframe can be converted without allocating or moving
+        // the encoded NAL bytes.
+        avcc[prefix..i].copy_from_slice(&START_CODE);
+        i = nal_end;
+        valid_end = nal_end;
     }
-    out
+    // Match the old converter's fail-closed behavior: discard a malformed NAL
+    // and any incomplete trailing prefix rather than forwarding invalid bytes.
+    avcc.truncate(valid_end);
+
+    if is_keyframe && !parameter_sets.is_empty() {
+        let prefix_bytes: usize = parameter_sets
+            .iter()
+            .map(|ps| START_CODE.len() + ps.len())
+            .sum();
+        let mut out = Vec::with_capacity(prefix_bytes + avcc.len());
+        for ps in parameter_sets {
+            out.extend_from_slice(&START_CODE);
+            out.extend_from_slice(ps);
+        }
+        out.extend_from_slice(&avcc);
+        out
+    } else {
+        avcc
+    }
+}
+
+/// Remove optional H.264 NAL units from a VideoToolbox AVCC access unit before
+/// it enters AVC444's shared decoder timeline. Keep slices plus any in-band
+/// SPS/PPS; the normal payload builder still prepends format-description
+/// parameter sets to keyframes.
+fn retain_avc444_nals(mut avcc: Vec<u8>) -> Vec<u8> {
+    let mut read = 0usize;
+    let mut write = 0usize;
+    while read + 4 <= avcc.len() {
+        let nal_len =
+            u32::from_be_bytes([avcc[read], avcc[read + 1], avcc[read + 2], avcc[read + 3]])
+                as usize;
+        let nal_start = read + 4;
+        let Some(nal_end) = nal_start.checked_add(nal_len) else {
+            break;
+        };
+        if nal_len == 0 || nal_end > avcc.len() {
+            break;
+        }
+        let nal_type = avcc[nal_start] & 0x1f;
+        if matches!(nal_type, 1 | 5 | 7 | 8) {
+            avcc.copy_within(read..nal_end, write);
+            write += nal_end - read;
+        }
+        read = nal_end;
+    }
+    avcc.truncate(write);
+    avcc
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avc444_requires_positive_v10_avc_capability() {
+        let v81 = [CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED,
+        }];
+        assert!(caps_indicate_avc(&v81));
+        assert!(!caps_indicate_avc444(&v81));
+
+        let v10 = [CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::SMALL_CACHE,
+        }];
+        assert!(caps_indicate_avc(&v10));
+        assert!(caps_indicate_avc444(&v10));
+
+        let disabled = [CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::AVC_DISABLED,
+        }];
+        assert!(!caps_indicate_avc(&disabled));
+        assert!(!caps_indicate_avc444(&disabled));
+
+        // Bare V10_1 is intentionally treated as no positive signal because
+        // decoder-less clients may advertise it beside disabled flagged sets.
+        assert!(!caps_indicate_avc444(&[CapabilitySet::V10_1]));
+    }
 
     fn recovery_params() -> RecoveryParams {
         RecoveryParams {
@@ -4708,12 +5069,46 @@ mod tests {
         avcc.extend_from_slice(&[0xAA, 0xAA, 0xAA]);
         avcc.extend_from_slice(&5u32.to_be_bytes());
         avcc.extend_from_slice(&[0xBB, 0xBB, 0xBB, 0xBB, 0xBB]);
-        let out = avcc_to_annex_b(&avcc, &[], false);
+        let allocation = avcc.as_ptr();
+        let out = avcc_to_annex_b_in_place(avcc, &[], false);
         let expected: Vec<u8> = [
             0, 0, 0, 1, 0xAA, 0xAA, 0xAA, 0, 0, 0, 1, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
         ]
         .into();
         assert_eq!(out, expected);
+        assert_eq!(
+            out.as_ptr(),
+            allocation,
+            "P-frame conversion must be zero-copy"
+        );
+    }
+
+    #[test]
+    fn avc444_nal_filter_keeps_only_parameter_sets_and_slices() {
+        let mut avcc = Vec::new();
+        for nal in [
+            &[0x06, 0x11][..],       // SEI: drop
+            &[0x67, 0x42][..],       // SPS: keep
+            &[0x68, 0xCE][..],       // PPS: keep
+            &[0x09, 0xF0][..],       // AUD: drop
+            &[0x65, 0xAA, 0xBB][..], // IDR: keep
+            &[0x0C, 0x80][..],       // filler: drop
+        ] {
+            avcc.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            avcc.extend_from_slice(nal);
+        }
+
+        let filtered = retain_avc444_nals(avcc);
+        let mut expected = Vec::new();
+        for nal in [
+            &[0x67, 0x42][..],
+            &[0x68, 0xCE][..],
+            &[0x65, 0xAA, 0xBB][..],
+        ] {
+            expected.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            expected.extend_from_slice(nal);
+        }
+        assert_eq!(filtered, expected);
     }
 
     #[test]
@@ -4726,7 +5121,7 @@ mod tests {
             v.extend_from_slice(&[0x65, 0x88]);
             v
         };
-        let out = avcc_to_annex_b(&avcc, &[sps.clone(), pps.clone()], true);
+        let out = avcc_to_annex_b_in_place(avcc, &[sps.clone(), pps.clone()], true);
         assert_eq!(&out[0..4], &[0, 0, 0, 1]);
         assert_eq!(&out[4..7], sps.as_slice());
         assert_eq!(&out[7..11], &[0, 0, 0, 1]);

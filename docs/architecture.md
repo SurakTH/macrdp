@@ -20,8 +20,8 @@ src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by
                   default; non-US via src/keyboard_layout.rs),
                   per-side modifier state with NX_DEVICE bits, Caps Lock
                   toggle, AX-driven symbolic-hotkey workarounds
-                  (Cmd+Tab app cycle, Cmd+` window cycle, Spotlight,
-                  screencapture) since WindowServer's symbolic-hotkey
+                  (Cmd+Tab app cycle, Cmd+` window cycle, Ctrl+Arrow Mission
+                  Control/Space actions, Spotlight, screencapture) since WindowServer's symbolic-hotkey
                   dispatcher won't fire for CGEventPost. The Cmd+Tab cycle
                   (also Option+Tab with --alt-tab-switch), and the Cmd+`
                   window cycle (also Option+` with --alt-backtick-switch),
@@ -160,12 +160,14 @@ src/virtual_display/    Opt-in headless display via undocumented
 src/h264.rs       EGFX/H.264 video pipeline (opt-in via --enable-h264).
                   Bridges the VideoToolbox encoder (src/videotoolbox.rs) to
                   upstream's GraphicsPipelineServer: per SCK frame, encode →
-                  non-blocking drain → AVC420 (Annex-B framing) → DRDYNVC →
-                  ServerEvent::Egfx. Uses upstream's auto-allocated surface id
+                  non-blocking drain → AVC420, or paired AVC444 main+auxiliary
+                  streams with --avc444 → DRDYNVC → ServerEvent::Egfx. Uses
+                  upstream's auto-allocated surface id
                   (see the mstsc reconnect-blank quirk note below). Falls back
                   to legacy BitmapUpdate for clients that don't advertise
                   AVC420 decode.
-src/videotoolbox.rs  VideoToolbox H.264 encoder (AVCC NALs + SPS/PPS).
+src/videotoolbox.rs  VideoToolbox H.264 encoder (AVCC NALs + SPS/PPS), including
+                  single-session main→auxiliary submission for AVC444 v1.
                   Feeds VT a full-range BT.709 NV12 (420f) buffer it builds
                   from the captured BGRA — VT would otherwise emit video-range
                   YUV, which mstsc renders washed-out. The BGRA→NV12 conversion

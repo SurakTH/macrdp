@@ -4,6 +4,35 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
+## Unreleased — keyboard symbolic-hotkey fix + AVC444 interoperability correction
+
+- **Plain Ctrl+Arrow now has an explicit RDP input path.** macOS refuses to
+  dispatch Mission Control/Spaces shortcuts from synthetic CGEvents even when
+  the Ctrl and extended-arrow scancodes are correct. macrdp now handles only
+  the four plain chords explicitly through System Events: Up opens Mission
+  Control, Down opens the current app's windows, and Left/Right drive the
+  enabled previous/next-Space shortcuts. Directly executing Apple's Mission
+  Control helper for Up/Down was rejected by macOS 26 with SIGKILL. The unified
+  System Events path is live-verified for all four directions on mstsc. Extra
+  modifiers and ordinary arrows still reach applications,
+  and repeat key-downs are suppressed to prevent overview toggle flicker.
+  Server-side unit/build/clippy verification passes, and the complete four-way
+  shortcut behavior is live-verified on the target client.
+
+- **AVC420/AVC444 metablock rectangles now use the protocol's exclusive
+  right/bottom bounds.** The pinned `ironrdp-egfx` helper modeled
+  `Avc420Region` as inclusive and wrote `width-1`/`height-1` into the embedded
+  RFX AVC metadata. That is almost invisible in ordinary AVC420, but changes a
+  1920x1080 AVC444 reconstruction region into the odd 1919x1079 and can shift
+  the B-area chroma mapping, matching the severe gray/color-edge live symptom.
+  macrdp now vendors `ironrdp-egfx`, emits `width`/`height` for main and
+  auxiliary metadata, and removes the old compensating `+1` only from the outer
+  destination calculation—so the WireToSurface rectangle remains exactly the
+  requested desktop size. The previous single-session/all-IDR corrections are
+  retained. Server tests pass, but the final live mstsc build 26100 test still
+  showed the same severe gray/color-stripe corruption. AVC444 therefore remains
+  a diagnostics-only experiment; AVC420 and Native are the usable paths.
+
 ## v0.9.6 — bug-fix patch: scroll-down regression + an unauthenticated accept-loop DoS
 
 A bug-fix patch over v0.9.5, both fixes from @antonmos. It corrects **two things that shipped broken**: a scroll regression introduced by the v0.9.5 pin bump, and an unauthenticated remote DoS in the second-client-preemption path latent since v0.9.3.

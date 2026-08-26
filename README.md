@@ -1,16 +1,22 @@
 # macrdp
 
-[![Latest release](https://img.shields.io/github/v/release/clintcan/macrdp?sort=semver&label=release)](https://github.com/clintcan/macrdp/releases/latest)
+[![Upstream release](https://img.shields.io/github/v/release/clintcan/macrdp?sort=semver&label=upstream%20release)](https://github.com/clintcan/macrdp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-buy%20me%20a%20coffee-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/clintcan)
 
-A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, **read-write drive redirection** (mount the client's drives in Finder), **smart-card redirection** (use the client's smart card from macOS apps), system audio forwarding, and optional H.264 video (EGFX/AVC420, hardware-encoded). NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
+A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, **read-write drive redirection** (mount the client's drives in Finder), **smart-card redirection** (use the client's smart card from macOS apps), system audio forwarding, and optional hardware-encoded H.264 video (EGFX/AVC420 or opt-in AVC444). NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
 
 This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
+> [!NOTE]
+> This is [SurakTH's fork](https://github.com/SurakTH/macrdp) of the original
+> [clintcan/macrdp](https://github.com/clintcan/macrdp) project. The original
+> authors and contributors retain full credit; fork-specific work and AI
+> assistance are documented in [CREDITS.md](CREDITS.md).
+
 ## Status
 
-v0 — daily-driver usable on a trusted LAN, and usable **over the internet** (VPN / ZeroTier / high-latency links, including mobile). **Latest release: [v0.9.6](https://github.com/clintcan/macrdp/releases/latest)** — *bug-fix patch* (both fixes @antonmos): corrects a **scroll-down regression** from v0.9.5 (a vendored wheel-decode compensation double-corrected once the pin bump moved past upstream's own fix — every downward scroll inflated ~255× while up stayed correct, #179) and an **unauthenticated remote DoS** latent since v0.9.3 (a single silent TCP connection could wedge the second-client-preemption accept loop — health-watchdog-invisible — now bounded; #180 also fixes two more preemption correctness bugs). Builds on **v0.9.5** (*maintenance*: the IronRDP dependency pin was bumped `879ffed8` → `a5d1c682` (133 upstream commits) and vendored divergence shrank — two vendored forks retired, one divergence harvested; no user-facing change). Builds on **v0.9.4** (*security hotfix*: an unauthenticated remote client could wedge the **entire server** with a single malformed 2-byte frame — a pre-TLS 100%-CPU spin in the IronRDP framing reader that both the auth-guard and the health-check watchdog miss; now cleanly rejected instead of spinning, macrdp's upstream PR #1556). Builds on **v0.9.3** (*storm-guard fix + the connection/input batch*): the mstsc/Windows-App reconnect-blank drop loop can no longer run away — the reconnect-storm guard's counter now resets only on a genuinely **established** (sustained) session, so a brief-present-then-blank counts toward the cap and the loop bounds/trips instead of cycling forever (live-verified over ZeroTier). Ships with four merged contributions (@antonmos): a second client now **takes over** the live session (full-auth-gated) instead of hanging (#174), a blank-recovery heal-confirmation deadline (#175), relative-mouse + edge-clamp input fixes (#176), and a clipboard pre-connect-sync fix (#173). The default runtime path is unchanged. Builds on **v0.9.2** (*blank-recovery clean-presentation latch*) and **v0.9.1** (*the lockable-headless release*: the opt-in **`--shield-primary`** headless blanking mode that keeps the Mac lockable, client-resolution auto-adopt on `--virtual-display`, and a `--detach-primary` launchd-restart stopgap for the macOS-26 panel-re-enable bug) and **v0.9.0** (*the webcam release*: a client webcam presents as a **real macOS camera** via `--enable-camera-redirection` — as far as is known the first known open-source RDP _server_ to do so; H.264 over MS-RDPECAM → VideoToolbox decode → a CoreMediaIO Camera system extension, live-verified at 1080p/~30 fps), v0.8.40 (the *headless-laptop release*), and v0.8.39 (the *smooth-resize release*).
+v0 — daily-driver usable on a trusted LAN, and usable **over the internet** (VPN / ZeroTier / high-latency links, including mobile). **Latest upstream release: [v0.9.6](https://github.com/clintcan/macrdp/releases/latest)** — *bug-fix patch* (both fixes @antonmos): corrects a **scroll-down regression** from v0.9.5 (a vendored wheel-decode compensation double-corrected once the pin bump moved past upstream's own fix — every downward scroll inflated ~255× while up stayed correct, #179) and an **unauthenticated remote DoS** latent since v0.9.3 (a single silent TCP connection could wedge the second-client-preemption accept loop — health-watchdog-invisible — now bounded; #180 also fixes two more preemption correctness bugs). Builds on **v0.9.5** (*maintenance*: the IronRDP dependency pin was bumped `879ffed8` → `a5d1c682` (133 upstream commits) and vendored divergence shrank — two vendored forks retired, one divergence harvested; no user-facing change). Builds on **v0.9.4** (*security hotfix*: an unauthenticated remote client could wedge the **entire server** with a single malformed 2-byte frame — a pre-TLS 100%-CPU spin in the IronRDP framing reader that both the auth-guard and the health-check watchdog miss; now cleanly rejected instead of spinning, macrdp's upstream PR #1556). Builds on **v0.9.3** (*storm-guard fix + the connection/input batch*): the mstsc/Windows-App reconnect-blank drop loop can no longer run away — the reconnect-storm guard's counter now resets only on a genuinely **established** (sustained) session, so a brief-present-then-blank counts toward the cap and the loop bounds/trips instead of cycling forever (live-verified over ZeroTier). Ships with four merged contributions (@antonmos): a second client now **takes over** the live session (full-auth-gated) instead of hanging (#174), a blank-recovery heal-confirmation deadline (#175), relative-mouse + edge-clamp input fixes (#176), and a clipboard pre-connect-sync fix (#173). The default runtime path is unchanged. Builds on **v0.9.2** (*blank-recovery clean-presentation latch*) and **v0.9.1** (*the lockable-headless release*: the opt-in **`--shield-primary`** headless blanking mode that keeps the Mac lockable, client-resolution auto-adopt on `--virtual-display`, and a `--detach-primary` launchd-restart stopgap for the macOS-26 panel-re-enable bug) and **v0.9.0** (*the webcam release*: a client webcam presents as a **real macOS camera** via `--enable-camera-redirection` — as far as is known the first known open-source RDP _server_ to do so; H.264 over MS-RDPECAM → VideoToolbox decode → a CoreMediaIO Camera system extension, live-verified at 1080p/~30 fps), v0.8.40 (the *headless-laptop release*), and v0.8.39 (the *smooth-resize release*).
 
 Full per-release notes (what shipped, what was verified live, and the war stories): **[docs/release-history.md](docs/release-history.md)**.
 
@@ -27,10 +33,18 @@ Details and the path to closing the gaps: [docs/production-readiness-roadmap.md]
 ## Quick start
 
 ```bash
-cargo build --release
-codesign -s - --force target/release/macrdp   # ad-hoc sign so TCC grants persist
-./target/release/macrdp
+./start.sh   # auto-builds + ad-hoc signs when needed, then starts recommended mode
 ```
+
+Other presets: `./start.sh lan` for maximum practical quality on a clean LAN
+(HiDPI AVC420, 60 FPS, 50 Mbps, stable TCP and latency-free PCM audio), `./start.sh native`
+for the sharpest HiDPI bitmap text/UI at a stable 12 FPS, or `./start.sh fast`
+for the lowest-latency H.264 LAN setup. For a manual build,
+run `cargo build --release && codesign -s - --force target/release/macrdp`.
+
+Native is the Windows-like RemoteFX/QOI tile path: `mstsc` normally negotiates
+RemoteFX, FreeRDP commonly uses QOIZ/QOI, and some Windows App versions use
+NSCodec. The server automatically falls back to bitmap/RLE when needed.
 
 First run will prompt for:
 1. **Screen Recording permission** (System Settings → Privacy & Security → Screen Recording → enable `macrdp` → restart it).
@@ -42,7 +56,8 @@ Then connect from a client to `<your-mac-ip>:3390` with your Mac username and pa
 Common flags to try next (full reference: [docs/configuration.md](docs/configuration.md)):
 
 ```bash
-./macrdp --enable-h264                      # H.264 video — crisper AND lighter than the default bitmaps
+./macrdp --enable-h264                      # H.264 video — smoother and lighter than the default bitmaps
+./macrdp --enable-h264 --avc444             # Experimental diagnostics only; known live color corruption
 ./macrdp --enable-h264 --adaptive-bitrate   # + congestion-responsive rate control (recommended off-LAN)
 ./macrdp --bind 0.0.0.0:3390                # accept LAN connections (keep it OFF public IPs)
 ./macrdp --virtual-display --width 2560 --height 1440   # headless second desktop; local screen untouched
@@ -59,6 +74,8 @@ macrdp reimplements the macOS symbolic hotkeys in user space (WindowServer won't
 | **Cmd+\`** / **Cmd+Shift+\`** | Cycle windows of the current app |
 | **Cmd+Space** | Spotlight |
 | **Cmd+Shift+3 / 4 / 5** | Screenshots (full screen / region / Screenshot.app) |
+| **Ctrl+↑ / ↓** | Mission Control / windows of the current app |
+| **Ctrl+← / →** | Previous / next desktop Space |
 | **Ctrl+Alt+G** | Gather windows stranded off the virtual display (headless `--capture-primary`/`--detach-primary` modes) |
 | **Ctrl+Alt+Shift+R** | On-demand A/V resync — repaint a stale/idle-blanked screen (forced keyframe) and re-sync drifted audio, without disconnecting. Handy for mstsc after hours idle. |
 
@@ -108,6 +125,7 @@ Both are **ad-hoc signed, not notarized** — open the app once via **right-clic
 
 | Guide | What's in it |
 |-------|--------------|
+| **[Performance & quality tuning record](docs/performance-quality-tuning.md)** | Consolidated record of the H.264 zero-copy/allocation work, Native HiDPI bitmap tuning, codec-quality choices, launcher behavior, trade-offs, and verification status. |
 | **[Configuration & CLI](docs/configuration.md)** | Every flag, the auth-hardening environment variables (rate-limit/lockout/audit), headless mode (`--virtual-display`, `--detach-primary`/`--capture-primary`), and a full set of example invocations. |
 | **[Video](docs/video.md)** | The H.264/EGFX pipeline, Retina capture (`--hidpi`), client-resolution auto-adopt and letterboxing, bitrate/keyframe tuning, the mstsc reconnect-blank quirk and its in-place auto-recovery, and the vImage color-conversion benchmarks. |
 | **[Audio](docs/audio.md)** | RDPSND PCM, opt-in AAC compression (`--enable-aac`), the self-healing capture stream, and mute-on-minimize. |

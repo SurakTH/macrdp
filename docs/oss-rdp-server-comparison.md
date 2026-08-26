@@ -203,12 +203,12 @@ it isn't true.
 > in fact implement. An earlier version of this comparison claimed they had neither — it was
 > wrong, because it trusted the README. Read the tree.
 
-### Where x6nux/macrdp is ahead of us
+### Where x6nux/macrdp is ahead of us, or was the implementation reference
 
 | Their advantage | Our status |
 |---|---|
-| **AVC444 shipped** ("pixel-perfect color", RDP 10) — `yuv444_split.rs` (19 KB) | **Not wired here — parked deliberately, not unfinished.** `src/avc444.rs` has spec-compliant split/combine + roundtrip tests; upstream `ironrdp-egfx` already exposes `send_avc444_frame`. Parked on a *measurement*: VideoToolbox shares one hardware encoder block (two sessions ≈ **1.02× throughput**, effectively serial), so AVC444 costs ~2× encode wall-clock — fine at 1080p/60 (~10 ms/frame), **doesn't fit 4K/60** (~39 ms vs 16.6 ms). Plan is opt-in `--avc444` with that caveat. **They run on the same Apple Silicon and inherit the identical constraint** — they shipped it anyway. |
-| **openh264 software encoder** (13.8 KB) — a VideoToolbox-independent H.264 path | **We have none — H.264 is VideoToolbox-only.** Calibrate this: macrdp is macOS-only and VideoToolbox H.264 encode exists on every supported Mac, so "hardware encode unavailable" is close to a null case, and we still have a full *software* **legacy** path (`rfx.rs`, `nscodec.rs`, `bitmap.rs`) that non-AVC420 clients fall back to automatically. The more interesting angle is **AVC444**: it needs two H.264 streams, and we parked it because VideoToolbox serializes them (1.02×, one shared hardware block) — but a software encoder runs on CPU cores, so VT-for-main + openh264-for-aux could give real parallelism the VT-only budget can't. That may be why they ship both (**unverified — not checked whether they actually pair them**). Worth investigating if AVC444 is ever revisited. |
+| **AVC444 shipped** ("pixel-perfect color", RDP 10) — `yuv444_split.rs` (19 KB) | **Comparable in code, but not in live interoperability.** `--avc444` / `./start.sh avc444` wire the split through one continuous VideoToolbox H.264 session (main then auxiliary), with V10+ capability gating and AVC420 fallback. Synchronized all-IDR pairs, FreeRDP-style 2x2 main-chroma averaging, NAL sanitation, and corrected exclusive region bounds all pass server-side tests, but every live mstsc build 26100 revision still rendered severe gray/color-stripe corruption. The mode is retained for diagnostics only, not claimed as a working counterpart. |
+| **openh264 software encoder** (13.8 KB) — a VideoToolbox-independent H.264 path | **We have none — H.264 is VideoToolbox-only.** Calibrate this: macrdp is macOS-only and VideoToolbox H.264 encode exists on every supported Mac, so "hardware encode unavailable" is close to a null case, and we still have a full *software* **legacy** path (`rfx.rs`, `nscodec.rs`, `bitmap.rs`) that non-AVC clients fall back to automatically. |
 | **HTML clipboard format** (`html.rs`) | Ours does CF_UNICODETEXT / CF_DIB / file lists — **no HTML**. |
 | **Lock-screen capture** (CoreGraphics fallback) | We have none — but see [known-quirks.md](known-quirks.md): the lock screen renders on the *physical* panel and macOS blocks synthetic input to the login window, so copying this yields a screen you still cannot type into. Lower value than it appears. |
 | **Full Tauri GUI** — dashboard, charts, logs, settings, tray, SQLite | Ours is a menu-bar controller. Theirs is a substantially larger application. |
@@ -274,9 +274,9 @@ Each of the following is **absent from their entire source tree** (whole-tree se
 ### Fair summary
 
 Both are genuine, actively-built macOS RDP servers sharing a lineage, and the honest gap is
-**narrower than a README comparison suggests** — they have audio, clipboard, AVC444, a software
-encoder, and a far richer GUI. The real distinction is **device redirection, headless operation,
-UDP transport, and operational hardening**: macrdp is a remote-desktop *platform*, theirs is a
+**narrower than a README comparison suggests** — both now have audio, clipboard, and AVC444;
+they also have a software encoder and a far richer GUI. The real distinction is **device
+redirection, headless operation, UDP transport, and operational hardening**: macrdp is a remote-desktop *platform*, theirs is a
 polished remote *display*. Neither supersedes the other, and for "see and drive my Mac with good
 color and a nice UI" theirs is a reasonable — arguably better-presented — choice.
 

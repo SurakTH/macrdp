@@ -143,6 +143,9 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Reuses the Ctrl+Alt+G gather machinery. Config:
                           #   RESTORE_WINDOWS_ON_DISCONNECT. macOS-only.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
+--avc444                  # request dual-view AVC444 v1 for sharper color detail;
+                          #   requires --enable-h264 and a capable RDPGFX V10+ client,
+                          #   otherwise the session uses compatible AVC420
 --bitrate N               # H.264 bitrate ceiling in Mbps (default 6; only with
                           #   --enable-h264). With --adaptive-bitrate it's the
                           #   ceiling the encoder backs off from under congestion;

@@ -376,9 +376,9 @@ pub struct CaptureDisplay {
     /// Shared "client minimized" flag from the vendor server's
     /// `SuppressOutput` handler. When set, `next_update` short-circuits
     /// (no SCK pull, no encode, no ship) and waits on a short timer
-    /// until the flag clears, at which point the H.264 path forces an
-    /// IDR keyframe so the client can resume from a clean reference
-    /// frame. `None` disables the gate entirely (single-binary builds
+    /// until the flag clears, at which point H.264 forces an IDR and the
+    /// bitmap path forces one full repaint so the client resumes from a
+    /// clean surface. `None` disables the gate entirely (single-binary builds
     /// where the server doesn't expose the handle — e.g., the non-macOS
     /// stub).
     pub display_suppressed: Option<Arc<AtomicBool>>,
@@ -906,7 +906,7 @@ mod macos {
 
     use anyhow::{anyhow, Context};
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
-    use screencapturekit::cv::CVPixelBufferLockFlags;
+    use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
     use screencapturekit::prelude::{
         PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration, SCStreamOutputType,
     };
@@ -972,10 +972,12 @@ mod macos {
         /// `flush_frames` times to push it through within a couple of frame
         /// intervals. Stays 0 (no-op) on the legacy bitmap path.
         flush_remaining: u32,
-        /// Last BGRA frame submitted to EGFX, reused across frames (no per-frame
-        /// realloc) and re-encoded as cheap skip-P-frames during a flush burst.
-        last_frame: Vec<u8>,
-        last_stride: usize,
+        /// Last BGRA frame submitted to EGFX, retained from ScreenCaptureKit
+        /// and re-encoded as cheap skip-P-frames during a flush burst. Holding
+        /// the CoreVideo buffer avoids copying the full desktop on every frame
+        /// (about 2 GB/s of memory traffic at 4K/60). Only one buffer is held,
+        /// and it is released as soon as the bounded flush burst completes.
+        last_frame: Option<CVPixelBuffer>,
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
         display_suppressed: Option<Arc<AtomicBool>>,
@@ -1141,6 +1143,13 @@ mod macos {
                 .with_excluding_windows(&[])
                 .build();
 
+            // The bitmap path is pull-driven by socket writes + software
+            // encoding. Keep only the newest SCK sample while it is busy so a
+            // slow full-screen repaint drops intermediate motion instead of
+            // turning into visible input lag. H.264 keeps a slightly deeper
+            // queue because its hardware encoder is independently bounded.
+            let sample_buffer_capacity = if gfx.is_some() { 4 } else { 1 };
+
             let config = SCStreamConfiguration::new()
                 .with_width(u32::from(width))
                 .with_height(u32::from(height))
@@ -1169,7 +1178,12 @@ mod macos {
                 .with_scales_to_fit(true)
                 .with_preserves_aspect_ratio(letterbox);
 
-            let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
+            let stream = AsyncSCStream::new(
+                &filter,
+                &config,
+                sample_buffer_capacity,
+                SCStreamOutputType::Screen,
+            );
             stream
                 .start_capture()
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
@@ -1227,8 +1241,7 @@ mod macos {
                 frame_interval,
                 flush_frames,
                 flush_remaining: 0,
-                last_frame: Vec::new(),
-                last_stride: 0,
+                last_frame: None,
                 display_suppressed,
                 was_suppressed: false,
                 suppressed_since: None,
@@ -1372,6 +1385,10 @@ mod macos {
                 // MonitorLayout PDU) — silently snapping the resize back
                 // before the next frame ships.
                 if let Some((w, h)) = self.pending_resize.take_settled(RESIZE_DEBOUNCE) {
+                    // Never submit a retained old-size buffer into the fresh
+                    // surface/encoder that the resize is about to create.
+                    self.flush_remaining = 0;
+                    self.last_frame = None;
                     self.desktop_size.set(w, h);
                     self.suppress_next_adopt.store(true, Ordering::Relaxed);
                     if let Some(gfx) = self.gfx.as_ref() {
@@ -1413,23 +1430,21 @@ mod macos {
 
                 // Client minimized (sent `SuppressOutput { desktop_rect: None }`)
                 // — stop pulling SCK samples and stop encoding/shipping. Without
-                // this, mstsc accumulates EGFX frames during a long minimize and
-                // the refocus chew-through locks up its input dispatch for
-                // seconds (typing/clicks queue behind decode-and-paint of every
-                // buffered frame). Also tear down any in-flight flush burst —
-                // re-submitting stale frames during a minimize is pointless.
-                // Cursor + pending bitmap branches above still flow (they're
-                // tiny and harmless to buffer at the client). Re-check the flag
-                // every ~100 ms so resume is responsive.
+                // this, mstsc accumulates frames during a long minimize and the
+                // refocus chew-through locks up its input dispatch for seconds.
+                // This applies to both EGFX and legacy bitmap sessions. On a
+                // bitmap resume we invalidate the seed so the next SCK sample
+                // repaints the whole surface; EGFX instead forces an IDR below.
+                // Re-check every ~100 ms so resume is responsive.
                 //
-                // **Only honor suppress after the first EGFX frame has shipped.**
+                // **Only honor suppress after the first display frame has shipped.**
                 // mstsc's normal connect handshake includes a
                 // `SuppressOutput { None }` *before* its display surface is
                 // ready; blocking the first frame leaves it with a half-init'd
                 // surface that doesn't recover when we un-suppress (mstsc
-                // freezes on the connection). FreeRDP doesn't issue suppress
-                // during connect, so it was never affected. Gate the gate on
-                // `first_egfx_frame_sent` so the handshake completes normally.
+                // freezes on the connection). For EGFX that milestone is
+                // `first_egfx_frame_sent`; for bitmap it is a fully drained
+                // initial seed (`seeded`, with `pending` already empty here).
                 //
                 // **Debounce so transient flaps don't oscillate the pipeline.**
                 // Under heavy local CPU/IO (cargo build) mstsc backs off
@@ -1441,18 +1456,40 @@ mod macos {
                 // engage the gate once the flag has been steady-`true` for
                 // `SUPPRESS_DEBOUNCE`. Real multi-second minimizes still trip
                 // normally.
-                if self.first_egfx_frame_sent {
+                let display_pipeline_ready = if self.gfx.is_some() {
+                    self.first_egfx_frame_sent
+                } else {
+                    self.seeded
+                };
+                if display_pipeline_ready {
                     if let Some(flag) = self.display_suppressed.as_ref() {
                         if flag.load(Ordering::Relaxed) {
                             let started = *self.suppressed_since.get_or_insert_with(Instant::now);
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
                                 self.was_suppressed = true;
                                 self.flush_remaining = 0;
+                                // Release the retained SCK surface while the
+                                // client is minimized; resume starts from a
+                                // fresh frame + forced IDR.
+                                self.last_frame = None;
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                                 continue;
                             }
                         } else {
                             self.suppressed_since = None;
+                            if self.was_suppressed && self.gfx.is_none() {
+                                // Bitmap codecs have no predictive reference
+                                // frame to reset, but the client may have
+                                // discarded its surface while minimized. Force
+                                // one complete repaint before returning to
+                                // cheap dirty-region updates.
+                                self.was_suppressed = false;
+                                self.seeded = false;
+                                self.pending.clear();
+                                tracing::debug!(
+                                    "client un-suppress edge — forcing full bitmap repaint"
+                                );
+                            }
                         }
                     }
                 }
@@ -1472,15 +1509,31 @@ mod macos {
                             if self.flush_remaining > 0 {
                                 self.flush_remaining -= 1;
                                 if let Some(gfx) = self.gfx.as_ref() {
-                                    if !self.last_frame.is_empty() {
-                                        if let Err(e) = gfx.submit_bgra(
-                                            &self.last_frame,
-                                            self.last_stride,
-                                            false,
-                                        ) {
-                                            tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
+                                    if let Some(pixel_buffer) = self.last_frame.as_ref() {
+                                        match pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) {
+                                            Ok(guard) => {
+                                                let src = guard.as_slice();
+                                                if !src.is_empty() {
+                                                    if let Err(e) = gfx.submit_bgra(
+                                                        src,
+                                                        guard.bytes_per_row(),
+                                                        false,
+                                                    ) {
+                                                        tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => tracing::warn!(
+                                                os_status = e,
+                                                "EGFX flush could not lock retained pixel buffer"
+                                            ),
                                         }
                                     }
+                                }
+                                if self.flush_remaining == 0 {
+                                    // Return the retained surface to SCK's pool
+                                    // immediately after the final flush frame.
+                                    self.last_frame = None;
                                 }
                             }
                             continue;
@@ -1624,14 +1677,13 @@ mod macos {
                                     "first EGFX frame shipped — suppress gate now armed"
                                 );
                             }
-                            // Stash this frame and arm the flush burst so that,
-                            // once SCK goes idle after this change, we re-submit
-                            // it enough times to drain mstsc's presentation
-                            // buffer. Reuse the buffer to avoid a per-frame
-                            // realloc; clear keeps the capacity.
-                            self.last_frame.clear();
-                            self.last_frame.extend_from_slice(src);
-                            self.last_stride = stride_bytes;
+                            // Keep the CoreVideo surface itself for the bounded
+                            // flush burst. `image_buffer()` returned an owned
+                            // retained reference, so moving it here prevents
+                            // SCK from recycling its backing store until we are
+                            // done, without copying the full BGRA frame.
+                            drop(guard);
+                            self.last_frame = (self.flush_frames > 0).then_some(pixel_buffer);
                             self.flush_remaining = self.flush_frames;
                             continue;
                         }
@@ -1657,16 +1709,17 @@ mod macos {
                         .filter_map(|r| {
                             let origin = r.origin();
                             let size = r.size();
-                            let x = origin.x.max(0.0).round() as u32;
-                            let y = origin.y.max(0.0).round() as u32;
-                            let w = size.width.max(0.0).round() as u32;
-                            let h = size.height.max(0.0).round() as u32;
-                            let x = u16::try_from(x.min(u32::from(pb_width))).ok()?;
-                            let y = u16::try_from(y.min(u32::from(pb_height))).ok()?;
-                            let w =
-                                u16::try_from(w.min(u32::from(pb_width.saturating_sub(x)))).ok()?;
-                            let h = u16::try_from(h.min(u32::from(pb_height.saturating_sub(y))))
-                                .ok()?;
+                            let x0 = origin.x.max(0.0).floor() as u32;
+                            let y0 = origin.y.max(0.0).floor() as u32;
+                            let x1 = (origin.x.max(0.0) + size.width.max(0.0)).ceil() as u32;
+                            let y1 = (origin.y.max(0.0) + size.height.max(0.0)).ceil() as u32;
+
+                            let x = u16::try_from(x0.min(u32::from(pb_width))).ok()?;
+                            let y = u16::try_from(y0.min(u32::from(pb_height))).ok()?;
+                            let max_w = u32::from(pb_width.saturating_sub(x));
+                            let max_h = u32::from(pb_height.saturating_sub(y));
+                            let w = u16::try_from(x1.saturating_sub(x0).min(max_w)).ok()?;
+                            let h = u16::try_from(y1.saturating_sub(y0).min(max_h)).ok()?;
                             if w == 0 || h == 0 {
                                 None
                             } else {
@@ -1676,6 +1729,10 @@ mod macos {
                         .collect(),
                     _ => vec![(0, 0, pb_width, pb_height)],
                 };
+
+                // Clear any leftover strips from previous ticks so stale older
+                // frames never overwrite newer screen updates (eliminates ghosting).
+                self.pending.clear();
 
                 // Split oversized rects into strips so each BitmapUpdate stays
                 // within the size mstsc will render (see split_strips). No-op

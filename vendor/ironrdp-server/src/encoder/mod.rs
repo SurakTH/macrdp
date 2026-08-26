@@ -542,6 +542,10 @@ struct RemoteFxHandler {
     remotefx: RfxEncoder,
     codec_id: u8,
     desktop_size: Option<DesktopSize>,
+    // Reused across bitmap updates. `set_surface` serializes into its own
+    // outgoing PDU Vec before `handle` returns, so retaining this workspace is
+    // safe and removes one large allocation per dirty rectangle.
+    output: Vec<u8>,
 }
 
 impl RemoteFxHandler {
@@ -550,6 +554,7 @@ impl RemoteFxHandler {
             remotefx: RfxEncoder::new(algo),
             desktop_size: Some(desktop_size),
             codec_id,
+            output: Vec::new(),
         }
     }
 
@@ -560,24 +565,30 @@ impl RemoteFxHandler {
 
 impl BitmapUpdateHandler for RemoteFxHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> Result<UpdateFragmenter> {
-        let mut buffer = vec![0; bitmap.data.len()];
+        self.output.resize(bitmap.data.len().max(4096), 0);
+        // Keep the one-shot RemoteFX header available across output-buffer
+        // retries. Taking it inside the loop used to lose the header whenever
+        // the first size estimate was too small — more likely at max quality.
+        let desktop_size = self.desktop_size;
         let len = loop {
             match self
                 .remotefx
-                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size.take())
+                .encode(bitmap, self.output.as_mut_slice(), desktop_size)
             {
                 Err(e) => match e.kind() {
                     ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
-                        buffer.resize(buffer.len() * 2, 0);
-                        debug!("encoder buffer resized to: {}", buffer.len() * 2);
+                        let new_len = self.output.len().saturating_mul(2);
+                        self.output.resize(new_len, 0);
+                        debug!("encoder buffer resized to: {}", new_len);
                     }
                     _ => Err(e).context("RemoteFX encode error")?,
                 },
                 Ok(len) => break len,
             }
         };
+        self.desktop_size = None;
 
-        set_surface(bitmap, self.codec_id, &buffer[..len])
+        set_surface(bitmap, self.codec_id, &self.output[..len])
     }
 }
 

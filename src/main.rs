@@ -89,13 +89,15 @@ const FALLBACK_HEIGHT: u16 = 720;
 /// NSCodec. The encoder is a Phase-1 stub right now — see CLAUDE.md.
 fn bitmap_codecs() -> BitmapCodecs {
     BitmapCodecs(vec![
-        // NSCodec — for Microsoft Remote Desktop on macOS.
+        // NSCodec — for Microsoft Remote Desktop on macOS. CLL=1 is the
+        // highest-fidelity value allowed by MS-RDPNSC; chroma subsampling and
+        // dynamic fidelity stay disabled so text edges remain clean.
         Codec {
             id: 0,
             property: CodecProperty::NsCodec(NsCodec {
                 is_dynamic_fidelity_allowed: false,
-                is_subsampling_allowed: false, // Phase 3 will flip this on.
-                color_loss_level: 3,
+                is_subsampling_allowed: false,
+                color_loss_level: 1,
             }),
         },
         // RemoteFx — what mstsc actually uses.
@@ -117,6 +119,27 @@ fn bitmap_codecs() -> BitmapCodecs {
             property: CodecProperty::QoiZ,
         },
     ])
+}
+
+#[cfg(test)]
+mod bitmap_codec_tests {
+    use super::*;
+
+    #[test]
+    fn nscodec_preset_requests_maximum_fidelity() {
+        let ns = bitmap_codecs()
+            .0
+            .into_iter()
+            .find_map(|codec| match codec.property {
+                CodecProperty::NsCodec(ns) => Some(ns),
+                _ => None,
+            })
+            .expect("NSCodec must remain advertised");
+
+        assert!(!ns.is_dynamic_fidelity_allowed);
+        assert!(!ns.is_subsampling_allowed);
+        assert_eq!(ns.color_loss_level, 1);
+    }
 }
 
 /// Bounds of the user's primary display in macOS's global point-coord
@@ -390,6 +413,14 @@ struct Args {
     #[arg(long)]
     enable_h264: bool,
 
+    /// Prefer RDP AVC444 v1 (full 4:4:4 chroma) for sharp text and UI while
+    /// retaining H.264 motion. Requires --enable-h264 and an RDP 10+ client;
+    /// AVC420-only clients automatically fall back to the normal H.264 path.
+    /// AVC444 encodes two synchronized streams and is therefore heavier than
+    /// AVC420; the dedicated launcher uses a conservative frame cap.
+    #[arg(long, requires = "enable_h264")]
+    avc444: bool,
+
     /// Target H.264 bitrate in megabits/sec (only with --enable-h264).
     /// Default 6. Raising it sharpens detail at the cost of bigger per-frame
     /// writes, which can fill the socket buffer and delay audio on a
@@ -647,6 +678,12 @@ struct Args {
     /// adopts, so the cap applies there). Config: MAX_CLIENT_SIZE.
     #[arg(long = "max-client-size", value_name = "WxH", value_parser = parse_max_client_size)]
     max_client_size: Option<(u16, u16)>,
+
+    /// Only accept connections from these client IP addresses (comma-separated or repeated).
+    /// If specified, any connection from an IP not in this list is rejected immediately.
+    /// Loopback (127.0.0.1) is always permitted. Config key: ALLOW_IP.
+    #[arg(long = "allow-ip", value_delimiter = ',')]
+    allow_ip: Vec<std::net::IpAddr>,
 
     /// On Cmd+Tab, un-minimize the target app's window (bring it back from the
     /// Dock) instead of just activating the app. Off by default, which matches
@@ -1551,6 +1588,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_H264", false) {
         argv.push("--enable-h264".into());
     }
+    if on("AVC444", false) {
+        argv.push("--avc444".into());
+    }
     if on("ENABLE_AAC", false) {
         argv.push("--enable-aac".into());
     }
@@ -2351,8 +2391,8 @@ async fn async_main() -> Result<()> {
     if !args.enable_h264 {
         info!(
             "video codec: legacy bitmap path (RemoteFX/QOI/NSCodec/raw, client-negotiated). \
-             For crisp H.264 on capable clients (mstsc, Microsoft Remote Desktop, FreeRDP, \
-             Thincast) pass --enable-h264 (AVC420 over EGFX)."
+             For smoother motion and lower bandwidth on capable clients pass --enable-h264 \
+             (AVC420 over EGFX), or add --avc444 for sharper color detail on RDPGFX V10+."
         );
     }
 
@@ -2430,6 +2470,7 @@ async fn async_main() -> Result<()> {
             desktop_size.clone(),
             fps,
             args.bitrate.max(1).saturating_mul(1_000_000),
+            args.avc444,
             args.keyframe_interval,
             args.h264_frames_in_flight.max(1),
             egfx_on_lossy_flag.clone(),
@@ -2589,9 +2630,9 @@ async fn async_main() -> Result<()> {
 
     // Auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log via the
     // server's pre-handshake/post-disconnect ConnectionHandler seam. On by default
-    // (MACRDP_CONN_GUARD=0 disables).
+    // (MACRDP_CONN_GUARD=0 disables). Passes --allow-ip whitelist if configured.
     let conn_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> =
-        auth_guard::AuthGuardHandler::from_env();
+        auth_guard::AuthGuardHandler::from_allow_ips(args.allow_ip);
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
@@ -2942,6 +2983,7 @@ mod config_tests {
              export BIND=0.0.0.0:3390\n\
              USERNAME=alice\n\
              ENABLE_H264=1\n\
+             AVC444=1\n\
              ENABLE_AAC=0\n\
              HIDPI=1\n\
              UNMINIMIZE=1\n\
@@ -2960,6 +3002,7 @@ mod config_tests {
         assert_eq!(args.bind.to_string(), "0.0.0.0:3390");
         assert_eq!(args.username.as_deref(), Some("alice"));
         assert!(args.enable_h264);
+        assert!(args.avc444);
         assert!(!args.enable_aac);
         assert!(args.hidpi);
         assert!(args.unminimize_on_switch);
@@ -3015,6 +3058,15 @@ mod config_tests {
         assert!(!args.enable_h264);
         assert!(!args.enable_udp_multitransport);
         assert!(!args.udp_migrate_egfx);
+    }
+
+    #[test]
+    fn avc444_cli_requires_h264() {
+        let args = Args::try_parse_from(["macrdp", "--enable-h264", "--avc444"]).unwrap();
+        assert!(args.enable_h264);
+        assert!(args.avc444);
+
+        assert!(Args::try_parse_from(["macrdp", "--avc444"]).is_err());
     }
 
     #[test]
