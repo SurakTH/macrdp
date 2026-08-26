@@ -193,7 +193,8 @@ next sample repaints the complete surface before dirty-region updates resume.
 
 - `./start.sh` is a dispatcher. No mode means Ultimate; `avc444` selects the
   diagnostic-only 4:4:4 preset, `lan` selects LAN Max, `native` selects the
-  high-clarity bitmap preset, and `fast` selects low-latency H.264.
+  high-clarity bitmap preset, `fast` selects low-latency H.264, and `doctor`
+  runs a read-only prerequisites/binary/signing/port/LAN preflight.
 - Every preset sources `scripts/ensure-release.sh`.
 - The helper builds `target/release/macrdp` when the binary is missing or older
   than Rust/native source, Cargo metadata, or the toolchain file.
@@ -201,6 +202,9 @@ next sample repaints the complete surface before dirty-region updates resume.
   macOS development/TCC behavior consistent.
 - `MACRDP_SKIP_AUTO_BUILD=1` skips the automatic check, but cannot start if the
   release binary is missing.
+- CI syntax-checks every launcher, verifies mode/argument routing through
+  temporary non-launching stubs, audits repository hygiene, and runs the
+  vendored `ironrdp-egfx` region/PDU suite directly.
 - The current project release binary was rebuilt and ad-hoc signed after these
   source changes.
 

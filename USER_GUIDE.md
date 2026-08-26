@@ -19,6 +19,14 @@
 เปิดโปรแกรม **Terminal** เข้ามาที่โฟลเดอร์นี้ แล้วใช้คำสั่งเดียว:
 
 ```bash
+./start.sh doctor
+```
+
+คำสั่ง `doctor` ตรวจความพร้อมแบบ read-only โดยไม่ build และไม่เปิด server:
+ตรวจเครื่องมือ build, Release binary, codesign, port 3390, พื้นที่ว่าง และ IP
+ในวง LAN หากไม่พบปัญหาร้ายแรงจึงเปิดใช้งานด้วย:
+
+```bash
 ./start.sh
 ```
 

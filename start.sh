@@ -26,6 +26,10 @@ case "${1:-ultimate}" in
     shift
     exec "$DIR/start-fast.sh" "$@"
     ;;
+  doctor|diagnose|check)
+    shift
+    exec "$DIR/scripts/doctor.sh" "$@"
+    ;;
   -h|--help|help)
     cat <<'EOF'
 Usage: ./start.sh [mode] [macrdp options]
@@ -36,6 +40,7 @@ Modes:
   native    HiDPI bitmap mode: sharpest text/UI, stable 12 FPS
   fast      Lowest-latency H.264 preset for a fast LAN
   avc444    Experimental diagnostics only; known color corruption on tested clients
+  doctor    Read-only preflight: build tools, binary, signing, port, and LAN IP
 
 The launcher automatically runs an optimized release build when source files
 are newer than the binary. Set MACRDP_SKIP_AUTO_BUILD=1 to disable that check.

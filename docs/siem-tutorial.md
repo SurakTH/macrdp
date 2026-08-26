@@ -166,7 +166,7 @@ container is flaky.
 
 [INPUT]
     Name             tail
-    Path             /Users/YOU/Library/Logs/macrdp-audit.log
+    Path             /Users/<mac-user>/Library/Logs/macrdp-audit.log
     Tag              macrdp.audit
     Parser           macrdp_json
     Read_from_Head   true

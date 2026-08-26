@@ -33,8 +33,15 @@ Details and the path to closing the gaps: [docs/production-readiness-roadmap.md]
 ## Quick start
 
 ```bash
+./start.sh doctor   # read-only preflight; does not build or start the server
 ./start.sh   # auto-builds + ad-hoc signs when needed, then starts recommended mode
 ```
+
+`doctor` checks macOS/build prerequisites, whether the optimized binary is
+missing or stale, code signing, executable launcher bits, port 3390, free disk
+space, and the active LAN address. Screen Recording and Accessibility remain
+verified by macrdp itself at launch because macOS does not expose a reliable
+read-only shell query for another binary's TCC grants.
 
 Other presets: `./start.sh lan` for maximum practical quality on a clean LAN
 (HiDPI AVC420, 60 FPS, 50 Mbps, stable TCP and latency-free PCM audio), `./start.sh native`

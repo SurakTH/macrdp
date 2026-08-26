@@ -12,6 +12,11 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 --password PASS           Skip the interactive prompt
 --skip-auth               Bypass PAM (testing only)
 --keychain                Read password from macOS Keychain (service=macrdp)
+--allow-ip IP[,IP...]     Only accept clients with an exact IPv4/IPv6 address in
+                          this allowlist. Use commas or repeat the flag for more
+                          than one address. Other addresses are rejected before
+                          authentication; loopback (127.0.0.1/::1) is always
+                          allowed. Exact addresses only (no CIDR ranges).
 -v, --verbose             Show all the noisy logs the default filter hides
 --allow-sleep             Let the Mac sleep / auto-lock normally (default
                           is to spawn `caffeinate` so an idle Mac doesn't
@@ -292,6 +297,25 @@ to other hosts — you can't lock yourself out locally. The defaults are conserv
 are env-only (no CLI flags) and can be set via `config.env` (the matching keys are shown) or
 the LaunchAgent plist's `EnvironmentVariables`:
 
+`--allow-ip` is a separate, stricter gate and remains enforced even if
+`MACRDP_CONN_GUARD=0`. This is useful when listening on the LAN but only one or
+two known clients should connect. Supply exact client addresses (not CIDR
+ranges), separated by commas or by repeating the flag:
+
+```bash
+# Permit one LAN client.
+./macrdp --bind 0.0.0.0:3390 --allow-ip 192.168.1.20
+
+# Permit multiple clients (the repeated form works too).
+./macrdp --bind 0.0.0.0:3390 \
+  --allow-ip 192.168.1.20,192.168.1.21 \
+  --allow-ip 2001:db8::20
+```
+
+If a client receives its address via DHCP, reserve that address in the router or
+update the allowlist when it changes. Loopback (`127.0.0.1`/`::1`) stays allowed
+so local testing and recovery remain possible.
+
 ```
 MACRDP_CONN_GUARD=1               # master switch (0/off = disable rate-limit + lockout)   [config.env: CONN_GUARD]
 MACRDP_AUDIT_LOG=1                # connection audit log (independent of the guard)          [AUDIT_LOG]
@@ -405,6 +429,11 @@ Both restore the original layout when the last client disconnects, and both auto
 # even with TLS + NLA/CredSSP + rate-limit/lockout, the production answer for any
 # RDP server is to reach it over a VPN or an RD Gateway, never a raw public IP.
 ./macrdp --bind 0.0.0.0:3390 --username clint
+
+# Accept LAN connections only from these two client addresses. Other remote
+# addresses are rejected before authentication; loopback remains available.
+./macrdp --bind 0.0.0.0:3390 \
+  --allow-ip 192.168.1.20,192.168.1.21
 
 # Higher frame rate, custom cert dir.
 ./macrdp --fps 30 --cert-dir ~/.macrdp-certs

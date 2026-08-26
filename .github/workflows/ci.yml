@@ -40,6 +40,15 @@ jobs:
         with:
           persist-credentials: false
 
+      # Fork-specific, dependency-free guards. Keep these before the toolchain
+      # install so launcher/repository mistakes fail fast and cheaply.
+      - name: Repository and launcher guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/check-repo-hygiene.sh
+          bash scripts/test-launchers.sh
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
@@ -62,6 +71,13 @@ jobs:
         env:
           RUSTFLAGS: ''
         run: cargo test --locked
+
+      # ironrdp-egfx is a vendored path dependency, not a workspace member.
+      # Root `cargo test` compiles it but does not run its own PDU/region tests.
+      - name: Test ironrdp-egfx (vendored AVC region logic)
+        env:
+          RUSTFLAGS: ''
+        run: cargo test --locked -p ironrdp-egfx
 
       # vendor/ironrdp-rdpeudp is a STANDALONE crate (not a workspace member, so
       # the root cargo test/fmt don't reach it). It's platform-independent
