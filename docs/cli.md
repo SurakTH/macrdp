@@ -219,7 +219,7 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   webcam — the raw-USB path can't (it refuses those
                           #   bulk reads with 0x8007001f).
                           #   REQUIRES the camera system extension to be installed +
-                          #   activated once (macrdpController.app → "Enable macrdp
+                          #   activated once (macrdp Controller.app → "Enable macrdp
                           #   Camera…", needs the entitled/notarized build) — see
                           #   docs/camera-extension-setup.md. Without it macrdp still
                           #   negotiates + decodes, it just has no camera to feed.

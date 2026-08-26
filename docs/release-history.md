@@ -4,7 +4,26 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
-## Unreleased — keyboard symbolic-hotkey fix + AVC444 interoperability correction
+## Unreleased — fork controller, optimized presets, keyboard shortcuts, and AVC444 diagnostics
+
+- **A native `macrdp Controller` now provides the everyday setup path.** The
+  menu-bar app exposes the Ultimate, LAN Max, Native, and Fast profiles, an
+  exact-address Allowed IP control, connection/status information, and the
+  server Start/Restart/Stop actions without requiring repeated Terminal
+  commands. Opening it from Finder (or reopening it after closing the window)
+  now always presents Settings instead of appearing to do nothing. Release CI
+  builds the Controller on every macOS run and packages it beside `macrdp.app`
+  in a checksummed DMG; CI artifacts remain ad-hoc signed and therefore require
+  right-click → Open once on a downloaded build.
+
+- **The fork's launch profiles make the quality/performance trade-off explicit.**
+  Ultimate is the balanced daily default, LAN Max pushes AVC420 quality on a
+  clean LAN, Native prioritizes sharp lossless bitmap/tile rendering at a lower
+  frame rate, and Fast minimizes latency. AVC444 remains isolated as a clearly
+  labeled diagnostics mode because the live Windows client still corrupts its
+  color reconstruction. See
+  [performance-quality-tuning.md](performance-quality-tuning.md) for the exact
+  settings, measurements, and limitations.
 
 - **Plain Ctrl+Arrow now has an explicit RDP input path.** macOS refuses to
   dispatch Mission Control/Spaces shortcuts from synthetic CGEvents even when

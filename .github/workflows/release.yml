@@ -198,6 +198,17 @@ jobs:
             || { echo "shield-window helper not embedded in the app"; exit 1; }
           codesign --verify --deep --strict target/macrdp.app
 
+      - name: Assemble macrdp Controller.app (ad-hoc signed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="$RUNNER_TEMP/controllerout" CODESIGN_IDENTITY="-" gui/make-tray-app.sh
+          test -x "target/macrdp Controller.app/Contents/MacOS/macrdptray" \
+            || { echo "Controller executable not embedded in the app"; exit 1; }
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' \
+            "target/macrdp Controller.app/Contents/Info.plist")" = "macrdp Controller"
+          codesign --verify --strict "target/macrdp Controller.app"
+
       - name: Stage app artifact
         id: stageapp
         shell: bash
@@ -214,12 +225,31 @@ jobs:
           echo "archive=dist/${NAME}.zip" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/${NAME}.zip.sha256" >> "$GITHUB_OUTPUT"
 
+      # The easiest installation path: both apps plus an Applications drop-link.
+      # The bundles are ad-hoc signed in CI, so the draft release retains the
+      # right-click -> Open warning documented in README.md.
+      - name: Stage installer DMG
+        id: stagedmg
+        shell: bash
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          NAME="macrdp-${VERSION}-${{ matrix.target }}"
+          OUT_DIR=dist DMG_NAME="${NAME}.dmg" CODESIGN_IDENTITY="-" \
+            packaging/make-dmg.sh "target/macrdp.app" "target/macrdp Controller.app"
+          hdiutil verify "dist/${NAME}.dmg"
+          (cd dist && shasum -a 256 "${NAME}.dmg" > "${NAME}.dmg.sha256")
+          echo "archive=dist/${NAME}.dmg" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${NAME}.dmg.sha256" >> "$GITHUB_OUTPUT"
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: |
             ${{ steps.stage.outputs.archive }}
             ${{ steps.stageapp.outputs.archive }}
+            ${{ steps.stagedmg.outputs.archive }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -230,6 +260,8 @@ jobs:
             ${{ steps.stage.outputs.checksum }}
             ${{ steps.stageapp.outputs.archive }}
             ${{ steps.stageapp.outputs.checksum }}
+            ${{ steps.stagedmg.outputs.archive }}
+            ${{ steps.stagedmg.outputs.checksum }}
           if-no-files-found: error
           retention-days: 7
 
@@ -259,6 +291,7 @@ jobs:
           mkdir -p out
           find artifacts -type f -name '*.tar.gz' -exec cp {} out/ \;
           find artifacts -type f -name '*.zip'    -exec cp {} out/ \;
+          find artifacts -type f -name '*.dmg'    -exec cp {} out/ \;
           find artifacts -type f -name '*.sha256' -exec cp {} out/ \;
           (cd out && cat *.sha256 > SHA256SUMS && rm *.sha256)
           cat out/SHA256SUMS
@@ -268,9 +301,11 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           draft: true                 # human reviews before publishing
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
             out/*.tar.gz
             out/*.zip
+            out/*.dmg
             out/SHA256SUMS

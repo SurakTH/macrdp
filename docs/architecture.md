@@ -60,7 +60,7 @@ gui/Sources/macrdpcamera  The "macrdp Camera" CoreMediaIO Camera SYSTEM EXTENSIO
                   match the decoder — CMIO does NOT transcode, so an advertised format
                   that differs from the buffers sent renders garbage. Hand-assembled
                   into a .systemextension bundle by packaging/make-camera-extension.sh
-                  (NO Xcode), signed + notarized, embedded in macrdpController.app and
+                  (NO Xcode), signed + notarized, embedded in macrdp Controller.app and
                   activated once via OSSystemExtensionRequest (see
                   gui/Sources/macrdptray/CameraExtension.swift). Runs under a role
                   account, so its os_log is invisible without sudo. Setup + the four

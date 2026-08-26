@@ -124,15 +124,19 @@ app, icons, TCC notes): **[packaging/README.md](packaging/README.md)**.
 
 ## Release artifacts
 
-Pushing a `v*` tag runs the [release workflow](.github/workflows/release.yml), which builds on an Apple-Silicon runner and attaches these to a draft GitHub Release (Apple Silicon / `aarch64-apple-darwin` only):
+Pushing a `v*` tag runs the [release workflow](.github/workflows/release.yml), which builds on an Apple-Silicon runner and attaches these to a draft GitHub Release (Apple Silicon / `aarch64-apple-darwin` only). Tags containing a suffix such as `-controller.1` are marked as pre-releases automatically:
 
 | File | What it is |
 |------|------------|
+| `macrdp-<ver>-aarch64-apple-darwin.dmg` | easiest install: **`macrdp.app` + `macrdp Controller.app`** and an Applications drop-link |
 | `macrdp-<ver>-aarch64-apple-darwin.tar.gz` | the **bare CLI binary** + `LICENSE`/`README` |
-| `macrdp-<ver>-aarch64-apple-darwin-app.zip` | the full **`macrdp.app`**, with the embedded smart-card IFD handler + installer — the only artifact that carries everything `--enable-smartcard-redirection` needs |
-| `SHA256SUMS` | checksums for both |
+| `macrdp-<ver>-aarch64-apple-darwin-app.zip` | the full **`macrdp.app`**, with the embedded smart-card IFD handler + installer — the only standalone artifact that carries everything `--enable-smartcard-redirection` needs |
+| `SHA256SUMS` | checksums for every downloadable archive |
 
-Both are **ad-hoc signed, not notarized** — open the app once via **right-click → Open** (or `xattr -dr com.apple.quarantine macrdp.app`). For a Developer-ID-signed + notarized build, or the menu-bar controller app (neither is produced in CI), build locally with [packaging/make-app.sh](packaging/README.md).
+The CI-built apps are **ad-hoc signed, not notarized** — open each app once via
+**right-click → Open**. The DMG contains both apps, but it does not remove this
+Gatekeeper step. For a Developer-ID-signed + notarized build, build locally with
+[packaging/make-app.sh](packaging/README.md) and the matching controller/DMG scripts.
 
 ## Documentation
 

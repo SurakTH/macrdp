@@ -180,7 +180,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           → "Video capturing devices", ticked BEFORE connecting.
                           REQUIRES the "macrdp Camera" system extension to be
                           installed + activated ONCE — it ships inside
-                          macrdpController.app; open the controller and choose
+                          macrdp Controller.app; open the controller and choose
                           "Enable macrdp Camera…", then approve it in System Settings
                           → General → Login Items & Extensions → Camera Extensions.
                           That needs the signed + notarized build (the entitlement is

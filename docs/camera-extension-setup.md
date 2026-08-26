@@ -13,7 +13,7 @@ one fails with no error and cost real debugging time.
 
 ## What activates what
 
-- **`macrdpController.app`** (the menu-bar app, `gui/`) embeds the extension at
+- **`macrdp Controller.app`** (the menu-bar app, `gui/`) embeds the extension at
   `Contents/Library/SystemExtensions/com.clintcan.macrdp.controller.camera.systemextension`
   (the filename MUST equal the bundle id) and activates it
   via `OSSystemExtensionRequest` (menu → **Enable macrdp Camera…**). It needs the
@@ -76,14 +76,14 @@ gui/make-tray-app.sh
 `QGLA89KHM7.com.clintcan.macrdp`); override `APP_GROUP=` if you registered a different
 group. This builds the extension (`make-camera-extension.sh`), embeds + signs it,
 signs the controller with the entitlement + profile, notarizes the whole app, and
-installs to `/Applications/macrdpController.app`.
+installs to `/Applications/macrdp Controller.app`.
 
 ## Activate
 
 1. During development, enable dev mode so the OS skips the version check between
    rebuilds: `systemextensionsctl developer on` (reboot if it doesn't take effect;
    community reports vary).
-2. Launch `/Applications/macrdpController.app` → menu → **Enable macrdp Camera…**.
+2. Launch `/Applications/macrdp Controller.app` → menu → **Enable macrdp Camera…**.
 3. macOS will block it pending approval: **System Settings → Privacy & Security**,
    scroll to *"System software from Clint Christopher Canada was blocked"* → **Allow**
    (the menu offers an "Open Privacy & Security" button). You may need to re-run
@@ -126,7 +126,7 @@ The quickest health check is actually on the macrdp side — it logs the sink fe
   removes the *version-bump* requirement but not necessarily the reboot. Budget for a
   reboot per meaningful reinstall.
 - **Uninstall:** deactivate from the app (a `deactivationRequest` — wire a menu item if
-  needed) or delete `macrdpController.app` (the extension auto-uninstalls when its host
+  needed) or delete `macrdp Controller.app` (the extension auto-uninstalls when its host
   app is removed). `systemextensionsctl reset` nukes ALL extensions and typically needs
   SIP disabled — last resort only.
 - **Logs:** `log stream --predicate 'subsystem == "com.clintcan.macrdp.camera"'` for the

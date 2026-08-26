@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Entitlements for macrdpController.app when it embeds + activates the macrdp
+  Entitlements for macrdp Controller.app when it embeds + activates the macrdp
   Camera system extension (camera redirection Phase 3).
 
   Only used when gui/make-tray-app.sh is run with CAMERA_EXTENSION=1 (the

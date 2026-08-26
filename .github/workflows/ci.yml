@@ -127,6 +127,11 @@ jobs:
           RUSTFLAGS: '-D warnings'
         run: cargo test --locked --target aarch64-apple-darwin
 
+      # Keep the native controller buildable on every main/PR change instead of
+      # discovering Swift or AppKit regressions only after a release tag exists.
+      - name: Build macrdp Controller (Swift release)
+        run: ( cd gui && swift build -c release --product macrdptray )
+
   # End-to-end integration test for the security AUDIT LOG. A cargo test can't
   # drive CredSSP/NLA (the harness is TLS-only), so this runs a real loopback
   # macrdp + a real FreeRDP client (`+auth-only`, no GUI) and asserts the JSON
