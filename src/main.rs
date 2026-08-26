@@ -1702,6 +1702,39 @@ fn args_from_config(path: &Path) -> Result<Args> {
             argv.push(sz.clone());
         }
     }
+
+    // First-class config keys used by the menu-bar controller's performance
+    // profiles. Keeping these out of EXTRA_FLAGS makes the generated config
+    // readable and lets the UI update one setting without rewriting unrelated
+    // operator-supplied flags. An explicitly-present switch key is
+    // authoritative even when it is 0: the matching switch is stripped from
+    // EXTRA_FLAGS below so a disabled UI toggle cannot be silently re-enabled.
+    let mut configured_value_flags: Vec<&str> = Vec::new();
+    for (cfg_key, cli_flag) in [
+        ("ALLOW_IP", "--allow-ip"),
+        ("FPS", "--fps"),
+        ("KEYFRAME_CHANGE_PCT", "--keyframe-change-pct"),
+        ("KEYFRAME_CLICK_PCT", "--keyframe-click-pct"),
+        ("KEYFRAME_INTERVAL", "--keyframe-interval"),
+        ("H264_FRAMES_IN_FLIGHT", "--h264-frames-in-flight"),
+        ("FLUSH_FRAMES", "--flush-frames"),
+    ] {
+        if let Some(value) = cfg.get(cfg_key).filter(|value| !value.is_empty()) {
+            argv.push(cli_flag.into());
+            argv.push(value.clone());
+            configured_value_flags.push(cli_flag);
+        }
+    }
+
+    let mut configured_switch_flags: Vec<&str> = Vec::new();
+    for (cfg_key, cli_flag) in [("KEYFRAME_ON_CHANGE", "--keyframe-on-change")] {
+        if cfg.contains_key(cfg_key) {
+            configured_switch_flags.push(cli_flag);
+            if on(cfg_key, false) {
+                argv.push(cli_flag.into());
+            }
+        }
+    }
     // Env-only tunables (auth guard, health-check watchdog, blank recovery,
     // auto-reconnect cookie — each read lazily after this point). Bridge the
     // friendly config.env keys to their MACRDP_* env vars here so menu-bar /
@@ -1790,6 +1823,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS",
         ),
         ("AUTO_RECONNECT", "MACRDP_AUTO_RECONNECT"),
+        // AVC444 is diagnostics-only, but make its all-intra safety setting
+        // explicit when the controller stages that experimental mode.
+        ("AVC444_ALL_INTRA", "MACRDP_AVC444_ALL_INTRA"),
         // USB-redirection read-ahead tunables (--enable-usb-redirection). These
         // are env-only, read via getenv() in usb_spike.m; bridging them lets the
         // webcam knobs be set from config.env instead of the plist's
@@ -1827,8 +1863,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if let Some(extra) = cfg.get("EXTRA_FLAGS") {
         let mut toks = extra.split_whitespace();
         while let Some(tok) = toks.next() {
-            if bitrate.is_some() && tok == "--bitrate" {
+            if (bitrate.is_some() && tok == "--bitrate") || configured_value_flags.contains(&tok) {
                 toks.next(); // consume its value so it isn't pushed either
+                continue;
+            }
+            if configured_switch_flags.contains(&tok) {
                 continue;
             }
             argv.push(tok.to_string());
@@ -3043,6 +3082,48 @@ mod config_tests {
         // Empty BITRATE is ignored (no arg pushed) → default, not an error.
         let p = write_temp("br4", "BITRATE=\n");
         assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn controller_profile_keys_map_to_cli_and_override_stale_extra_flags() {
+        let p = write_temp(
+            "profile",
+            "ENABLE_H264=1\n\
+             ALLOW_IP=192.168.1.20,192.168.1.21\n\
+             FPS=60\n\
+             KEYFRAME_ON_CHANGE=0\n\
+             KEYFRAME_CHANGE_PCT=15\n\
+             KEYFRAME_CLICK_PCT=3\n\
+             KEYFRAME_INTERVAL=2.0\n\
+             H264_FRAMES_IN_FLIGHT=1\n\
+             FLUSH_FRAMES=2\n\
+             EXTRA_FLAGS=\"--fps 12 --keyframe-on-change --allow-ip 10.0.0.1 --stretch\"\n",
+        );
+        let args = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+
+        assert_eq!(args.fps, Some(60));
+        assert!(!args.keyframe_on_change);
+        assert_eq!(args.keyframe_change_pct, 15);
+        assert_eq!(args.keyframe_click_pct, 3);
+        assert_eq!(args.keyframe_interval, 2.0);
+        assert_eq!(args.h264_frames_in_flight, 1);
+        assert_eq!(args.flush_frames, 2);
+        assert!(args.stretch, "unmanaged EXTRA_FLAGS must be preserved");
+        assert_eq!(
+            args.allow_ip,
+            vec![
+                "192.168.1.20".parse::<std::net::IpAddr>().unwrap(),
+                "192.168.1.21".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_allow_ip_in_config_is_rejected() {
+        let p = write_temp("bad-ip", "ALLOW_IP=192.168.1.20/24\n");
+        assert!(args_from_config(&p).is_err());
         fs::remove_file(&p).ok();
     }
 

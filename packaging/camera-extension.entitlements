@@ -17,8 +17,8 @@
   which omits it on the extension).
 
   The App Group id (__APP_GROUP__, substituted by the packaging script, e.g.
-  QGLA89KHM7.com.clintcan.macrdp) MUST be registered in the Apple Developer portal
-  and assigned to THIS extension's App ID (com.clintcan.macrdp.controller.camera).
+  QGLA89KHM7.io.github.surakth.macrdp) MUST be registered in the Apple Developer portal
+  and assigned to THIS extension's App ID (io.github.surakth.macrdp.controller.camera).
   The container controller app does NOT need the group (it only activates the
   extension; the decoded-frame feed comes from macrdp.app via the CoreMediaIO
   client API, not an App-Group channel).

@@ -33,7 +33,7 @@ fi
 # Bundle-ID prefix (reverse-DNS of the publishing entity). MUST match what
 # install-launchagent.sh and gui/make-tray-app.sh use, or the controller will
 # target the wrong LaunchAgent label.
-BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-io.github.surakth}"
 BUNDLE_ID="$BUNDLE_PREFIX.macrdp"
 
 VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"

@@ -1,4 +1,4 @@
-# macrdp Controller (menu-bar app)
+# macrdp Surak Controller (menu-bar app)
 
 A small AppKit menu-bar (tray) app that **controls** the macrdp LaunchAgent and
 its `config.env` — start/stop the server, flip feature toggles, jump to the
@@ -30,7 +30,7 @@ Built with plain SwiftPM (no `.xcodeproj`): `swift build -c release` produces
 the executable, `make-tray-app.sh` wraps it into a signed `LSUIElement` bundle
 in `target/` and installs it.
 
-The bundle-ID prefix is configurable with `BUNDLE_PREFIX` (default `com.clintcan`)
+The bundle-ID prefix is configurable with `BUNDLE_PREFIX` (default `io.github.surakth`)
 — the controller becomes `$BUNDLE_PREFIX.macrdp.controller` and derives the
 server's LaunchAgent label by stripping `.controller` at runtime. **Use the same
 `BUNDLE_PREFIX` here as in `../packaging/`**, or the controller drives the wrong
@@ -60,6 +60,32 @@ macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose res
 ```
 (`--install-agent` assumes the Keychain password is set separately.)
 
+## Settings window
+
+Choose **Show macrdp Surak…** from the menu-bar icon. Changes are staged in the
+window and written together when you click **Apply**, so changing several
+options causes only one server restart.
+
+The Connection tab includes the same practical presets as `start.sh`:
+
+| Profile | Intended use |
+|---|---|
+| **Ultimate** | Recommended overall mode: AVC420, 60 FPS, 25 Mbps adaptive, UDP offered and AAC. |
+| **LAN Max** | Highest live-verified LAN quality: HiDPI AVC420, 60 FPS, 50 Mbps, stable TCP and PCM. |
+| **Native** | Sharpest text/UI: HiDPI bitmap/RemoteFX at a stable 12 FPS. |
+| **Fast** | Lowest latency: AVC420, 60 FPS, 50 Mbps and a one-frame pipeline. |
+
+Profiles do not expose the Mac to the network. Enable **Allow connections from
+the network** separately, then optionally enter one or more exact client
+addresses in **Allowed client IPs**. An empty allowlist accepts any authenticated
+client; CIDR ranges are intentionally not accepted. The Status tab shows the
+active profile, the address to enter in the RDP client, the allowlist, and
+Start/Restart/Stop controls.
+
+AVC444 remains available only under Video → Experimental. Tested `mstsc` clients
+still develop severe gray/pink color corruption, so use Ultimate or LAN Max for
+real work.
+
 ## Menu
 
 - **Status header** — running (with pid) / stopped / not installed; a
@@ -68,6 +94,8 @@ macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose res
 - **Set Up Remote Desktop** — one click applies the recommended config (virtual
   display + detach + H.264 + app-switcher HUD + per-connection workers) and
   starts. Shown until that config is active.
+- **Show macrdp Surak…** — opens the full Settings/Status window, including the
+  performance profiles, Allowed IP field, connection target, and server controls.
 - **Start · Stop · Restart** — self-installs on first run, then `kickstart -k` /
   `bootout` the agent (with EIO retry).
 - **Options** — H.264 / AAC / HiDPI / **Un-minimize on Cmd+Tab** / **App-switcher HUD** /
@@ -114,8 +142,8 @@ CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
   NOTARIZE=1 NOTARY_PROFILE=macrdp-notary ./make-tray-app.sh
 ```
 
-This is MIT-licensed; selling a productized, notarized build + support is fully
-compatible with that (you're selling the product, not a license exemption).
+This is dual-licensed under MIT OR Apache-2.0; selling a productized, notarized
+build + support is compatible with those terms.
 The Mac App Store is not viable for the server it controls (private
 `CGVirtualDisplay` API + system-wide input/capture) — ship a direct download.
 

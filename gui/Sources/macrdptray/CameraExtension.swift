@@ -20,7 +20,9 @@ import os.log
 // stays installed across server restarts and auto-uninstalls when this controller
 // app is deleted.
 
-private let camLog = OSLog(subsystem: "com.clintcan.macrdp.controller", category: "camera-ext")
+private let camLog = OSLog(
+    subsystem: Bundle.main.bundleIdentifier ?? "io.github.surakth.macrdp.controller",
+    category: "camera-ext")
 
 final class CameraExtensionManager: NSObject, OSSystemExtensionRequestDelegate {
     static let shared = CameraExtensionManager()
@@ -34,7 +36,7 @@ final class CameraExtensionManager: NSObject, OSSystemExtensionRequestDelegate {
         if let bid = Bundle.main.bundleIdentifier {
             return bid + ".camera"
         }
-        return "com.clintcan.macrdp.controller.camera"
+        return "io.github.surakth.macrdp.controller.camera"
     }
 
     private var onResult: ((Result<String, Error>) -> Void)?

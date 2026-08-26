@@ -40,7 +40,9 @@ private let kHeight: Int32 = 720
 // the extension forwards to the source with NO conversion. CMIO does not transcode,
 // so the advertised stream format MUST equal the format of the buffers sent.
 private let kPixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-private let logger = OSLog(subsystem: "com.clintcan.macrdp.camera", category: "extension")
+private let logger = OSLog(
+    subsystem: Bundle.main.bundleIdentifier ?? "io.github.surakth.macrdp.controller.camera",
+    category: "extension")
 
 
 // MARK: - Provider (one virtual device)
@@ -103,7 +105,7 @@ final class MacrdpCameraDeviceSource: NSObject, CMIOExtensionDeviceSource {
     private var _sinkActive = false
     private var _timer: DispatchSourceTimer?
     private let _timerQueue = DispatchQueue(
-        label: "com.clintcan.macrdp.camera.timer", qos: .userInteractive)
+        label: "io.github.surakth.macrdp.camera.timer", qos: .userInteractive)
     private var _videoDescription: CMFormatDescription!
     private var _bufferPool: CVPixelBufferPool!
     private var _bufferAuxAttributes: NSDictionary!

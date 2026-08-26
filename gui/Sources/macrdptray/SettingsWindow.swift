@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-// The tabbed Settings window opened by "Show macrdp…". A SwiftUI TabView hosted
+// The tabbed Settings window opened by "Show macrdp Surak…". A SwiftUI view hosted
 // in a plain NSWindow (the status-bar item stays AppKit). While the window is
 // open the app switches to a .regular activation policy so it behaves like a
 // real app (Dock icon + reliable focus + a working Edit menu for the text
@@ -18,7 +18,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             contentRect: NSRect(x: 0, y: 0, width: 600, height: 580),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
-        window.title = "macrdp Settings"
+        window.title = "macrdp Surak Settings"
         window.contentViewController = NSHostingController(rootView: SettingsView(model: model))
         window.isReleasedWhenClosed = false
         window.center()
@@ -82,11 +82,11 @@ extension AppController {
         let appItem = NSMenuItem()
         main.addItem(appItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About macrdp", action: #selector(showAbout), keyEquivalent: "")
+        appMenu.addItem(withTitle: "About macrdp Surak", action: #selector(showAbout), keyEquivalent: "")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Hide macrdp", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Hide macrdp Surak", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit macrdp Controller", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Quit macrdp Surak", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
         let editItem = NSMenuItem()
@@ -193,7 +193,7 @@ struct SettingsView: View {
                     .disabled(!model.isDirty)
                 Button("Apply") { model.apply() }
                     .keyboardShortcut("s", modifiers: .command)
-                    .disabled(!model.isDirty)
+                    .disabled(!model.isDirty || model.validationError != nil)
             }
             .padding(12)
         }
@@ -215,7 +215,10 @@ struct SettingsView: View {
     }
 
     @ViewBuilder private var status: some View {
-        if model.isDirty {
+        if let error = model.validationError {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.callout).foregroundColor(.red)
+        } else if model.isDirty {
             Label("Unsaved changes — Apply to restart the server with them",
                   systemImage: "pencil.circle")
                 .font(.callout).foregroundColor(.secondary)
@@ -236,6 +239,28 @@ private struct ConnectionTab: View {
     @ObservedObject var model: SettingsModel
     var body: some View {
         Form {
+            Section("Performance profile") {
+                Picker("Profile", selection: Binding(
+                    get: { model.selectedProfile?.rawValue ?? "custom" },
+                    set: { value in
+                        if let profile = PerformanceProfile(rawValue: value) {
+                            model.applyProfile(profile)
+                        }
+                    })) {
+                    ForEach(PerformanceProfile.allCases) { profile in
+                        Text(profile.title).tag(profile.rawValue)
+                    }
+                    if model.selectedProfile == nil {
+                        Text("Custom").tag("custom")
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text(model.selectedProfile?.detail
+                    ?? "Custom settings. Choose a profile to stage its live-verified values, then Apply.")
+                    .font(.caption).foregroundColor(.secondary)
+                Text("Profiles change video, audio and shortcut settings only. Network access stays a separate choice below.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
             Section("Network") {
                 Toggle("Allow connections from the network", isOn: Binding(
                     get: { model.allowNetwork },
@@ -260,6 +285,18 @@ private struct ConnectionTab: View {
                 }
                 Text("Off = loopback only (127.0.0.1), reachable from this Mac only.")
                     .font(.caption).foregroundColor(.secondary)
+                TextField("Allowed client IPs", text: Binding(
+                    get: { model.allowedIPDisplay },
+                    set: { model.setAllowedIPs($0) }),
+                    prompt: Text("Optional, e.g. 192.168.1.20, 192.168.1.21"))
+                    .disabled(!model.allowNetwork)
+                if let error = model.validationError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundColor(.red)
+                } else {
+                    Text("Empty allows any authenticated client. Exact IPv4/IPv6 addresses only; loopback is always allowed.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
             }
             Section("Account") {
                 Button(model.controller.hasKeychainPassword()
@@ -309,6 +346,13 @@ private struct VideoTab: View {
                 Text("Captures the primary display at backing (Retina) resolution — crisper, ~4× the "
                     + "pixels. Best with H.264 and a fast client; mstsc can feel laggy at HiDPI.")
                     .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Experimental") {
+                Toggle("AVC444 diagnostics", isOn: model.boolBinding("AVC444"))
+                    .disabled(!model.bool("ENABLE_H264"))
+                Text("Known issue: tested mstsc clients render severe gray/pink color corruption. "
+                    + "Use Ultimate or LAN Max for real work.")
+                    .font(.caption).foregroundColor(.orange)
             }
         }
         .formStyle(.grouped)
@@ -569,6 +613,7 @@ private struct StatusView: View {
     @State private var stats: ServerStats = .stopped
     @State private var conn: ConnectionInfo = .none
     @State private var live: LiveStats?
+    @State private var connectTarget = "—"
     // Only ticks while this pane is on screen (subscription cancels on disappear).
     private let tick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -576,10 +621,26 @@ private struct StatusView: View {
         Form {
             Section("Server") {
                 row("Status", stats.running ? "Running (pid \(stats.pid))" : "Stopped")
+                row("Profile", model.appliedProfile?.title ?? "Custom")
+                row("Connect to", connectTarget)
+                row("Allowed clients", model.appliedAllowedIPDisplay)
                 if stats.running {
                     row("Uptime", stats.uptime.isEmpty ? "—" : stats.uptime)
                     row("Memory", String(format: "%.0f MB  (%.1f%% of RAM)", stats.rssMB, stats.memPct))
                     row("CPU", String(format: "%.1f%%", stats.cpu))
+                }
+                HStack {
+                    Button(stats.running ? "Restart Server" : "Start Server") {
+                        if stats.running { model.controller.restart() }
+                        else { model.controller.start() }
+                        refreshAfterAction()
+                    }
+                    if stats.running {
+                        Button("Stop Server") {
+                            model.controller.stop()
+                            refreshAfterAction()
+                        }
+                    }
                 }
             }
             Section("Connection") {
@@ -622,12 +683,18 @@ private struct StatusView: View {
             let s = controller.serverStats()
             let c = controller.currentConnection()
             let l = c.connected ? controller.liveStats() : nil
+            let target = controller.connectionTarget()
             DispatchQueue.main.async {
                 stats = s
                 conn = c
                 live = l
+                connectTarget = target
             }
         }
+    }
+
+    private func refreshAfterAction() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { refresh() }
     }
 
     private func bitrateText(_ l: LiveStats) -> String {
@@ -658,6 +725,33 @@ private func logCapture(_ line: String, _ pattern: String) -> String? {
 }
 
 extension AppController {
+    /// Address to type into an RDP client. For an all-interface bind, resolve
+    /// the active default-route interface so the UI shows a useful LAN address
+    /// instead of the non-connectable 0.0.0.0 wildcard.
+    func connectionTarget() -> String {
+        let bind = readConfig()["BIND"] ?? "127.0.0.1:3390"
+        let port = bind.split(separator: ":").last.map(String.init) ?? "3390"
+        guard bind.hasPrefix("0.0.0.0:") else { return bind }
+        return "\(localLANAddress() ?? "<Mac LAN IP>"):\(port)"
+    }
+
+    private func localLANAddress() -> String? {
+        let route = run("/sbin/route", ["-n", "get", "default"])
+        guard route.code == 0 else { return nil }
+        let interface = route.stdout
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { $0.hasPrefix("interface:") }?
+            .split(separator: ":", maxSplits: 1)
+            .last?
+            .trimmingCharacters(in: .whitespaces)
+        guard let interface, !interface.isEmpty else { return nil }
+        let address = run("/usr/sbin/ipconfig", ["getifaddr", interface])
+        guard address.code == 0 else { return nil }
+        let value = address.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
     /// Live RSS / CPU / uptime of the server process (via `ps`).
     func serverStats() -> ServerStats {
         guard let pid = agentState().pid else { return .stopped }
@@ -733,9 +827,12 @@ extension AppController {
             + "RDP clients connect over TLS to your Mac and get the desktop with keyboard, "
             + "mouse, clipboard and audio — plus optional H.264 video, headless virtual "
             + "displays, and drive / smart-card / camera / USB redirection.\n\n"
-            + statusLine
+            + statusLine + "\n\n"
+            + "Maintained by SurakTH. Based on macrdp by Clint Canada and its contributors. "
+            + "Fork-specific improvements were developed with assistance from OpenAI Codex "
+            + "using GPT-5.6 Sol. Licensed under MIT OR Apache-2.0."
         let opts: [NSApplication.AboutPanelOptionKey: Any] = [
-            .applicationName: "macrdp",
+            .applicationName: "macrdp Surak",
             .applicationVersion: version,
             .credits: NSAttributedString(
                 string: body,

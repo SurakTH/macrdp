@@ -13,7 +13,7 @@ PKG_DIR="$REPO_ROOT/packaging"
 APP_DIR="${APP_DIR:-/Applications}"
 # MUST match the BUNDLE_PREFIX used by make-app.sh (and gui/make-tray-app.sh),
 # or the controller targets a different label than the agent installed here.
-BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-io.github.surakth}"
 LABEL="$BUNDLE_PREFIX.macrdp"
 UID_NUM="$(id -u)"
 

@@ -19,7 +19,7 @@ LaunchAgent and edits the same `config.env` — no re-permissioning.
 > **vs. `dist/install.sh`:** the repo's other auto-start path installs a *bare
 > binary* to `~/.local/bin/macrdp` under the launchd label `com.user.macrdp`.
 > This `packaging/` path instead produces a real `.app` bundle under the label
-> `com.clintcan.macrdp`. They share the `macrdp` Keychain entry and both bind
+> `io.github.surakth.macrdp` in this fork. They share the `macrdp` Keychain entry and both bind
 > `:3390`, so they're **mutually exclusive** — pick one. Use `dist/install.sh`
 > for the lightweight binary; use `packaging/` when you want a stable bundle
 > identity and a path a future GUI can build on. The build is staged in
@@ -68,17 +68,17 @@ packaging/install-launchagent.sh
 
 # 4. First launch will need TCC grants. Grant macrdp.app under
 #    System Settings -> Privacy & Security -> Screen Recording AND Accessibility,
-#    then: launchctl kickstart -k gui/$(id -u)/com.clintcan.macrdp
+#    then: launchctl kickstart -k gui/$(id -u)/io.github.surakth.macrdp
 ```
 
 ## Day to day
 
 ```bash
 tail -f ~/Library/Logs/macrdp.log                       # logs
-launchctl print gui/$(id -u)/com.clintcan.macrdp        # status (state/pid)
+launchctl print gui/$(id -u)/io.github.surakth.macrdp        # status (state/pid)
 $EDITOR "$HOME/Library/Application Support/macrdp/config.env"
-launchctl kickstart -k gui/$(id -u)/com.clintcan.macrdp # apply config change
-launchctl bootout    gui/$(id -u)/com.clintcan.macrdp   # stop entirely
+launchctl kickstart -k gui/$(id -u)/io.github.surakth.macrdp # apply config change
+launchctl bootout    gui/$(id -u)/io.github.surakth.macrdp   # stop entirely
 ```
 
 Edit feature toggles (H.264, AAC, HiDPI, un-minimize-on-Cmd+Tab), the headless virtual display
@@ -114,7 +114,7 @@ reader registered with `system_profiler SPSmartCardsDataType`.
 
 ## Notes & limits
 
-- **Bundle-ID prefix is configurable** via `BUNDLE_PREFIX` (default `com.clintcan`):
+- **Bundle-ID prefix is configurable** via `BUNDLE_PREFIX` (default `io.github.surakth`):
   the app becomes `$BUNDLE_PREFIX.macrdp`, the LaunchAgent label the same, and the
   controller `$BUNDLE_PREFIX.macrdp.controller`. **Set the *same* `BUNDLE_PREFIX`
   for `make-app.sh`, `install-launchagent.sh`, and `gui/make-tray-app.sh`** — the
@@ -178,7 +178,7 @@ reader registered with `system_profiler SPSmartCardsDataType`.
   re-granting Screen Recording + Accessibility). The zero-cost fix is a
   **self-signed code-signing certificate named `macrdp-dev`** in the login
   keychain — `make-app.sh` auto-prefers it when `CODESIGN_IDENTITY` is unset —
-  which makes the requirement `identifier "com.clintcan.macrdp" and
+  which makes the requirement `identifier "io.github.surakth.macrdp" and
   certificate leaf = H"<cert hash>"`, stable across rebuilds. Create it once
   via Keychain Access → Certificate Assistant → Create a Certificate →
   type "Code Signing", or scripted:

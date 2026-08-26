@@ -1,5 +1,93 @@
 import AppKit
+import Network
 import SwiftUI
+
+/// The live-verified launcher presets, expressed as config.env keys so the
+/// installed app and the terminal launchers select the same runtime behavior.
+/// Network exposure is deliberately not part of a performance profile; the
+/// user enables LAN access separately and sees the existing security warning.
+enum PerformanceProfile: String, CaseIterable, Identifiable {
+    case ultimate, lan, native, fast
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .ultimate: return "Ultimate"
+        case .lan: return "LAN Max"
+        case .native: return "Native"
+        case .fast: return "Fast"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .ultimate:
+            return "Best overall balance: AVC420 at 60 FPS, 25 Mbps adaptive, UDP offered, AAC."
+        case .lan:
+            return "Highest live-verified LAN quality: HiDPI AVC420, 60 FPS, 50 Mbps, stable TCP and PCM."
+        case .native:
+            return "Sharpest text and UI: HiDPI bitmap/RemoteFX at a stable 12 FPS."
+        case .fast:
+            return "Lowest latency: AVC420 at 60 FPS, 50 Mbps and a minimal one-frame pipeline."
+        }
+    }
+
+    var settings: [String: String] {
+        var values = [
+            "AVC444": "0",
+            "MAP_CTRL_TO_CMD": "1",
+            "ALT_TAB_SWITCH": "1",
+            "UDP_MIGRATE_EGFX": "0",
+            "KEYFRAME_INTERVAL": "2.0",
+            "KEYFRAME_CHANGE_PCT": "20",
+            "KEYFRAME_CLICK_PCT": "5",
+            "H264_FRAMES_IN_FLIGHT": "2",
+            "FLUSH_FRAMES": "4",
+            "STATS_ENDPOINT": "1",
+        ]
+        switch self {
+        case .ultimate:
+            values.merge([
+                "ENABLE_H264": "1", "HIDPI": "0", "ENABLE_AAC": "1",
+                "ADAPTIVE_BITRATE": "1", "ENABLE_UDP_MULTITRANSPORT": "1",
+                "BITRATE": "25", "FPS": "60", "KEYFRAME_ON_CHANGE": "1",
+                "KEYFRAME_CHANGE_PCT": "15", "KEYFRAME_CLICK_PCT": "3",
+                "H264_FRAMES_IN_FLIGHT": "1", "FLUSH_FRAMES": "2",
+                "UNMINIMIZE": "1", "BLANK_RECOVERY": "0",
+            ]) { _, new in new }
+        case .lan:
+            values.merge([
+                "ENABLE_H264": "1", "HIDPI": "1", "ENABLE_AAC": "0",
+                "ADAPTIVE_BITRATE": "0", "ENABLE_UDP_MULTITRANSPORT": "0",
+                "BITRATE": "50", "FPS": "60", "KEYFRAME_ON_CHANGE": "1",
+                "KEYFRAME_CHANGE_PCT": "15", "KEYFRAME_CLICK_PCT": "3",
+                "H264_FRAMES_IN_FLIGHT": "1", "FLUSH_FRAMES": "2",
+                "UNMINIMIZE": "1", "BLANK_RECOVERY": "0",
+            ]) { _, new in new }
+        case .native:
+            values.merge([
+                "ENABLE_H264": "0", "HIDPI": "1", "ENABLE_AAC": "0",
+                "ADAPTIVE_BITRATE": "0", "ENABLE_UDP_MULTITRANSPORT": "0",
+                "BITRATE": "", "FPS": "12", "KEYFRAME_ON_CHANGE": "0",
+                "UNMINIMIZE": "1", "BLANK_RECOVERY": "1", "STATS_ENDPOINT": "0",
+            ]) { _, new in new }
+        case .fast:
+            values.merge([
+                "ENABLE_H264": "1", "HIDPI": "0", "ENABLE_AAC": "0",
+                "ADAPTIVE_BITRATE": "0", "ENABLE_UDP_MULTITRANSPORT": "1",
+                "BITRATE": "50", "FPS": "60", "KEYFRAME_ON_CHANGE": "0",
+                "H264_FRAMES_IN_FLIGHT": "1", "UNMINIMIZE": "0",
+                "BLANK_RECOVERY": "0",
+            ]) { _, new in new }
+        }
+        return values
+    }
+
+    func matches(_ config: [String: String]) -> Bool {
+        settings.allSatisfy { config[$0.key, default: ""] == $0.value }
+    }
+}
 
 // Draft model backing the tabbed Settings window (SettingsWindow.swift).
 //
@@ -43,6 +131,22 @@ final class SettingsModel: ObservableObject {
     /// True when the draft diverges from the on-disk config, i.e. Apply has work.
     var isDirty: Bool { draft != saved }
 
+    var selectedProfile: PerformanceProfile? {
+        PerformanceProfile.allCases.first { $0.matches(draft) }
+    }
+
+    var appliedProfile: PerformanceProfile? {
+        PerformanceProfile.allCases.first { $0.matches(saved) }
+    }
+
+    var validationError: String? {
+        let invalid = allowedIPTokens.filter {
+            IPv4Address($0) == nil && IPv6Address($0) == nil
+        }
+        guard !invalid.isEmpty else { return nil }
+        return "Invalid IP address: \(invalid.joined(separator: ", "))"
+    }
+
     func reload() {
         let cfg = controller.readConfig()
         saved = cfg
@@ -53,6 +157,12 @@ final class SettingsModel: ObservableObject {
 
     /// Write every changed key, then kickstart once (if the server is running).
     func apply() {
+        guard validationError == nil else { return }
+        // Preserve natural typing (including a trailing comma) while the field
+        // is being edited, then store one canonical comma-separated value.
+        if draft["ALLOW_IP"] != nil {
+            draft["ALLOW_IP"] = allowedIPTokens.joined(separator: ",")
+        }
         for (key, value) in draft where saved[key] != value {
             controller.writeConfig(key: key, value: value)
         }
@@ -115,6 +225,9 @@ final class SettingsModel: ObservableObject {
         } else if (draft["UDP_MIGRATE_EGFX"] ?? "0") == "1" {
             draft["ENABLE_H264"] = "1"
         }
+        if (draft["ENABLE_H264"] ?? "0") != "1", draft["AVC444"] == "1" {
+            draft["AVC444"] = "0"
+        }
     }
 
     // MARK: - Network bind (loopback <-> all interfaces, port preserved)
@@ -126,6 +239,34 @@ final class SettingsModel: ObservableObject {
     func setAllowNetwork(_ on: Bool) {
         let port = bindDisplay.split(separator: ":").last.map(String.init) ?? "3390"
         setString("BIND", "\(on ? "0.0.0.0" : "127.0.0.1"):\(port)")
+    }
+
+    var allowedIPTokens: [String] {
+        string("ALLOW_IP")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    var allowedIPDisplay: String { string("ALLOW_IP") }
+
+    var appliedAllowedIPDisplay: String {
+        let values = (saved["ALLOW_IP"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return values.isEmpty ? "Any authenticated client" : values.joined(separator: ", ")
+    }
+
+    func setAllowedIPs(_ value: String) {
+        setString("ALLOW_IP", value)
+    }
+
+    // MARK: - Performance profiles
+
+    func applyProfile(_ profile: PerformanceProfile) {
+        for (key, value) in profile.settings { draft[key] = value }
+        normalize()
     }
 
     // MARK: - Primary-screen mode

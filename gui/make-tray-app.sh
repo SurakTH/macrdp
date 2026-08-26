@@ -15,7 +15,7 @@ APP_NAME="macrdpController.app"
 # MUST match the BUNDLE_PREFIX used by packaging/{make-app,install-launchagent}.sh.
 # The controller derives the server's LaunchAgent label by stripping ".controller"
 # from its own bundle id at runtime, so this prefix decides which agent it drives.
-BUNDLE_PREFIX="${BUNDLE_PREFIX:-com.clintcan}"
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-io.github.surakth}"
 CONTROLLER_ID="$BUNDLE_PREFIX.macrdp.controller"
 
 VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
@@ -38,8 +38,8 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>macrdp Controller</string>
-    <key>CFBundleDisplayName</key><string>macrdp Controller</string>
+    <key>CFBundleName</key><string>macrdp Surak</string>
+    <key>CFBundleDisplayName</key><string>macrdp Surak</string>
     <key>CFBundleIdentifier</key><string>$CONTROLLER_ID</string>
     <key>CFBundleExecutable</key><string>macrdptray</string>
     <key>CFBundlePackageType</key><string>APPL</string>

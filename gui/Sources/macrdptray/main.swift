@@ -1,8 +1,8 @@
 import AppKit
 import UniformTypeIdentifiers
 
-// macrdp Controller: a menu-bar app that controls the macrdp LaunchAgent
-// (label com.clintcan.macrdp, installed by packaging/install-launchagent.sh)
+// macrdp Surak: a menu-bar app that controls the macrdp LaunchAgent
+// (label io.github.surakth.macrdp by default in this fork)
 // and toggles flags in config.env. It is a *controller* — quitting it leaves
 // the server running under launchd. It needs no TCC grants of its own (it only
 // runs `launchctl`, opens URLs, and edits files in the user's own Library);
@@ -21,7 +21,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let bid = Bundle.main.bundleIdentifier, bid.hasSuffix(".controller") {
             return String(bid.dropLast(".controller".count))
         }
-        return "com.clintcan.macrdp"
+        return "io.github.surakth.macrdp"
     }()
 
     var uid: String { String(getuid()) }
@@ -45,7 +45,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory) // menu-bar only, no Dock icon
         installMainMenu() // so the Settings window's text fields get edit shortcuts
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "macrdp")
+            button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "macrdp Surak")
             button.image?.isTemplate = true
         }
         let menu = NSMenu()
@@ -80,8 +80,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // glanceable without opening the menu.
         statusItem.button?.alphaValue = running ? 1.0 : 0.4
         statusItem.button?.toolTip = running
-            ? "macrdp: running (pid \(st.pid!))"
-            : (st.loaded ? "macrdp: stopped" : "macrdp: not installed")
+            ? "macrdp Surak: running (pid \(st.pid!))"
+            : (st.loaded ? "macrdp Surak: stopped" : "macrdp Surak: not installed")
     }
 
     // MARK: - Server status (parsed from the log)
@@ -135,9 +135,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let st = agentState()
         let header: String
-        if !st.loaded { header = "macrdp — not installed" }
-        else if let pid = st.pid { header = "macrdp — running (pid \(pid))" }
-        else { header = "macrdp — stopped" }
+        if !st.loaded { header = "macrdp Surak — not installed" }
+        else if let pid = st.pid { header = "macrdp Surak — running (pid \(pid))" }
+        else { header = "macrdp Surak — stopped" }
         let h = NSMenuItem(title: header, action: nil, keyEquivalent: "")
         h.isEnabled = false
         menu.addItem(h)
@@ -151,7 +151,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         // Show the tabbed Settings window (where all the config options now live).
-        menu.addItem(item("Show macrdp…", #selector(showSettings)))
+        menu.addItem(item("Show macrdp Surak…", #selector(showSettings)))
         menu.addItem(.separator())
 
         let running = st.pid != nil
@@ -588,6 +588,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !fm.fileExists(atPath: configURL.path) {
             let defaults = """
             BIND="127.0.0.1:3390"
+            ALLOW_IP=""
             USE_KEYCHAIN=1
             ENABLE_H264=0
             ENABLE_AAC=0

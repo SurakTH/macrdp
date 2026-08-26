@@ -16,6 +16,7 @@
 #
 # Env:
 #   APP_DIR=/Applications   where macrdp.app is installed (to find the bundle)
+#   BUNDLE_PREFIX           reverse-DNS prefix (default io.github.surakth)
 #   IFD_VID / IFD_PID       VID/PID of the USB device that triggers the driver
 #                           load (macOS loads IFD drivers only on a matching USB
 #                           hotplug). Defaults to the bundle's baked-in values.
@@ -26,6 +27,7 @@ DEST="$DRIVERS/ifd-macrdp.bundle"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SELF_DIR/.." && pwd)"
 APP_DIR="${APP_DIR:-/Applications}"
+BUNDLE_PREFIX="${BUNDLE_PREFIX:-io.github.surakth}"
 
 # Run a shell command as root via one GUI auth prompt. Paths are single-quoted
 # by callers; AppleScript string is double-quoted, so no escaping clash.
@@ -83,7 +85,7 @@ if [ -z "$SRC" ]; then
     VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
     SRC="$REPO_ROOT/target/ifd-macrdp.bundle"
     rm -rf "$SRC"; mkdir -p "$SRC/Contents/MacOS"
-    sed -e "s/__VERSION__/$VERSION/g" -e "s#__BUNDLE_ID__#com.clintcan.macrdp.ifd#g" \
+    sed -e "s/__VERSION__/$VERSION/g" -e "s#__BUNDLE_ID__#$BUNDLE_PREFIX.macrdp.ifd#g" \
         "$REPO_ROOT/packaging/ifd-Info.plist" > "$SRC/Contents/Info.plist"
     cp "$DY" "$SRC/Contents/MacOS/libifd_macrdp.dylib"
     codesign -s - --force "$SRC/Contents/MacOS/libifd_macrdp.dylib" "$SRC"
