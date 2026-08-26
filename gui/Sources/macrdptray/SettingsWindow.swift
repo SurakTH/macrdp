@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-// The tabbed Settings window opened by "Show macrdp Surak…". A SwiftUI view hosted
+// The tabbed Settings window opened by "Show macrdp Controller…". A SwiftUI view hosted
 // in a plain NSWindow (the status-bar item stays AppKit). While the window is
 // open the app switches to a .regular activation policy so it behaves like a
 // real app (Dock icon + reliable focus + a working Edit menu for the text
@@ -18,7 +18,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             contentRect: NSRect(x: 0, y: 0, width: 600, height: 580),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
-        window.title = "macrdp Surak Settings"
+        window.title = "macrdp Controller Settings"
         window.contentViewController = NSHostingController(rootView: SettingsView(model: model))
         window.isReleasedWhenClosed = false
         window.center()
@@ -82,11 +82,11 @@ extension AppController {
         let appItem = NSMenuItem()
         main.addItem(appItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About macrdp Surak", action: #selector(showAbout), keyEquivalent: "")
+        appMenu.addItem(withTitle: "About macrdp Controller", action: #selector(showAbout), keyEquivalent: "")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Hide macrdp Surak", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Hide macrdp Controller", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit macrdp Surak", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Quit macrdp Controller", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
         let editItem = NSMenuItem()
@@ -832,7 +832,7 @@ extension AppController {
             + "Fork-specific improvements were developed with assistance from OpenAI Codex "
             + "using GPT-5.6 Sol. Licensed under MIT OR Apache-2.0."
         let opts: [NSApplication.AboutPanelOptionKey: Any] = [
-            .applicationName: "macrdp Surak",
+            .applicationName: "macrdp Controller",
             .applicationVersion: version,
             .credits: NSAttributedString(
                 string: body,

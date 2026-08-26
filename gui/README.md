@@ -1,4 +1,4 @@
-# macrdp Surak Controller (menu-bar app)
+# macrdp Controller (menu-bar app)
 
 A small AppKit menu-bar (tray) app that **controls** the macrdp LaunchAgent and
 its `config.env` — start/stop the server, flip feature toggles, jump to the
@@ -21,9 +21,9 @@ need to run `install-launchagent.sh` — the controller **self-installs** the
 LaunchAgent and onboards the Keychain password on first **Start** (see below).
 
 ```bash
-./make-tray-app.sh                                  # -> /Applications/macrdpController.app
+./make-tray-app.sh                                  # -> /Applications/macrdp Controller.app
 APP_DIR="$HOME/Applications" ./make-tray-app.sh     # or install without sudo
-open "/Applications/macrdpController.app"            # display icon appears in the menu bar
+open "/Applications/macrdp Controller.app"          # Settings opens; menu icon stays after close
 ```
 
 Built with plain SwiftPM (no `.xcodeproj`): `swift build -c release` produces
@@ -55,14 +55,14 @@ No Terminal, no `install-launchagent.sh`. For unattended/MDM deploys there's a
 headless equivalent:
 
 ```bash
-macrdpController.app/Contents/MacOS/macrdptray --install-agent   # locate + write + load agent
-macrdpController.app/Contents/MacOS/macrdptray --print-paths      # diagnose resolved paths (no side effects)
+macrdp\ Controller.app/Contents/MacOS/macrdptray --install-agent   # locate + write + load agent
+macrdp\ Controller.app/Contents/MacOS/macrdptray --print-paths      # diagnose resolved paths (no side effects)
 ```
 (`--install-agent` assumes the Keychain password is set separately.)
 
 ## Settings window
 
-Choose **Show macrdp Surak…** from the menu-bar icon. Changes are staged in the
+Choose **Show macrdp Controller…** from the menu-bar icon. Changes are staged in the
 window and written together when you click **Apply**, so changing several
 options causes only one server restart.
 
@@ -94,7 +94,7 @@ real work.
 - **Set Up Remote Desktop** — one click applies the recommended config (virtual
   display + detach + H.264 + app-switcher HUD + per-connection workers) and
   starts. Shown until that config is active.
-- **Show macrdp Surak…** — opens the full Settings/Status window, including the
+- **Show macrdp Controller…** — opens the full Settings/Status window, including the
   performance profiles, Allowed IP field, connection target, and server controls.
 - **Start · Stop · Restart** — self-installs on first run, then `kickstart -k` /
   `bootout` the agent (with EIO retry).
@@ -149,5 +149,5 @@ The Mac App Store is not viable for the server it controls (private
 
 ## Notes
 - To auto-launch the controller at login: System Settings → General →
-  Login Items → add `macrdpController.app` (the server itself already
+  Login Items → add `macrdp Controller.app` (the server itself already
   autostarts via its own LaunchAgent).

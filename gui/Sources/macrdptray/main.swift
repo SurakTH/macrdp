@@ -1,7 +1,7 @@
 import AppKit
 import UniformTypeIdentifiers
 
-// macrdp Surak: a menu-bar app that controls the macrdp LaunchAgent
+// macrdp Controller: a menu-bar app that controls the macrdp LaunchAgent
 // (label io.github.surakth.macrdp by default in this fork)
 // and toggles flags in config.env. It is a *controller* — quitting it leaves
 // the server running under launchd. It needs no TCC grants of its own (it only
@@ -45,7 +45,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory) // menu-bar only, no Dock icon
         installMainMenu() // so the Settings window's text fields get edit shortcuts
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "macrdp Surak")
+            button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "macrdp Controller")
             button.image?.isTemplate = true
         }
         let menu = NSMenu()
@@ -56,6 +56,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.refreshGlyph()
         }
+        // A Finder launch must visibly do something. The controller can stay a
+        // menu-bar app after the window closes, but its initial launch opens the
+        // Settings/Status window instead of appearing to do nothing.
+        DispatchQueue.main.async { [weak self] in self?.showSettings() }
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        if !flag { showSettings() }
+        return true
     }
 
     // MARK: - Agent state
@@ -80,8 +92,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // glanceable without opening the menu.
         statusItem.button?.alphaValue = running ? 1.0 : 0.4
         statusItem.button?.toolTip = running
-            ? "macrdp Surak: running (pid \(st.pid!))"
-            : (st.loaded ? "macrdp Surak: stopped" : "macrdp Surak: not installed")
+            ? "macrdp Controller: running (pid \(st.pid!))"
+            : (st.loaded ? "macrdp Controller: stopped" : "macrdp Controller: not installed")
     }
 
     // MARK: - Server status (parsed from the log)
@@ -135,9 +147,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let st = agentState()
         let header: String
-        if !st.loaded { header = "macrdp Surak — not installed" }
-        else if let pid = st.pid { header = "macrdp Surak — running (pid \(pid))" }
-        else { header = "macrdp Surak — stopped" }
+        if !st.loaded { header = "macrdp Controller — not installed" }
+        else if let pid = st.pid { header = "macrdp Controller — running (pid \(pid))" }
+        else { header = "macrdp Controller — stopped" }
         let h = NSMenuItem(title: header, action: nil, keyEquivalent: "")
         h.isEnabled = false
         menu.addItem(h)
@@ -151,7 +163,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         // Show the tabbed Settings window (where all the config options now live).
-        menu.addItem(item("Show macrdp Surak…", #selector(showSettings)))
+        menu.addItem(item("Show macrdp Controller…", #selector(showSettings)))
         menu.addItem(.separator())
 
         let running = st.pid != nil
@@ -180,7 +192,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // password, write + register the LaunchAgent — no Terminal step needed.
         guard let serverApp = locateServerApp() else {
             alert(style: .warning, "Can't find macrdp.app",
-                  "Move both macrdp.app and macrdp Controller into /Applications "
+                  "Move both macrdp.app and macrdp Controller.app into /Applications "
                   + "(or ~/Applications), then click Start again.")
             return
         }

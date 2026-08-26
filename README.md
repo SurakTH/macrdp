@@ -112,7 +112,7 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 packaging/make-app.sh                                 # build + sign + install to /Applications
 security add-generic-password -s macrdp -a "$(id -un)" -w 'YOUR_PASSWORD'
 packaging/install-launchagent.sh                      # load LaunchAgent (label io.github.surakth.macrdp)
-gui/make-tray-app.sh                                  # build + install macrdp Surak controller
+gui/make-tray-app.sh                                  # build + install macrdp Controller
 ```
 
 The controller exposes Ultimate, LAN Max, Native, and Fast profiles plus LAN

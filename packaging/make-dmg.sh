@@ -8,7 +8,7 @@
 #
 # Usage:
 #   packaging/make-dmg.sh [App.app ...]
-#     With no args, includes target/macrdp.app and target/macrdpController.app
+#     With no args, includes target/macrdp.app and target/macrdp Controller.app
 #     if present.
 #
 # Env:
@@ -30,7 +30,7 @@ VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 # Collect app bundles: explicit args, else the staged builds under target/.
 apps=("$@")
 if [ ${#apps[@]} -eq 0 ]; then
-    for a in "$REPO_ROOT/target/macrdp.app" "$REPO_ROOT/target/macrdpController.app"; do
+    for a in "$REPO_ROOT/target/macrdp.app" "$REPO_ROOT/target/macrdp Controller.app"; do
         [ -d "$a" ] && apps+=("$a")
     done
 fi
@@ -86,7 +86,7 @@ tell application "Finder"
       set position of item "macrdp.app" of container window to {150, 150}
     end try
     try
-      set position of item "macrdpController.app" of container window to {150, 320}
+      set position of item "macrdp Controller.app" of container window to {150, 320}
     end try
     set position of item "Applications" of container window to {450, 230}
     update without registering applications

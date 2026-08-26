@@ -7,7 +7,7 @@
 #
 # This is the no-Xcode analogue of Xcode's "System Extension" product type — the
 # same hand-assembly approach make-app.sh uses for macrdp.app. The resulting
-# `.systemextension` is embedded into macrdpController.app/Contents/Library/
+# `.systemextension` is embedded into macrdp Controller.app/Contents/Library/
 # SystemExtensions/ by gui/make-tray-app.sh (CAMERA_EXTENSION=1), which then
 # activates it via OSSystemExtensionRequest.
 #
