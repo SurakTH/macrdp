@@ -1,0 +1,89 @@
+name: publish verified release
+
+on:
+  push:
+    tags:
+      - 'publish-v*'
+
+# Temporary, deliberately narrow release-promotion path. A
+# `publish-<release-tag>` trigger promotes only an existing draft after
+# re-downloading and verifying every expected asset. This workflow is removed
+# from main immediately after the authorized release is published.
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: verify assets and publish pre-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Verify draft assets and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          trigger_tag="$GITHUB_REF_NAME"
+          release_tag="${trigger_tag#publish-}"
+          if [[ "$release_tag" == "$trigger_tag" || "$release_tag" != v* ]]; then
+            echo "invalid publish trigger: $trigger_tag" >&2
+            exit 1
+          fi
+
+          is_draft="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq '.isDraft')"
+          if [[ "$is_draft" != true ]]; then
+            echo "release $release_tag is not an unpublished draft" >&2
+            exit 1
+          fi
+
+          asset_dir="$(mktemp -d)"
+          trap 'rm -rf "$asset_dir"' EXIT
+          gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --dir "$asset_dir"
+
+          base="macrdp-${release_tag}-aarch64-apple-darwin"
+          expected=(
+            "$base.dmg"
+            "$base-app.zip"
+            "$base.tar.gz"
+            "SHA256SUMS"
+          )
+          for name in "${expected[@]}"; do
+            test -s "$asset_dir/$name" || {
+              echo "required release asset is missing or empty: $name" >&2
+              exit 1
+            }
+          done
+
+          asset_count="$(find "$asset_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [[ "$asset_count" != 4 ]]; then
+            echo "expected exactly 4 release assets, found $asset_count" >&2
+            find "$asset_dir" -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+
+          checksum_count="$(wc -l < "$asset_dir/SHA256SUMS" | tr -d ' ')"
+          if [[ "$checksum_count" != 3 ]]; then
+            echo "expected 3 checksum entries, found $checksum_count" >&2
+            exit 1
+          fi
+          (cd "$asset_dir" && sha256sum --check SHA256SUMS)
+
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq '.id')"
+          printf '{"draft":false,"prerelease":true}' | \
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" --input - >/dev/null
+
+          gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,url \
+            --jq 'select(.isDraft == false and .isPrerelease == true) | .url'
