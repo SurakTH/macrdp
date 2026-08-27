@@ -27,7 +27,8 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Verify draft assets and publish
+      - name: Resolve authorized draft
+        id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -37,22 +38,46 @@ jobs:
           trigger_tag="$GITHUB_REF_NAME"
           release_tag="${trigger_tag#publish-}"
           if [[ "$release_tag" == "$trigger_tag" || "$release_tag" != v* ]]; then
-            echo "invalid publish trigger: $trigger_tag" >&2
+            echo "::error title=Invalid publish trigger::$trigger_tag does not map to a v* release tag"
             exit 1
           fi
 
-          is_draft="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft --jq '.isDraft')"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag")"
+          is_draft="$(jq -r '.draft' <<<"$release_json")"
           if [[ "$is_draft" != true ]]; then
-            echo "release $release_tag is not an unpublished draft" >&2
+            echo "::error title=Release is not a draft::$release_tag has draft=$is_draft; refusing to publish"
             exit 1
           fi
 
-          asset_dir="$(mktemp -d)"
-          trap 'rm -rf "$asset_dir"' EXIT
-          gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --dir "$asset_dir"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "release_id=$(jq -r '.id' <<<"$release_json")" >> "$GITHUB_OUTPUT"
+          echo "Draft assets reported by GitHub:"
+          jq -r '.assets[] | "- \(.name) (\(.size) bytes)"' <<<"$release_json"
 
-          base="macrdp-${release_tag}-aarch64-apple-darwin"
+      - name: Download release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          asset_dir="$RUNNER_TEMP/release-assets"
+          rm -rf "$asset_dir"
+          mkdir -p "$asset_dir"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$asset_dir"
+          ls -lah "$asset_dir"
+
+      - name: Verify asset set
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          asset_dir="$RUNNER_TEMP/release-assets"
+          base="macrdp-${RELEASE_TAG}-aarch64-apple-darwin"
+
           expected=(
             "$base.dmg"
             "$base-app.zip"
@@ -60,30 +85,50 @@ jobs:
             "SHA256SUMS"
           )
           for name in "${expected[@]}"; do
-            test -s "$asset_dir/$name" || {
-              echo "required release asset is missing or empty: $name" >&2
+            if [[ ! -s "$asset_dir/$name" ]]; then
+              downloaded="$(find "$asset_dir" -maxdepth 1 -type f -exec basename {} \; | sort | paste -sd ', ' -)"
+              echo "::error title=Missing release asset::Expected non-empty $name; downloaded: ${downloaded:-none}"
               exit 1
-            }
+            fi
           done
 
           asset_count="$(find "$asset_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')"
           if [[ "$asset_count" != 4 ]]; then
-            echo "expected exactly 4 release assets, found $asset_count" >&2
-            find "$asset_dir" -maxdepth 1 -type f -print >&2
+            downloaded="$(find "$asset_dir" -maxdepth 1 -type f -exec basename {} \; | sort | paste -sd ', ' -)"
+            echo "::error title=Unexpected asset count::Expected exactly 4 assets, found $asset_count: ${downloaded:-none}"
             exit 1
           fi
 
+      - name: Verify SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          asset_dir="$RUNNER_TEMP/release-assets"
           checksum_count="$(wc -l < "$asset_dir/SHA256SUMS" | tr -d ' ')"
           if [[ "$checksum_count" != 3 ]]; then
-            echo "expected 3 checksum entries, found $checksum_count" >&2
+            echo "::error title=Unexpected checksum count::Expected 3 checksum entries, found $checksum_count"
             exit 1
           fi
           (cd "$asset_dir" && sha256sum --check SHA256SUMS)
 
-          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq '.id')"
-          printf '{"draft":false,"prerelease":true}' | \
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" --input - >/dev/null
+      - name: Publish verified pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
 
-          gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" \
+          printf '{"draft":false,"prerelease":true}' | \
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --input - >/dev/null
+
+          release_url="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json isDraft,isPrerelease,url \
-            --jq 'select(.isDraft == false and .isPrerelease == true) | .url'
+            --jq 'select(.isDraft == false and .isPrerelease == true) | .url')"
+          if [[ -z "$release_url" ]]; then
+            echo "::error title=Publish verification failed::$RELEASE_TAG was not observed as a public pre-release"
+            exit 1
+          fi
+          echo "Published $release_url"
