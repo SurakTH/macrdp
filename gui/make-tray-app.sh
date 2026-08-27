@@ -5,6 +5,7 @@
 # Env overrides:
 #   APP_DIR=/Applications              # install location (default /Applications)
 #   CODESIGN_IDENTITY="-"             # "-" = ad-hoc; or a Developer ID name
+#   SKIP_BUILD=1                       # reuse gui/.build/release/macrdptray
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,8 +24,12 @@ VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | cut -d'"' -f2)"
 
 echo "==> macrdp Controller v$VERSION  (id: $CONTROLLER_ID, identity: $IDENTITY, install: $APP_DIR)"
 
-echo "==> swift build -c release"
-( cd "$GUI_DIR" && swift build -c release )
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    echo "==> swift build -c release --product macrdptray"
+    ( cd "$GUI_DIR" && swift build -c release --product macrdptray )
+else
+    echo "==> reusing existing release macrdptray (SKIP_BUILD=1)"
+fi
 BIN="$GUI_DIR/.build/release/macrdptray"
 [ -x "$BIN" ] || { echo "build produced no binary at $BIN" >&2; exit 1; }
 
@@ -45,8 +50,13 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSMultipleInstancesProhibited</key><true/>
     <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSHumanReadableCopyright</key><string>macrdp contributors; MIT OR Apache-2.0</string>
 </dict>
 </plist>
 PLIST
@@ -131,5 +141,4 @@ codesign --verify --strict "$APP_DIR/$APP_NAME"
 echo
 echo "Done. Installed: $APP_DIR/$APP_NAME"
 echo "Launch it:  open \"$APP_DIR/$APP_NAME\"   (a display icon appears in the menu bar)"
-echo "Note: it controls the LaunchAgent from packaging/ — run make-app.sh +"
-echo "      install-launchagent.sh first if you haven't."
+echo "Note: install macrdp.app beside it; Start self-installs or repairs the LaunchAgent."

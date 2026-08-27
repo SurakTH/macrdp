@@ -6,6 +6,16 @@ tags, dates, and downloadable artifacts.)
 
 ## Unreleased — fork controller, optimized presets, keyboard shortcuts, and AVC444 diagnostics
 
+- **Controller lifecycle and upgrades are now self-healing.** Start compares
+  the full LaunchAgent contract with the currently located `macrdp.app`; a stale
+  `~/Applications` path, moved bundle, missing executable, or obsolete plist is
+  unloaded and atomically repaired before launch. Lifecycle commands run on a
+  bounded background queue, verify that the server PID remains alive, and show
+  actionable launch/TCC errors in Status. A manual **Repair Installation** action
+  performs the same reconciliation without touching config, TLS state, or the
+  Keychain password. Pure Swift tests cover current, moved, missing, and changed-
+  config LaunchAgent cases, and the DMG now includes a quick-start read-me.
+
 - **A native `macrdp Controller` now provides the everyday setup path.** The
   menu-bar app exposes the Ultimate, LAN Max, Native, and Fast profiles, an
   exact-address Allowed IP control, connection/status information, and the

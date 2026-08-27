@@ -39,6 +39,7 @@ LaunchAgent and edits the same `config.env` — no re-permissioning.
 | `select-usb-trigger.sh` | List attached USB devices and pick one as the IFD-handler load trigger; prints its `VID PID` (and a ready-to-paste `IFD_VID=.. IFD_PID=..` install line). Invoked by `install-ifd-handler.sh` interactively; runnable standalone. Embedded in the app next to the installer. |
 | `notarize.sh` | Notarize + staple a `.app`/`.dmg`/`.pkg` (used by the build scripts). |
 | `make-dmg.sh` | Wrap signed apps into a signed + notarized distribution DMG (styled icon layout). |
+| `INSTALL.txt` | End-user quick start included in the DMG as `Read Me.txt`. |
 | `make-icns.sh` | Build `AppIcon.icns` from a square PNG (used by the build scripts). |
 
 ### App icon & DMG styling
@@ -48,8 +49,8 @@ both bundles' `AppIcon.icns` + `CFBundleIconFile`. Per-app overrides:
 `packaging/macrdp.png` (server) and `packaging/macrdpController.png` (controller);
 each falls back to `icon.png`. No icon file → bundles use the default (generic) icon.
 
-`make-dmg.sh` lays out the DMG window (positioned app + controller + `/Applications`
-drop-link) via Finder automation — **best-effort**: if the build process lacks
+`make-dmg.sh` lays out the DMG window (positioned app + controller + quick-start
+read-me + `/Applications` drop-link) via Finder automation — **best-effort**: if the build process lacks
 Finder automation permission it falls back to an unstyled but functional DMG.
 Optional **`packaging/dmg-background.png`** sets a window background.
 

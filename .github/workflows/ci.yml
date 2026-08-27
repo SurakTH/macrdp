@@ -127,6 +127,10 @@ jobs:
           RUSTFLAGS: '-D warnings'
         run: cargo test --locked --target aarch64-apple-darwin
 
+      # Exercise LaunchAgent upgrade/move logic without touching a real agent.
+      - name: Test macrdp Controller core
+        run: ( cd gui && swift test )
+
       # Keep the native controller buildable on every main/PR change instead of
       # discovering Swift or AppKit regressions only after a release tag exists.
       - name: Build macrdp Controller (Swift release)

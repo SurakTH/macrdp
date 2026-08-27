@@ -15,6 +15,8 @@ trap 'rm -rf "$WORK"' EXIT
 # iconset can be rejected as "Invalid Iconset".
 BUILDER="$WORK/make-icns"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-xcrun swiftc "$SCRIPT_DIR/make-icns.swift" -o "$BUILDER"
+MODULE_CACHE="${CLANG_MODULE_CACHE_PATH:-$WORK/module-cache}"
+mkdir -p "$MODULE_CACHE"
+CLANG_MODULE_CACHE_PATH="$MODULE_CACHE" xcrun swiftc "$SCRIPT_DIR/make-icns.swift" -o "$BUILDER"
 "$BUILDER" "$SRC" "$OUT"
 echo "wrote $OUT"

@@ -50,6 +50,7 @@ trap 'rm -rf "$WORK"' EXIT
 STAGE="$WORK/dmg"
 mkdir -p "$STAGE"
 for a in "${apps[@]}"; do cp -R "$a" "$STAGE/"; done
+cp "$PKG_DIR/INSTALL.txt" "$STAGE/Read Me.txt"
 ln -s /Applications "$STAGE/Applications"   # drag-to-install target
 
 rm -f "$DMG"
@@ -87,6 +88,9 @@ tell application "Finder"
     end try
     try
       set position of item "macrdp Controller.app" of container window to {150, 320}
+    end try
+    try
+      set position of item "Read Me.txt" of container window to {450, 360}
     end try
     set position of item "Applications" of container window to {450, 230}
     update without registering applications

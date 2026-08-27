@@ -47,9 +47,19 @@ controller:
 2. **Prompts for your macOS account password** and stores it in the Keychain
    (the headless server reads it from there; written via `security` so there's
    no read-time Keychain prompt).
-3. **Writes + loads the LaunchAgent** pointing at that server bundle.
-4. **Reminds you to grant** Screen Recording + Accessibility, with a button to
+3. **Reconciles + loads the LaunchAgent** pointing at that server bundle. If an
+   earlier install still points to a moved or deleted app, the controller safely
+   unloads the stale job, atomically rewrites it, and loads the current path.
+4. **Verifies that the server stays running** instead of treating a successful
+   `kickstart` as proof; launch errors and privacy failures appear in Status.
+5. **Reminds you to grant** Screen Recording + Accessibility, with a button to
    open the pane.
+
+Start/Stop/Restart run on a bounded background queue, so a slow `launchctl`
+operation cannot freeze AppKit. Status shows `Starting…` / `Stopping…` /
+`Repairing…`, disables duplicate actions, and provides **Repair Installation**
+for an explicit path/config reconciliation. Repair preserves `config.env`, the
+TLS certificate, logs, and the Keychain password.
 
 No Terminal, no `install-launchagent.sh`. For unattended/MDM deploys there's a
 headless equivalent:
@@ -97,7 +107,8 @@ real work.
 - **Show macrdp Controller…** — opens the full Settings/Status window, including the
   performance profiles, Allowed IP field, connection target, and server controls.
 - **Start · Stop · Restart** — self-installs on first run, then `kickstart -k` /
-  `bootout` the agent (with EIO retry).
+  `bootout` the agent (with EIO retry, timeouts, stable-PID verification, and
+  automatic repair when the installed server path changes).
 - **Options** — H.264 / AAC / HiDPI / **Un-minimize on Cmd+Tab** / **App-switcher HUD** /
   **Per-connection workers (reconnect fix)** checkmarks, **Drive / Smart-card
   redirection** toggles, **UDP multitransport** + **↳ Move video to UDP (clean

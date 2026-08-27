@@ -115,6 +115,10 @@ final class SettingsModel: ObservableObject {
     /// Cached at open + after Apply (NOT recomputed in the view body — it shells
     /// out to `launchctl`, which per-render would spawn a subprocess per keystroke).
     @Published private(set) var serverRunning = false
+    /// Lifecycle work is serialized by AppController and reflected here so the
+    /// SwiftUI window remains responsive and never lets Start/Stop be spammed.
+    @Published private(set) var serverAction: ServerAction?
+    @Published private(set) var serverActionResult: ServerActionResult?
     /// Which section the sidebar shows. Hoisted here (not local @State) so the
     /// main-menu "Section" items can navigate the window too.
     @Published var section: SettingsSection = .status
@@ -125,11 +129,12 @@ final class SettingsModel: ObservableObject {
         let cfg = controller.readConfig()
         self.saved = cfg
         self.draft = cfg
-        self.serverRunning = controller.agentState().pid != nil
+        self.serverRunning = controller.cachedServerRunning
     }
 
     /// True when the draft diverges from the on-disk config, i.e. Apply has work.
     var isDirty: Bool { draft != saved }
+    var serverBusy: Bool { serverAction != nil }
 
     var selectedProfile: PerformanceProfile? {
         PerformanceProfile.allCases.first { $0.matches(draft) }
@@ -166,10 +171,32 @@ final class SettingsModel: ObservableObject {
         for (key, value) in draft where saved[key] != value {
             controller.writeConfig(key: key, value: value)
         }
-        controller.applyIfRunning()
         reload()
-        serverRunning = controller.agentState().pid != nil
-        lastAppliedAt = Date()
+        if serverRunning {
+            beginServerAction(.restart, marksSettingsApplied: true)
+        } else {
+            lastAppliedAt = Date()
+        }
+    }
+
+    func beginServerAction(_ action: ServerAction, marksSettingsApplied: Bool = false) {
+        guard !serverBusy else { return }
+        serverAction = action
+        serverActionResult = nil
+        controller.performServerAction(action) { [weak self] result in
+            guard let self else { return }
+            self.serverAction = nil
+            self.serverActionResult = result
+            self.serverRunning = result.running
+            if marksSettingsApplied, result.success { self.lastAppliedAt = Date() }
+        }
+    }
+
+    /// Keep the Apply footer's cached state aligned with the Status pane's
+    /// background sampler without shelling out during SwiftUI body evaluation.
+    func updateServerRunning(_ running: Bool) {
+        guard !serverBusy else { return }
+        serverRunning = running
     }
 
     // MARK: - Typed value access + SwiftUI bindings

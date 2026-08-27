@@ -190,10 +190,10 @@ struct SettingsView: View {
                 status
                 Spacer()
                 Button("Revert") { model.revert() }
-                    .disabled(!model.isDirty)
+                    .disabled(!model.isDirty || model.serverBusy)
                 Button("Apply") { model.apply() }
                     .keyboardShortcut("s", modifiers: .command)
-                    .disabled(!model.isDirty || model.validationError != nil)
+                    .disabled(!model.isDirty || model.validationError != nil || model.serverBusy)
             }
             .padding(12)
         }
@@ -218,6 +218,9 @@ struct SettingsView: View {
         if let error = model.validationError {
             Label(error, systemImage: "exclamationmark.triangle.fill")
                 .font(.callout).foregroundColor(.red)
+        } else if let action = model.serverAction {
+            Label(action.progressTitle, systemImage: "arrow.triangle.2.circlepath")
+                .font(.callout).foregroundColor(.secondary)
         } else if model.isDirty {
             Label("Unsaved changes — Apply to restart the server with them",
                   systemImage: "pencil.circle")
@@ -620,7 +623,10 @@ private struct StatusView: View {
     var body: some View {
         Form {
             Section("Server") {
-                row("Status", stats.running ? "Running (pid \(stats.pid))" : "Stopped")
+                row("Status", model.serverAction?.progressTitle
+                    ?? (model.serverRunning
+                        ? (stats.running ? "Running (pid \(stats.pid))" : "Running")
+                        : "Stopped"))
                 row("Profile", model.appliedProfile?.title ?? "Custom")
                 row("Connect to", connectTarget)
                 row("Allowed clients", model.appliedAllowedIPDisplay)
@@ -630,15 +636,36 @@ private struct StatusView: View {
                     row("CPU", String(format: "%.1f%%", stats.cpu))
                 }
                 HStack {
-                    Button(stats.running ? "Restart Server" : "Start Server") {
-                        if stats.running { model.controller.restart() }
-                        else { model.controller.start() }
-                        refreshAfterAction()
+                    Button(model.serverRunning ? "Restart Server" : "Start Server") {
+                        model.beginServerAction(model.serverRunning ? .restart : .start)
                     }
-                    if stats.running {
+                    .disabled(model.serverBusy)
+                    if model.serverRunning {
                         Button("Stop Server") {
-                            model.controller.stop()
-                            refreshAfterAction()
+                            model.beginServerAction(.stop)
+                        }
+                        .disabled(model.serverBusy)
+                    }
+                    Spacer()
+                    Button("Repair Installation") { model.beginServerAction(.repair) }
+                        .disabled(model.serverBusy)
+                        .help("Rebuild the LaunchAgent with the current macrdp.app path, then start it")
+                }
+                if model.serverBusy {
+                    ProgressView().controlSize(.small)
+                } else if let result = model.serverActionResult, !result.cancelled {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label(result.message,
+                              systemImage: result.success
+                                ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                            .font(.caption)
+                            .foregroundColor(result.success ? .secondary : .red)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if result.needsPermissionAttention {
+                            Button("Open Privacy Settings…") {
+                                model.controller.openScreenRecording()
+                            }
+                            .controlSize(.small)
                         }
                     }
                 }
@@ -689,12 +716,9 @@ private struct StatusView: View {
                 conn = c
                 live = l
                 connectTarget = target
+                model.updateServerRunning(s.running)
             }
         }
-    }
-
-    private func refreshAfterAction() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { refresh() }
     }
 
     private func bitrateText(_ l: LiveStats) -> String {
@@ -818,7 +842,7 @@ extension AppController {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        let st = agentState()
+        let st = cachedAgentStateSnapshot
         let statusLine: String
         if let pid = st.pid { statusLine = "Server: running (pid \(pid))" }
         else if st.loaded { statusLine = "Server: installed, stopped" }

@@ -110,15 +110,19 @@ launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
 
 ```bash
 packaging/make-app.sh                                 # build + sign + install to /Applications
-security add-generic-password -s macrdp -a "$(id -un)" -w 'YOUR_PASSWORD'
-packaging/install-launchagent.sh                      # load LaunchAgent (label io.github.surakth.macrdp)
 gui/make-tray-app.sh                                  # build + install macrdp Controller
+open "/Applications/macrdp Controller.app"            # click Start; onboarding is in the app
 ```
 
 The controller exposes Ultimate, LAN Max, Native, and Fast profiles plus LAN
 access and an exact-address Allowed IP field. Feature toggles, bind address, and
 extra flags live in `~/Library/Application Support/macrdp/config.env` — outside
 the bundle, so edits never disturb the signature or TCC grants. The full
+Controller self-installs the LaunchAgent and repairs an obsolete executable path
+after either app is moved or replaced; **Repair Installation** on Status reruns
+the same safe reconciliation without deleting config, TLS data, or Keychain
+credentials. Start/Stop/Restart run off the UI thread and report verified launchd
+results instead of leaving the window blocked. The full
 packaging guide (Developer-ID signing, notarization, the DMG, the controller
 app, icons, TCC notes): **[packaging/README.md](packaging/README.md)**.
 

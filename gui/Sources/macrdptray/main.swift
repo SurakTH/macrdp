@@ -1,5 +1,70 @@
 import AppKit
+import ControllerCore
+import Darwin
 import UniformTypeIdentifiers
+
+enum ServerAction: Equatable {
+    case start
+    case restart
+    case stop
+    case repair
+
+    var progressTitle: String {
+        switch self {
+        case .start: return "Starting…"
+        case .restart: return "Restarting…"
+        case .stop: return "Stopping…"
+        case .repair: return "Repairing…"
+        }
+    }
+}
+
+struct ServerActionResult {
+    let success: Bool
+    let message: String
+    let running: Bool
+    let repaired: Bool
+    let needsPermissionAttention: Bool
+    let cancelled: Bool
+
+    init(
+        success: Bool,
+        message: String,
+        running: Bool,
+        repaired: Bool,
+        needsPermissionAttention: Bool,
+        cancelled: Bool = false
+    ) {
+        self.success = success
+        self.message = message
+        self.running = running
+        self.repaired = repaired
+        self.needsPermissionAttention = needsPermissionAttention
+        self.cancelled = cancelled
+    }
+}
+
+private final class ProcessOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func store(_ value: Data) {
+        lock.lock()
+        data = value
+        lock.unlock()
+    }
+
+    func string() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
+private struct StartupLogMarker {
+    let main: UInt64
+    let stderr: UInt64
+}
 
 // macrdp Controller: a menu-bar app that controls the macrdp LaunchAgent
 // (label io.github.surakth.macrdp by default in this fork)
@@ -37,6 +102,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var plistURL: URL { home.appendingPathComponent("Library/LaunchAgents/\(label).plist") }
 
     var timer: Timer?
+    private let lifecycleQueue = DispatchQueue(label: "io.github.surakth.macrdp.controller.lifecycle",
+                                               qos: .userInitiated)
+    private(set) var activeServerAction: ServerAction?
+    private var cachedAgentState: (loaded: Bool, pid: Int?) = (false, nil)
+    private var glyphRefreshInFlight = false
+    var cachedServerRunning: Bool { cachedAgentState.pid != nil }
+    var cachedAgentStateSnapshot: (loaded: Bool, pid: Int?) { cachedAgentState }
 
     /// The tabbed Settings window (SettingsWindow.swift); nil while closed.
     var settingsWindowController: SettingsWindowController?
@@ -86,14 +158,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func refreshGlyph() {
-        let st = agentState()
-        let running = st.pid != nil
-        // Dim the menu-bar icon when the server isn't running so state is
-        // glanceable without opening the menu.
-        statusItem.button?.alphaValue = running ? 1.0 : 0.4
-        statusItem.button?.toolTip = running
-            ? "macrdp Controller: running (pid \(st.pid!))"
-            : (st.loaded ? "macrdp Controller: stopped" : "macrdp Controller: not installed")
+        guard !glyphRefreshInFlight else { return }
+        glyphRefreshInFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let st = self.agentState()
+            DispatchQueue.main.async {
+                self.cachedAgentState = st
+                self.glyphRefreshInFlight = false
+                let running = st.pid != nil
+                // Dim the menu-bar icon when the server isn't running so state
+                // is glanceable without opening the menu.
+                self.statusItem.button?.alphaValue = running ? 1.0 : 0.4
+                self.statusItem.button?.toolTip = running
+                    ? "macrdp Controller: running (pid \(st.pid!))"
+                    : (st.loaded
+                        ? "macrdp Controller: stopped" : "macrdp Controller: not installed")
+            }
+        }
     }
 
     // MARK: - Server status (parsed from the log)
@@ -145,9 +227,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
 
-        let st = agentState()
+        let st = cachedAgentState
         let header: String
-        if !st.loaded { header = "macrdp Controller — not installed" }
+        if let action = activeServerAction { header = "macrdp Controller — \(action.progressTitle)" }
+        else if !st.loaded { header = "macrdp Controller — not installed" }
         else if let pid = st.pid { header = "macrdp Controller — running (pid \(pid))" }
         else { header = "macrdp Controller — stopped" }
         let h = NSMenuItem(title: header, action: nil, keyEquivalent: "")
@@ -167,7 +250,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         let running = st.pid != nil
-        if running {
+        if let action = activeServerAction {
+            let busy = NSMenuItem(title: action.progressTitle, action: nil, keyEquivalent: "")
+            busy.isEnabled = false
+            menu.addItem(busy)
+        } else if running {
             menu.addItem(item("Stop", #selector(stop)))
             menu.addItem(item("Restart", #selector(restart)))
         } else {
@@ -188,44 +275,87 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Actions
 
     @objc func start() {
-        // Self-install on first run: locate the server app, onboard the Keychain
-        // password, write + register the LaunchAgent — no Terminal step needed.
-        guard let serverApp = locateServerApp() else {
-            alert(style: .warning, "Can't find macrdp.app",
-                  "Move both macrdp.app and macrdp Controller.app into /Applications "
-                  + "(or ~/Applications), then click Start again.")
-            return
-        }
-        if !hasKeychainPassword() {
-            guard promptAndStorePassword() else { return } // user cancelled
-        }
-        ensureConfigExists()
-        let firstInstall = !FileManager.default.fileExists(atPath: plistURL.path)
-        if firstInstall { installLaunchAgent(serverApp: serverApp) }
-        ensureLoaded()
-        _ = run("/bin/launchctl", ["kickstart", "-k", service])
-        refreshGlyph()
-        if firstInstall { remindPermissions() }
+        performMenuAction(.start)
     }
 
     @objc func stop() {
-        _ = run("/bin/launchctl", ["bootout", service])
-        refreshGlyph()
+        performMenuAction(.stop)
     }
 
-    @objc func restart() { start() }
+    @objc func restart() { performMenuAction(.restart) }
 
-    func ensureLoaded() {
-        guard !agentState().loaded, FileManager.default.fileExists(atPath: plistURL.path) else { return }
-        // `launchctl bootstrap` intermittently fails with EIO ("Bootstrap
-        // failed: 5: Input/output error") right after a bootout; retry a few
-        // times until the service registers.
-        for _ in 0..<5 {
-            _ = run("/bin/launchctl", ["bootstrap", domain, plistURL.path])
-            if agentState().loaded { break }
-            Thread.sleep(forTimeInterval: 0.5)
+    @objc func repairInstallation() { performMenuAction(.repair) }
+
+    private func performMenuAction(_ action: ServerAction) {
+        performServerAction(action) { [weak self] result in
+            guard let self else { return }
+            if !result.success, !result.cancelled {
+                self.alert(style: .critical, "Couldn't \(action == .stop ? "stop" : "start") macrdp",
+                           result.message)
+            } else if action == .repair {
+                self.alert(style: .informational, "Installation repaired", result.message)
+            } else if result.needsPermissionAttention {
+                self.remindPermissions()
+            }
         }
-        _ = run("/bin/launchctl", ["enable", service])
+    }
+
+    /// Run launchctl and startup verification away from AppKit's main thread.
+    /// Password onboarding remains on the main thread because it presents an
+    /// NSAlert; every potentially blocking lifecycle command runs serially here.
+    func performServerAction(
+        _ action: ServerAction,
+        completion: @escaping (ServerActionResult) -> Void
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard activeServerAction == nil else {
+            completion(ServerActionResult(
+                success: false,
+                message: "Another server operation is already in progress.",
+                running: cachedServerRunning,
+                repaired: false,
+                needsPermissionAttention: false))
+            return
+        }
+
+        var serverApp: URL?
+        if action != .stop {
+            guard let located = locateServerApp() else {
+                completion(ServerActionResult(
+                    success: false,
+                    message: "Move both macrdp.app and macrdp Controller.app into Applications, "
+                        + "then try again.",
+                    running: cachedServerRunning,
+                    repaired: false,
+                    needsPermissionAttention: false))
+                return
+            }
+            serverApp = located
+            if !hasKeychainPassword(), !promptAndStorePassword() {
+                completion(ServerActionResult(
+                    success: false, message: "Start cancelled.", running: cachedServerRunning,
+                    repaired: false, needsPermissionAttention: false, cancelled: true))
+                return
+            }
+        }
+
+        activeServerAction = action
+        rebuildMenu()
+        lifecycleQueue.async { [weak self] in
+            guard let self else { return }
+            let result: ServerActionResult
+            if action == .stop {
+                result = self.stopServerNow()
+            } else {
+                result = self.startServerNow(serverApp: serverApp!, forceRepair: action == .repair)
+            }
+            DispatchQueue.main.async {
+                self.activeServerAction = nil
+                self.refreshGlyph()
+                self.rebuildMenu()
+                completion(result)
+            }
+        }
     }
 
     // MARK: - Headless entry (scripted/MDM deploy + testing)
@@ -235,13 +365,30 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// (assumes the Keychain password is set separately for unattended deploys).
     func runHeadless(_ args: [String]) -> Int32 {
         if args.contains("--print-paths") {
+            let serverApp = locateServerApp()
+            let plistTarget = readLaunchAgentPlist().flatMap(LaunchAgentSpec.programPath(in:))
+            let loadedTarget = registeredAgentProgramPath()
             print("label:      \(label)")
             print("bind:       \(readConfig()["BIND"] ?? "127.0.0.1:3390")")
-            print("server app: \(locateServerApp()?.path ?? "NOT FOUND")")
+            print("server app: \(serverApp?.path ?? "NOT FOUND")")
+            print("plist target: \(plistTarget ?? "NOT INSTALLED")")
+            print("loaded target: \(loadedTarget ?? "NOT LOADED")")
             print("plist:      \(plistURL.path)")
             print("config:     \(configURL.path)")
             print("log:        \(logURL.path)")
             print("password:   \(hasKeychainPassword() ? "set" : "MISSING")")
+            if let serverApp {
+                let spec = launchAgentSpec(serverApp: serverApp)
+                let current = readLaunchAgentPlist()
+                let loaded = agentState().loaded
+                let needsRepair = spec.requiresRepair(
+                    plist: current,
+                    loadedProgramPath: loadedTarget,
+                    isLoaded: loaded,
+                    fileExists: FileManager.default.fileExists(atPath:)
+                )
+                print("agent:      \(needsRepair ? "NEEDS REPAIR" : "current")")
+            }
             return 0
         }
         guard let serverApp = locateServerApp() else {
@@ -249,11 +396,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 "error: macrdp.app not found next to the controller or in /Applications\n".utf8))
             return 1
         }
-        ensureConfigExists()
-        installLaunchAgent(serverApp: serverApp)
-        ensureLoaded()
-        _ = run("/bin/launchctl", ["kickstart", "-k", service])
+        let result = startServerNow(serverApp: serverApp, forceRepair: true)
+        guard result.success else {
+            FileHandle.standardError.write(Data("error: \(result.message)\n".utf8))
+            return 1
+        }
         print("installed: \(plistURL.path) -> \(serverApp.path)")
+        print(result.message)
         if !hasKeychainPassword() {
             print("note: Keychain password not set — store it with:")
             print("  security add-generic-password -U -s macrdp -a \(NSUserName()) -w '<password>'")
@@ -278,33 +427,247 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Write + register the LaunchAgent plist pointing at the located server's
-    /// SIGNED binary, run directly with `--config` (the binary reads config.env
-    /// itself). Mirrors packaging/install-launchagent.sh, in-process. Launching
-    /// the signed Mach-O — not an unsigned wrapper script — gives macOS
-    /// Background Task Management a stable identity to approve once.
-    func installLaunchAgent(serverApp: URL) {
+    func launchAgentSpec(serverApp: URL) -> LaunchAgentSpec {
         let bin = serverApp.appendingPathComponent("Contents/MacOS/macrdp").path
-        let dict: [String: Any] = [
-            "Label": label,
-            "ProgramArguments": [bin, "--config", configURL.path],
-            "RunAtLoad": true,
-            "KeepAlive": true,
-            // No StandardOutPath: the server writes + rotates macrdp.log itself
-            // (a second writer would corrupt it / strand launchd on a rotated
-            // inode). StandardErrorPath keeps panics + pre-logging stderr.
-            "StandardErrorPath": errLogURL.path,
-            "EnvironmentVariables": ["RUST_LOG": "info"],
-        ]
-        let fm = FileManager.default
-        try? fm.createDirectory(at: plistURL.deletingLastPathComponent(),
-                                withIntermediateDirectories: true)
-        try? fm.createDirectory(at: logURL.deletingLastPathComponent(),
-                                withIntermediateDirectories: true)
-        if let data = try? PropertyListSerialization.data(fromPropertyList: dict,
-                                                          format: .xml, options: 0) {
-            try? data.write(to: plistURL)
+        return LaunchAgentSpec(
+            label: label,
+            serverBinaryPath: bin,
+            configPath: configURL.path,
+            stderrPath: errLogURL.path
+        )
+    }
+
+    func readLaunchAgentPlist() -> [String: Any]? {
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil) as? [String: Any] else {
+            return nil
         }
+        return plist
+    }
+
+    /// launchd caches the job definition at bootstrap time. Comparing only the
+    /// plist on disk misses a manually replaced plist whose already-loaded job
+    /// still points somewhere else, so reconciliation checks both views.
+    func registeredAgentProgramPath() -> String? {
+        let result = run("/bin/launchctl", ["print", service], timeout: 4)
+        guard result.code == 0 else { return nil }
+        for raw in result.stdout.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("program = ") {
+                return String(line.dropFirst("program = ".count))
+            }
+        }
+        return nil
+    }
+
+    /// Atomically write the complete LaunchAgent contract. The caller unloads a
+    /// stale registered job before replacing its plist, so launchd can never
+    /// retain an old executable path after the apps move.
+    func writeLaunchAgent(_ spec: LaunchAgentSpec) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: plistURL.deletingLastPathComponent(),
+                               withIntermediateDirectories: true)
+        try fm.createDirectory(at: logURL.deletingLastPathComponent(),
+                               withIntermediateDirectories: true)
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: spec.propertyList, format: .xml, options: 0)
+        try data.write(to: plistURL, options: .atomic)
+    }
+
+    private func stopServerNow() -> ServerActionResult {
+        if !agentState().loaded {
+            return ServerActionResult(
+                success: true, message: "Server was already stopped.", running: false,
+                repaired: false, needsPermissionAttention: false)
+        }
+        let stopped = unloadAgent()
+        if let error = stopped {
+            return ServerActionResult(
+                success: false, message: error, running: agentState().pid != nil,
+                repaired: false, needsPermissionAttention: false)
+        }
+        return ServerActionResult(
+            success: true, message: "Server stopped.", running: false,
+            repaired: false, needsPermissionAttention: false)
+    }
+
+    private func startServerNow(serverApp: URL, forceRepair: Bool) -> ServerActionResult {
+        let logMarker = startupLogMarker()
+        ensureConfigExists()
+        let spec = launchAgentSpec(serverApp: serverApp)
+        let existing = readLaunchAgentPlist()
+        let previousProgram = existing.flatMap(LaunchAgentSpec.programPath(in:))
+        let loadedState = agentState()
+        let loadedProgram = loadedState.loaded ? registeredAgentProgramPath() : nil
+        let requiresRepair = spec.requiresRepair(
+            plist: existing,
+            loadedProgramPath: loadedProgram,
+            isLoaded: loadedState.loaded,
+            fileExists: FileManager.default.fileExists(atPath:)
+        )
+        let shouldRepair = forceRepair || requiresRepair
+
+        if shouldRepair {
+            if let error = unloadAgent() {
+                return ServerActionResult(
+                    success: false, message: error, running: agentState().pid != nil,
+                    repaired: false, needsPermissionAttention: false)
+            }
+            do {
+                try writeLaunchAgent(spec)
+            } catch {
+                return ServerActionResult(
+                    success: false,
+                    message: "Couldn't write \(plistURL.path): \(error.localizedDescription)",
+                    running: false, repaired: false, needsPermissionAttention: false)
+            }
+        }
+
+        // A newly bootstrapped RunAtLoad job may already be starting. Use a
+        // non-destructive kickstart in that case: `-k` would kill the fresh
+        // process inside launchd's 10-second minimum-runtime window and trigger
+        // a throttle delay. An already-loaded job is intentionally restarted.
+        let wasLoaded = agentState().loaded
+        if let error = loadAgent() {
+            return ServerActionResult(
+                success: false, message: error, running: false,
+                repaired: shouldRepair, needsPermissionAttention: false)
+        }
+
+        let kickArgs = wasLoaded
+            ? ["kickstart", "-k", service]
+            : ["kickstart", service]
+        let kick = run("/bin/launchctl", kickArgs, timeout: 8)
+        guard kick.code == 0 else {
+            return ServerActionResult(
+                success: false,
+                message: commandFailure("launchctl couldn't start the server", result: kick),
+                running: false, repaired: shouldRepair, needsPermissionAttention: false)
+        }
+
+        guard let pid = waitForStableServer() else {
+            let failure = serverStartupFailure(since: logMarker)
+            return ServerActionResult(
+                success: false, message: failure, running: false,
+                repaired: shouldRepair,
+                needsPermissionAttention: failure.contains("Screen Recording"))
+        }
+
+        let permissions = permissionStatus()
+        let needsPermissionAttention = permissions.screen != true || permissions.accessibility != true
+        var message = "Server is running (pid \(pid))."
+        if shouldRepair {
+            if let previousProgram, previousProgram != spec.serverBinaryPath {
+                message += " Repaired the old LaunchAgent path to \(spec.serverBinaryPath)."
+            } else {
+                message += " LaunchAgent registration was repaired."
+            }
+        }
+        if needsPermissionAttention {
+            message += " macOS privacy permissions still need attention."
+        }
+        return ServerActionResult(
+            success: true, message: message, running: true, repaired: shouldRepair,
+            needsPermissionAttention: needsPermissionAttention)
+    }
+
+    /// Unregister the live job and wait until launchd has actually forgotten it;
+    /// rewriting the plist without this step is exactly what left the released
+    /// controller pointing at ~/Applications after the apps moved.
+    private func unloadAgent() -> String? {
+        guard agentState().loaded else { return nil }
+        let result = run("/bin/launchctl", ["bootout", service], timeout: 8)
+        let deadline = Date().addingTimeInterval(4)
+        while Date() < deadline {
+            if !agentState().loaded { return nil }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        if !agentState().loaded { return nil }
+        return commandFailure("launchd wouldn't unload the existing server", result: result)
+    }
+
+    /// Bootstrap with bounded retries for launchd's documented EIO teardown
+    /// race, then verify the job is registered before attempting kickstart.
+    private func loadAgent() -> String? {
+        if agentState().loaded { return nil }
+        let enabled = run("/bin/launchctl", ["enable", service], timeout: 8)
+        if enabled.code != 0 {
+            return commandFailure("launchd couldn't enable the server", result: enabled)
+        }
+        var last = (code: Int32(1), stdout: "")
+        for _ in 0..<5 {
+            last = run("/bin/launchctl", ["bootstrap", domain, plistURL.path], timeout: 8)
+            if agentState().loaded { return nil }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        return commandFailure("launchd couldn't load the server", result: last)
+    }
+
+    /// Require a PID to remain present across two samples. This catches the
+    /// common "kickstart returned success, process immediately crashed" case.
+    private func waitForStableServer() -> Int? {
+        let deadline = Date().addingTimeInterval(12)
+        while Date() < deadline {
+            if let pid = agentState().pid {
+                Thread.sleep(forTimeInterval: 0.6)
+                if agentState().pid != nil { return pid }
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return nil
+    }
+
+    private func commandFailure(
+        _ prefix: String,
+        result: (code: Int32, stdout: String)
+    ) -> String {
+        let detail = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.code == 124 { return "\(prefix): the command timed out." }
+        return detail.isEmpty ? "\(prefix) (exit \(result.code))." : "\(prefix): \(detail)"
+    }
+
+    private func startupLogMarker() -> StartupLogMarker {
+        StartupLogMarker(main: fileSize(logURL), stderr: fileSize(errLogURL))
+    }
+
+    private func fileSize(_ url: URL) -> UInt64 {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
+    /// Read only output produced by the current start attempt. Old TCC or port
+    /// errors must not be blamed for an unrelated future crash. If log rotation
+    /// replaced the file during startup, read the new file from the beginning.
+    private func textSince(_ offset: UInt64, in url: URL) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let start = offset <= size ? offset : 0
+        try? handle.seek(toOffset: start)
+        let data = (try? handle.readToEnd()) ?? Data()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func serverStartupFailure(since marker: StartupLogMarker) -> String {
+        let err = textSince(marker.stderr, in: errLogURL)
+        if err.contains("NoShareableContent") || err.contains("declined TCC") {
+            return "Screen Recording permission isn't granted to macrdp.app. Enable it in "
+                + "System Settings → Privacy & Security, then start the server again."
+        }
+        let recent = textSince(marker.main, in: logURL)
+        if recent.contains("Screen Recording permission NOT granted") {
+            return "Screen Recording permission isn't granted to macrdp.app. Enable it in "
+                + "System Settings → Privacy & Security, then start the server again."
+        }
+        if recent.contains("Address already in use") {
+            return "Port 3390 is already in use by another process."
+        }
+        let state = run("/bin/launchctl", ["print", service], timeout: 4).stdout
+        if let range = state.range(of: #"last exit code = [^\n]+"#, options: .regularExpression) {
+            return "The server exited during startup (\(state[range])). Open Logs for details."
+        }
+        return "The server didn't stay running. Open Logs for the startup error."
     }
 
     // MARK: - Keychain password onboarding
@@ -531,13 +894,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ("hungarian", "Hungarian"),
     ]
 
-    /// Re-exec the agent so config.env changes take effect, if it's running.
-    func applyIfRunning() {
-        if agentState().pid != nil {
-            _ = run("/bin/launchctl", ["kickstart", "-k", service])
-        }
-    }
-
     @objc func editConfig() { ensureConfigExists(); NSWorkspace.shared.open(configURL) }
     @objc func openLogs() {
         if !FileManager.default.fileExists(atPath: logURL.path) {
@@ -623,7 +979,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Process helper
 
-    func run(_ path: String, _ args: [String], env: [String: String]? = nil)
+    func run(
+        _ path: String,
+        _ args: [String],
+        env: [String: String]? = nil,
+        timeout: TimeInterval = 15
+    )
         -> (code: Int32, stdout: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
@@ -637,9 +998,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.standardOutput = pipe
         p.standardError = pipe
         do { try p.run() } catch { return (-1, "") }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+        // Drain concurrently so a verbose child can't fill the pipe and
+        // deadlock. The deadline also prevents a wedged launchctl/security
+        // invocation from leaving the Controller in a permanent busy state.
+        let output = ProcessOutputBuffer()
+        let readerDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            output.store(pipe.fileHandleForReading.readDataToEndOfFile())
+            readerDone.signal()
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning, Date() < deadline { usleep(50_000) }
+        let timedOut = p.isRunning
+        if timedOut {
+            p.terminate()
+            let terminateDeadline = Date().addingTimeInterval(0.5)
+            while p.isRunning, Date() < terminateDeadline { usleep(25_000) }
+            if p.isRunning { Darwin.kill(p.processIdentifier, SIGKILL) }
+        }
         p.waitUntilExit()
-        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        _ = readerDone.wait(timeout: .now() + 1)
+        return (timedOut ? 124 : p.terminationStatus, output.string())
     }
 }
 

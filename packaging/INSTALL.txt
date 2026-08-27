@@ -1,0 +1,19 @@
+macrdp — Quick Start
+====================
+
+1. Drag BOTH macrdp.app and macrdp Controller.app to Applications.
+2. Open macrdp Controller and choose Start Server.
+3. Enter your Mac account password when asked. It is stored in your login
+   Keychain and is used only to authenticate RDP clients.
+4. Grant macrdp.app Screen Recording and Accessibility access when macOS asks,
+   then choose Start Server again.
+
+If the apps were moved or replaced, open the Controller's Status page and use
+Repair Installation. Your settings, TLS certificate, and Keychain password are
+preserved.
+
+These community release builds are ad-hoc signed, not Apple-notarized. On first
+launch you may need to right-click each app and choose Open.
+
+Project: https://github.com/SurakTH/macrdp
+Based on macrdp by Clint Canada and contributors.
