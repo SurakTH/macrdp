@@ -106,7 +106,7 @@ else
       fi
     done < <(
       find "$PROJECT_DIR/src" "$PROJECT_DIR/vendor" \
-        -type f \( -name '*.rs' -o -name '*.m' -o -name '*.c' -o -name '*.h' \) \
+        -type f \( -name '*.rs' -o -name '*.m' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
         -print0
     )
   fi

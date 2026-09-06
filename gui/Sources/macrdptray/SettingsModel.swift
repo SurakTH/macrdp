@@ -110,11 +110,16 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var saved: [String: String]
     /// Working copy the UI edits; differs from `saved` exactly when dirty.
     @Published var draft: [String: String]
-    /// Set after a successful Apply, for transient "Applied ✓" feedback.
-    @Published var lastAppliedAt: Date?
+    /// Describes the completed action, independent of later server state.
+    @Published private(set) var applySuccessMessage: String?
+    @Published private(set) var applyError: String?
+    @Published private(set) var restartRequired = false
+    private let saveSettings: ([String: String]) throws -> Void
+    private let performAction: (ServerAction, @escaping (ServerActionResult) -> Void) -> Void
     /// Cached at open + after Apply (NOT recomputed in the view body — it shells
     /// out to `launchctl`, which per-render would spawn a subprocess per keystroke).
     @Published private(set) var serverRunning = false
+    @Published private(set) var serverStatusKnown = false
     /// Lifecycle work is serialized by AppController and reflected here so the
     /// SwiftUI window remains responsive and never lets Start/Stop be spammed.
     @Published private(set) var serverAction: ServerAction?
@@ -123,13 +128,26 @@ final class SettingsModel: ObservableObject {
     /// main-menu "Section" items can navigate the window too.
     @Published var section: SettingsSection = .status
 
-    init(controller: AppController) {
+    init(controller: AppController,
+         initialConfig: [String: String]? = nil,
+         saveSettings: (([String: String]) throws -> Void)? = nil,
+         performAction: ((ServerAction, @escaping (ServerActionResult) -> Void) -> Void)? = nil) {
         self.controller = controller
-        controller.ensureConfigExists()
-        let cfg = controller.readConfig()
+        self.saveSettings = saveSettings ?? { [unowned controller] in try controller.saveConfig(changes: $0) }
+        self.performAction = performAction ?? { [unowned controller] in controller.performServerAction($0, completion: $1) }
+        if initialConfig == nil { controller.ensureConfigExists() }
+        let cfg = initialConfig ?? controller.readConfig()
         self.saved = cfg
         self.draft = cfg
         self.serverRunning = controller.cachedServerRunning
+        self.serverStatusKnown = initialConfig != nil
+        if initialConfig == nil {
+            // Resolve even if the user leaves Status before its first refresh.
+            DispatchQueue.global(qos: .utility).async { [weak self, controller] in
+                let running = controller.agentState().pid != nil
+                DispatchQueue.main.async { self?.updateServerRunning(running) }
+            }
+        }
     }
 
     /// True when the draft diverges from the on-disk config, i.e. Apply has work.
@@ -145,11 +163,24 @@ final class SettingsModel: ObservableObject {
     }
 
     var validationError: String? {
+        if portNumber.isEmpty || !portNumber.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 })
+            || UInt16(portNumber).map({ $0 > 0 }) != true {
+            return "Port must be a whole number from 1 to 65535."
+        }
         let invalid = allowedIPTokens.filter {
             IPv4Address($0) == nil && IPv6Address($0) == nil
         }
-        guard !invalid.isEmpty else { return nil }
-        return "Invalid IP address: \(invalid.joined(separator: ", "))"
+        if !invalid.isEmpty { return "Invalid IP address: \(invalid.joined(separator: ", "))" }
+        for (key, label) in [("FPS", "Frame rate"), ("BITRATE", "Bitrate")] {
+            let value = draft[key] ?? ""
+            if !value.isEmpty, UInt32(value).map({ $0 > 0 }) != true {
+                return "\(label) must be a positive whole number."
+            }
+        }
+        if draft.values.contains(where: { $0.rangeOfCharacter(from: .newlines) != nil }) {
+            return "Each setting must fit on one line."
+        }
+        return nil
     }
 
     func reload() {
@@ -158,37 +189,61 @@ final class SettingsModel: ObservableObject {
         draft = cfg
     }
 
-    func revert() { draft = saved }
+    func revert() { draft = saved; applyError = nil }
 
-    /// Write every changed key, then kickstart once (if the server is running).
+    /// A failed write leaves the entire draft intact and never restarts the server.
     func apply() {
-        guard validationError == nil else { return }
-        // Preserve natural typing (including a trailing comma) while the field
-        // is being edited, then store one canonical comma-separated value.
-        if draft["ALLOW_IP"] != nil {
-            draft["ALLOW_IP"] = allowedIPTokens.joined(separator: ",")
+        guard serverStatusKnown, !serverBusy, validationError == nil, isDirty || restartRequired else { return }
+        applyError = nil
+        applySuccessMessage = nil
+        if isDirty {
+            var candidate = draft
+            if candidate["ALLOW_IP"] != nil {
+                candidate["ALLOW_IP"] = allowedIPTokens.joined(separator: ",")
+            }
+            let changes = candidate.filter { saved[$0.key] != $0.value }
+            do {
+                try saveSettings(changes)
+            } catch {
+                applyError = "Could not save settings: \(error.localizedDescription)"
+                return
+            }
+            saved = candidate
+            draft = candidate
+        } else if !restartRequired {
+            return
         }
-        for (key, value) in draft where saved[key] != value {
-            controller.writeConfig(key: key, value: value)
-        }
-        reload()
-        if serverRunning {
-            beginServerAction(.restart, marksSettingsApplied: true)
+        if serverRunning || restartRequired {
+            restartRequired = true
+            beginServerAction(serverRunning ? .restart : .start, marksSettingsApplied: true)
         } else {
-            lastAppliedAt = Date()
+            applySuccessMessage = "Settings saved — start the server to use them"
         }
     }
 
     func beginServerAction(_ action: ServerAction, marksSettingsApplied: Bool = false) {
-        guard !serverBusy else { return }
+        guard serverStatusKnown, !serverBusy else { return }
+        if !marksSettingsApplied { applySuccessMessage = nil }
         serverAction = action
         serverActionResult = nil
-        controller.performServerAction(action) { [weak self] result in
+        performAction(action) { [weak self] result in
             guard let self else { return }
             self.serverAction = nil
             self.serverActionResult = result
             self.serverRunning = result.running
-            if marksSettingsApplied, result.success { self.lastAppliedAt = Date() }
+            if marksSettingsApplied {
+                if result.success {
+                    self.restartRequired = false
+                    self.applyError = nil
+                    self.applySuccessMessage = action == .restart
+                        ? "Settings saved — server restarted" : "Settings saved — server started"
+                } else {
+                    self.applyError = "Settings saved, but not activated. \(result.message) Retry Apply."
+                }
+            } else if result.success && (action == .start || action == .restart) {
+                self.restartRequired = false
+                self.applyError = nil
+            }
         }
     }
 
@@ -197,6 +252,7 @@ final class SettingsModel: ObservableObject {
     func updateServerRunning(_ running: Bool) {
         guard !serverBusy else { return }
         serverRunning = running
+        serverStatusKnown = true
     }
 
     // MARK: - Typed value access + SwiftUI bindings
@@ -209,6 +265,11 @@ final class SettingsModel: ObservableObject {
 
     func setBool(_ key: String, _ value: Bool) {
         draft[key] = value ? "1" : "0"
+        // Honor the control the user touched: disabling H.264 must not be
+        // undone by the dependent UDP-video setting during normalization.
+        if key == "ENABLE_H264", !value {
+            if draft["UDP_MIGRATE_EGFX"] == "1" { draft["UDP_MIGRATE_EGFX"] = "0" }
+        }
         normalize()
     }
 
@@ -261,10 +322,22 @@ final class SettingsModel: ObservableObject {
 
     var bindDisplay: String { string("BIND", default: "127.0.0.1:3390") }
 
+    var portNumber: String {
+        guard let colon = bindDisplay.lastIndex(of: ":") else { return "" }
+        return String(bindDisplay[bindDisplay.index(after: colon)...])
+    }
+
+    func setPortNumber(_ port: String) {
+        // Preserve the exact host, including bracketed IPv6 and explicit LAN IPs.
+        let host = bindDisplay.lastIndex(of: ":").map { String(bindDisplay[..<$0]) }
+            ?? "127.0.0.1"
+        setString("BIND", "\(host):\(port)")
+    }
+
     var allowNetwork: Bool { bindDisplay.hasPrefix("0.0.0.0") }
 
     func setAllowNetwork(_ on: Bool) {
-        let port = bindDisplay.split(separator: ":").last.map(String.init) ?? "3390"
+        let port = portNumber
         setString("BIND", "\(on ? "0.0.0.0" : "127.0.0.1"):\(port)")
     }
 
@@ -293,6 +366,10 @@ final class SettingsModel: ObservableObject {
 
     func applyProfile(_ profile: PerformanceProfile) {
         for (key, value) in profile.settings { draft[key] = value }
+        if let fps = profile.settings["FPS"] { setFrameRate(fps) }
+        if let bitrate = profile.settings["BITRATE"], !bitrate.isEmpty {
+            setBitrate(bitrate)
+        }
         normalize()
     }
 
@@ -328,13 +405,26 @@ final class SettingsModel: ObservableObject {
         normalize()
     }
 
+    var frameRate: String {
+        if let fps = draft["FPS"], !fps.isEmpty { return fps }
+        return Self.extraFlagValue("--fps", in: string("EXTRA_FLAGS")) ?? ""
+    }
+
+    func setFrameRate(_ fps: String) {
+        draft["FPS"] = fps
+        let extra = string("EXTRA_FLAGS")
+        let cleaned = Self.strippingFlag("--fps", from: extra)
+        if cleaned != extra { draft["EXTRA_FLAGS"] = cleaned }
+        normalize()
+    }
+
     // MARK: - H.264 bitrate ceiling (Mbit/s)
 
     /// Effective ceiling: the BITRATE key if set, else a `--bitrate N` left in
     /// EXTRA_FLAGS (back-compat with hand-edited configs), else the default (6).
     var bitrateMbps: String {
         if let b = draft["BITRATE"], !b.isEmpty { return b }
-        if let n = Self.extraFlagsBitrate(string("EXTRA_FLAGS")) { return n }
+        if let n = Self.extraFlagValue("--bitrate", in: string("EXTRA_FLAGS")) { return n }
         return "6"
     }
 
@@ -343,24 +433,36 @@ final class SettingsModel: ObservableObject {
     func setBitrate(_ mbps: String) {
         draft["BITRATE"] = mbps
         let extra = string("EXTRA_FLAGS")
-        let cleaned = Self.stripBitrate(extra)
+        let cleaned = Self.strippingFlag("--bitrate", from: extra)
         if cleaned != extra { draft["EXTRA_FLAGS"] = cleaned }
         normalize()
     }
 
-    private static func extraFlagsBitrate(_ extra: String) -> String? {
-        let toks = extra.split(separator: " ").map(String.init)
-        guard let i = toks.firstIndex(of: "--bitrate"), i + 1 < toks.count else { return nil }
-        return toks[i + 1]
+    private static func extraFlagValue(_ flag: String, in extra: String) -> String? {
+        let tokens = extra.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        for (index, token) in tokens.enumerated() {
+            if token.hasPrefix(flag + "=") { return String(token.dropFirst(flag.count + 1)) }
+            if token == flag, index + 1 < tokens.count { return tokens[index + 1] }
+        }
+        return nil
     }
 
-    private static func stripBitrate(_ extra: String) -> String {
-        var toks = extra.split(separator: " ").map(String.init)
-        if let i = toks.firstIndex(of: "--bitrate") {
-            toks.remove(at: i)                       // the flag
-            if i < toks.count { toks.remove(at: i) } // its value
+    private static func strippingFlag(_ flag: String, from extra: String) -> String {
+        let tokens = extra.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        var kept: [String] = []
+        var index = 0
+        while index < tokens.count {
+            if tokens[index] == flag {
+                index += 1
+                if index < tokens.count, !tokens[index].hasPrefix("--") { index += 1 }
+            } else if tokens[index].hasPrefix(flag + "=") {
+                index += 1
+            } else {
+                kept.append(tokens[index])
+                index += 1
+            }
         }
-        return toks.joined(separator: " ")
+        return kept.joined(separator: " ")
     }
 
     // MARK: - Ctrl->Cmd exclude list (NO_REMAP_APPS)

@@ -44,7 +44,7 @@ ensure_macrdp_release() {
         fi
       done < <(
         find "$project_dir/src" "$project_dir/vendor" \
-          -type f \( -name '*.rs' -o -name '*.m' -o -name '*.c' -o -name '*.h' \) \
+          -type f \( -name '*.rs' -o -name '*.m' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
           -print0
       )
     fi
@@ -56,11 +56,17 @@ ensure_macrdp_release() {
       return 1
     fi
     echo "macrdp: $reason; building optimized release..."
-    (cd "$project_dir" && cargo build --release)
+    if ! (cd "$project_dir" && cargo build --release); then
+      echo "macrdp: release build failed; refusing to start an outdated binary" >&2
+      return 1
+    fi
     if command -v codesign >/dev/null 2>&1; then
       # Normalize Cargo's linker signature so macOS TCC permissions remain
       # associated with a stable executable identity across rebuilds.
-      codesign -s - --force "$binary"
+      if ! codesign -s - --force "$binary"; then
+        echo "macrdp: release code signing failed" >&2
+        return 1
+      fi
     fi
   fi
 

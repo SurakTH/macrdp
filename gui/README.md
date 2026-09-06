@@ -74,7 +74,16 @@ macrdp\ Controller.app/Contents/MacOS/macrdptray --print-paths      # diagnose r
 
 Choose **Show macrdp Controller…** from the menu-bar icon. Changes are staged in the
 window and written together when you click **Apply**, so changing several
-options causes only one server restart.
+options causes only one server restart. Apply merges all edits into one atomic
+file update, preserving comments and unrelated settings. If saving fails, the
+window keeps your edits and displays the error without restarting. If restarting
+fails after a successful save, Apply remains available to retry activation.
+
+After selecting a profile, customize FPS, bitrate, or feature toggles; the profile
+indicator changes to **Custom**. Video includes an editable FPS field (empty means
+automatic). Invalid FPS, bitrate, and client IP values prevent Apply. Turning off
+H.264 also turns off dependent AVC444 and UDP video migration settings. Choosing
+a bitrate removes old `--bitrate` overrides from Extra flags.
 
 The Connection tab includes the same practical presets as `start.sh`:
 
@@ -84,6 +93,11 @@ The Connection tab includes the same practical presets as `start.sh`:
 | **LAN Max** | Highest live-verified LAN quality: HiDPI AVC420, 60 FPS, 50 Mbps, stable TCP and PCM. |
 | **Native** | Sharpest text/UI: HiDPI bitmap/RemoteFX at a stable 12 FPS. |
 | **Fast** | Lowest latency: AVC420, 60 FPS, 50 Mbps and a one-frame pipeline. |
+
+The Connection tab's **Port** field changes the RDP listening port (default
+3390; valid range 1–65535). Apply saves it and restarts a running server, so
+reconnect using the new address shown in Status. Toggling network access keeps
+the selected port. Invalid or empty ports disable Apply.
 
 Profiles do not expose the Mac to the network. Enable **Allow connections from
 the network** separately, then optionally enter one or more exact client

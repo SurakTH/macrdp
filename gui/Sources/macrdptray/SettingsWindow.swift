@@ -15,8 +15,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.model = SettingsModel(controller: controller)
         self.onClose = onClose
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 580),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 700),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         window.title = "macrdp Controller Settings"
         window.contentViewController = NSHostingController(rootView: SettingsView(model: model))
@@ -193,11 +193,11 @@ struct SettingsView: View {
                     .disabled(!model.isDirty || model.serverBusy)
                 Button("Apply") { model.apply() }
                     .keyboardShortcut("s", modifiers: .command)
-                    .disabled(!model.isDirty || model.validationError != nil || model.serverBusy)
+                    .disabled((!model.isDirty && !model.restartRequired) || model.validationError != nil || model.serverBusy || !model.serverStatusKnown)
             }
             .padding(12)
         }
-        .frame(width: 660, height: 560)
+        .frame(minWidth: 660, minHeight: 560)
     }
 
     @ViewBuilder private var detail: some View {
@@ -215,18 +215,25 @@ struct SettingsView: View {
     }
 
     @ViewBuilder private var status: some View {
-        if let error = model.validationError {
+        if !model.serverStatusKnown {
+            Label("Checking server status…", systemImage: "clock")
+                .font(.callout).foregroundColor(.secondary)
+        } else if let error = model.validationError {
             Label(error, systemImage: "exclamationmark.triangle.fill")
                 .font(.callout).foregroundColor(.red)
         } else if let action = model.serverAction {
             Label(action.progressTitle, systemImage: "arrow.triangle.2.circlepath")
                 .font(.callout).foregroundColor(.secondary)
+        } else if let error = model.applyError {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.callout).foregroundColor(.red)
+                .fixedSize(horizontal: false, vertical: true)
         } else if model.isDirty {
-            Label("Unsaved changes — Apply to restart the server with them",
+            Label(model.serverRunning ? "Unsaved changes — Apply to save and restart" : "Unsaved changes — Apply to save",
                   systemImage: "pencil.circle")
                 .font(.callout).foregroundColor(.secondary)
-        } else if model.lastAppliedAt != nil {
-            Label(model.serverRunning ? "Applied — server restarted" : "Applied (server not running)",
+        } else if let message = model.applySuccessMessage {
+            Label(message,
                   systemImage: "checkmark.circle.fill")
                 .font(.callout).foregroundColor(.secondary)
         } else {
@@ -281,8 +288,13 @@ private struct ConnectionTab: View {
                         }
                         model.setAllowNetwork(on)
                     }))
+                TextField("Port", text: Binding(
+                    get: { model.portNumber }, set: { model.setPortNumber($0) }),
+                    prompt: Text("3390"))
+                Text("Default: 3390. Apply saves the new port and restarts a running server. Reconnect using the new address.")
+                    .font(.caption).foregroundColor(.secondary)
                 HStack {
-                    Text("Listening on")
+                    Text("Configured address")
                     Spacer()
                     Text(model.bindDisplay).foregroundColor(.secondary)
                 }
@@ -328,6 +340,12 @@ private struct VideoTab: View {
                 Toggle("H.264 video (EGFX / AVC420)", isOn: model.boolBinding("ENABLE_H264"))
                 Text("Streams the screen as H.264 — far less bandwidth than legacy bitmaps. "
                     + "Recommended. Clients without an H.264 decoder fall back automatically.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Frame rate") {
+                TextField("FPS", text: Binding(get: { model.frameRate }, set: { model.setFrameRate($0) }),
+                          prompt: Text("Automatic"))
+                Text("Leave empty for automatic: 60 FPS with H.264, 15 FPS with bitmap video.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Bitrate") {
@@ -520,8 +538,8 @@ private struct AdvancedTab: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Extra flags") {
-                TextField("Extra flags", text: model.stringBinding("EXTRA_FLAGS"), prompt: Text("e.g. --bitrate 6"))
-                Text("Passed verbatim to the server for anything not covered above.")
+                TextField("Extra flags", text: model.stringBinding("EXTRA_FLAGS"), prompt: Text("e.g. --stretch"))
+                Text("For options not covered by these controls. Use the Video tab to adjust frame rate and bitrate.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section {
@@ -617,6 +635,7 @@ private struct StatusView: View {
     @State private var conn: ConnectionInfo = .none
     @State private var live: LiveStats?
     @State private var connectTarget = "—"
+    @State private var copiedAddress = false
     // Only ticks while this pane is on screen (subscription cancels on disappear).
     private let tick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -624,11 +643,23 @@ private struct StatusView: View {
         Form {
             Section("Server") {
                 row("Status", model.serverAction?.progressTitle
-                    ?? (model.serverRunning
+                    ?? (!model.serverStatusKnown ? "Checking…" : model.serverRunning
                         ? (stats.running ? "Running (pid \(stats.pid))" : "Running")
                         : "Stopped"))
                 row("Profile", model.appliedProfile?.title ?? "Custom")
-                row("Connect to", connectTarget)
+                HStack {
+                    Text("Connect to")
+                    Spacer()
+                    Text(connectTarget).foregroundColor(.secondary).textSelection(.enabled)
+                    Button(copiedAddress ? "Copied" : "Copy address") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(connectTarget, forType: .string)
+                        copiedAddress = true
+                    }
+                    .controlSize(.small)
+                    .disabled(connectTarget == "—" || connectTarget.contains("<"))
+                    .help("Copy the address to enter in your RDP client")
+                }
                 row("Allowed clients", model.appliedAllowedIPDisplay)
                 if stats.running {
                     row("Uptime", stats.uptime.isEmpty ? "—" : stats.uptime)
@@ -639,16 +670,16 @@ private struct StatusView: View {
                     Button(model.serverRunning ? "Restart Server" : "Start Server") {
                         model.beginServerAction(model.serverRunning ? .restart : .start)
                     }
-                    .disabled(model.serverBusy)
+                    .disabled(model.serverBusy || !model.serverStatusKnown)
                     if model.serverRunning {
                         Button("Stop Server") {
                             model.beginServerAction(.stop)
                         }
-                        .disabled(model.serverBusy)
+                        .disabled(model.serverBusy || !model.serverStatusKnown)
                     }
                     Spacer()
                     Button("Repair Installation") { model.beginServerAction(.repair) }
-                        .disabled(model.serverBusy)
+                        .disabled(model.serverBusy || !model.serverStatusKnown)
                         .help("Rebuild the LaunchAgent with the current macrdp.app path, then start it")
                 }
                 if model.serverBusy {
@@ -676,8 +707,17 @@ private struct StatusView: View {
                     if let ip = conn.ip { row("Address", ip) }
                     if let b = conn.build { row("Windows build", b) }
                 } else {
-                    Text(stats.running ? "No client connected." : "Server not running.")
-                        .foregroundColor(.secondary)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(!model.serverStatusKnown ? "Checking server status…" : model.serverRunning ? "Waiting for an RDP client" : "Start the server to connect")
+                        Text("In your RDP client, enter the address above and sign in with your Mac account.")
+                            .font(.caption).foregroundColor(.secondary)
+                        if !(model.saved["ALLOW_IP"] ?? "").isEmpty {
+                            Text("Your client's IP must match Allowed clients above. You can edit the list in Connection settings.")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                        Button("Connection Settings") { model.section = .connection }
+                            .controlSize(.small)
+                    }
                 }
             }
             if conn.connected {
@@ -715,6 +755,7 @@ private struct StatusView: View {
                 stats = s
                 conn = c
                 live = l
+                if connectTarget != target { copiedAddress = false }
                 connectTarget = target
                 model.updateServerRunning(s.running)
             }

@@ -40,6 +40,11 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "SettingsModelTests",
+            dependencies: ["macrdptray"],
+            path: "Tests/SettingsModelTests"
+        ),
+        .testTarget(
             name: "ControllerCoreTests",
             dependencies: ["ControllerCore"],
             path: "Tests/ControllerCoreTests"

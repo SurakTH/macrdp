@@ -928,25 +928,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return d
     }
 
-    func writeConfig(key: String, value: String) {
-        ensureConfigExists()
-        guard let text = try? String(contentsOf: configURL, encoding: .utf8) else { return }
-        var lines = text.components(separatedBy: "\n")
-        var found = false
-        for (i, raw) in lines.enumerated() {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("#") { continue }
-            guard let eq = line.firstIndex(of: "=") else { continue }
-            let k = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
-            if k == key { lines[i] = "\(key)=\(value)"; found = true; break }
-        }
-        if !found { lines.append("\(key)=\(value)") }
-        // Always end with exactly one trailing newline — a config file with no
-        // final newline makes a downstream append concatenate onto the last
-        // key (which silently corrupted VD_HEIGHT + a new key once).
-        let body = lines.joined(separator: "\n")
-        let out = body.hasSuffix("\n") ? body : body + "\n"
-        try? out.write(to: configURL, atomically: true, encoding: .utf8)
+    func saveConfig(changes: [String: String]) throws {
+        try ConfigurationFile.save(changes: changes, to: configURL)
     }
 
     func ensureConfigExists() {

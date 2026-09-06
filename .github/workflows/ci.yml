@@ -48,6 +48,7 @@ jobs:
           set -euo pipefail
           bash scripts/check-repo-hygiene.sh
           bash scripts/test-launchers.sh
+          bash scripts/test-ensure-release.sh
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
@@ -126,6 +127,9 @@ jobs:
         env:
           RUSTFLAGS: '-D warnings'
         run: cargo test --locked --target aarch64-apple-darwin
+
+      - name: Test launcher release helper
+        run: bash scripts/test-ensure-release.sh
 
       # Exercise LaunchAgent upgrade/move logic without touching a real agent.
       - name: Test macrdp Controller core
