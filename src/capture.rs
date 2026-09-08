@@ -955,28 +955,17 @@ mod macos {
         /// Mouse-click hint for the post-click keyframe-threshold drop. Only
         /// consulted when `keyframe_on_change.enabled`.
         click_signal: Option<ClickSignal>,
-        /// Interval between SCK frames (1/fps). Doubles as the flush-burst
-        /// timeout: when SCK goes idle we wait at most this long before
-        /// re-submitting the last frame to drain mstsc's presentation buffer.
+        /// Interval between trailing pictures and deferred-submit retries.
         frame_interval: Duration,
-        /// How many trailing flush frames to re-send after each change
-        /// (`--flush-frames`). Each is a tiny skip-P-frame; mstsc needs ≥2 to
-        /// display a frame, default 4 gives margin. 0 disables the burst.
+        /// Number of trailing pictures after the quiet-period IDR refresh.
+        /// Zero disables the refresh burst, but not retries of deferred input.
         flush_frames: u32,
-        /// Trailing flush re-submits remaining after the last real change
-        /// (EGFX/H.264 path only). SCK stops delivering frames on a static
-        /// screen, so the last change before a pause (e.g. the final keystroke)
-        /// would otherwise sit in mstsc's ~2-frame AVC420 presentation buffer
-        /// until the next on-screen change or the periodic keyframe — that's
-        /// the "typing follows the keyframe" lag. We re-submit the last frame
-        /// `flush_frames` times to push it through within a couple of frame
-        /// intervals. Stays 0 (no-op) on the legacy bitmap path.
-        flush_remaining: u32,
-        /// Last BGRA frame submitted to EGFX, retained from ScreenCaptureKit
-        /// and re-encoded as cheap skip-P-frames during a flush burst. Holding
-        /// the CoreVideo buffer avoids copying the full desktop on every frame
-        /// (about 2 GB/s of memory traffic at 4K/60). Only one buffer is held,
-        /// and it is released as soon as the bounded flush burst completes.
+        /// After at least 100 ms without a new capture, refresh the latest
+        /// surface with an IDR, then drain the client's presentation queue.
+        /// Only accepted submissions consume this budget.
+        flush_burst: crate::frame_flush::FrameFlush,
+        /// Latest capture retained until its deferred submission or refresh
+        /// burst completes. Only one CoreVideo surface is held at a time.
         last_frame: Option<CVPixelBuffer>,
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
@@ -1000,7 +989,7 @@ mod macos {
         suppressed_since: Option<Instant>,
         /// True once the EGFX/H.264 encoder has accepted at least one
         /// frame for this session (i.e., `gfx.submit_bgra` returned
-        /// `Ok(true)`). The suppress gate is a no-op until this is set —
+        /// `Submitted` or `Deferred`). The suppress gate is a no-op until this is set —
         /// mstsc's normal connect handshake includes a
         /// `SuppressOutput { None }` *before* its display surface is
         /// fully initialized, and stopping the first EGFX frame from
@@ -1240,7 +1229,7 @@ mod macos {
                 click_signal,
                 frame_interval,
                 flush_frames,
-                flush_remaining: 0,
+                flush_burst: crate::frame_flush::FrameFlush::default(),
                 last_frame: None,
                 display_suppressed,
                 was_suppressed: false,
@@ -1319,6 +1308,12 @@ mod macos {
     impl RdpServerDisplayUpdates for ScreenCaptureUpdates {
         async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
             loop {
+                // A buffered SCK sample is immediately ready and does not
+                // consume Tokio's cooperative budget. H.264 also continues
+                // here without returning a DisplayUpdate. Yield explicitly so
+                // sibling input/event dispatch in client_loop can run even
+                // when the mouse is still and SCK never becomes Pending.
+                crate::capture_fairness::yield_capture_turn().await;
                 // EXPERIMENTAL blank-recovery: if the H.264 blank detector armed
                 // a bare core reactivation (BlankAction::Reactivate), emit a
                 // no-op DisplayUpdate::Resize to the same size. The vendored
@@ -1387,7 +1382,7 @@ mod macos {
                 if let Some((w, h)) = self.pending_resize.take_settled(RESIZE_DEBOUNCE) {
                     // Never submit a retained old-size buffer into the fresh
                     // surface/encoder that the resize is about to create.
-                    self.flush_remaining = 0;
+                    self.flush_burst.clear();
                     self.last_frame = None;
                     self.desktop_size.set(w, h);
                     self.suppress_next_adopt.store(true, Ordering::Relaxed);
@@ -1467,7 +1462,7 @@ mod macos {
                             let started = *self.suppressed_since.get_or_insert_with(Instant::now);
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
                                 self.was_suppressed = true;
-                                self.flush_remaining = 0;
+                                self.flush_burst.clear();
                                 // Release the retained SCK surface while the
                                 // client is minimized; resume starts from a
                                 // fresh frame + forced IDR.
@@ -1501,25 +1496,49 @@ mod macos {
                 // last frame, and a settled resize gets picked up promptly
                 // instead of stalling until the next real desktop change).
                 // (Neither pending — the common idle case — blocks normally.)
-                let sample = if self.flush_remaining > 0 || self.pending_resize.has_pending() {
-                    match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
+                let sample = if self.flush_burst.deadline().is_some()
+                    || self.pending_resize.has_pending()
+                {
+                    let deadline = self
+                        .flush_burst
+                        .deadline()
+                        .unwrap_or_else(|| Instant::now() + self.frame_interval);
+                    // Poll the deadline first: an always-ready stream of Idle
+                    // samples must not starve the final presentation frames.
+                    let next = tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(deadline.into()) => Err(()),
+                        sample = self.stream.next() => Ok(sample),
+                    };
+                    match next {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
                         Err(_) => {
-                            if self.flush_remaining > 0 {
-                                self.flush_remaining -= 1;
+                            if self.flush_burst.deadline().is_some() {
+                                let mut submitted = false;
                                 if let Some(gfx) = self.gfx.as_ref() {
                                     if let Some(pixel_buffer) = self.last_frame.as_ref() {
                                         match pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) {
                                             Ok(guard) => {
                                                 let src = guard.as_slice();
                                                 if !src.is_empty() {
-                                                    if let Err(e) = gfx.submit_bgra(
+                                                    match gfx.submit_bgra(
                                                         src,
                                                         guard.bytes_per_row(),
-                                                        false,
+                                                        self.flush_burst.force_keyframe(),
                                                     ) {
-                                                        tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
+                                                        Ok(
+                                                            crate::h264::FrameSubmission::Submitted,
+                                                        ) => submitted = true,
+                                                        Ok(
+                                                            crate::h264::FrameSubmission::Inactive,
+                                                        ) => self.flush_burst.clear(),
+                                                        Ok(
+                                                            crate::h264::FrameSubmission::Deferred,
+                                                        ) => {}
+                                                        Err(e) => {
+                                                            tracing::warn!(error = ?e, "EGFX flush submit_bgra failed")
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1530,7 +1549,12 @@ mod macos {
                                         }
                                     }
                                 }
-                                if self.flush_remaining == 0 {
+                                self.flush_burst.attempted(
+                                    submitted,
+                                    Instant::now(),
+                                    self.frame_interval,
+                                );
+                                if self.flush_burst.deadline().is_none() {
                                     // Return the retained surface to SCK's pool
                                     // immediately after the final flush frame.
                                     self.last_frame = None;
@@ -1583,10 +1607,10 @@ mod macos {
                 }
 
                 // EGFX/H.264 path: submit the full frame to the encoder. Once
-                // EGFX has negotiated (`Ok(true)`), it owns the display — skip
+                // EGFX has negotiated (`Submitted` or `Deferred`), it owns the display — skip
                 // the legacy BitmapUpdate emission entirely (cursor still flows
                 // via the poll at the top of the loop). Before negotiation, or
-                // for non-EGFX clients (`Ok(false)`), fall through to legacy.
+                // for non-EGFX clients (`Inactive`), fall through to legacy.
                 if let Some(gfx) = self.gfx.as_ref() {
                     // On-demand keyframes (opt-in via --keyframe-on-change). A
                     // large change at once (window raised to front, scroll, app
@@ -1667,7 +1691,10 @@ mod macos {
                         false
                     };
                     match gfx.submit_bgra(src, stride_bytes, big_change || resume_keyframe) {
-                        Ok(true) => {
+                        Ok(
+                            outcome @ (crate::h264::FrameSubmission::Submitted
+                            | crate::h264::FrameSubmission::Deferred),
+                        ) => {
                             self.seeded = true;
                             // First-EGFX-frame milestone: arms the suppress
                             // gate (see `first_egfx_frame_sent` in the struct).
@@ -1683,11 +1710,20 @@ mod macos {
                             // SCK from recycling its backing store until we are
                             // done, without copying the full BGRA frame.
                             drop(guard);
-                            self.last_frame = (self.flush_frames > 0).then_some(pixel_buffer);
-                            self.flush_remaining = self.flush_frames;
+                            self.flush_burst.arm(
+                                self.flush_frames,
+                                outcome == crate::h264::FrameSubmission::Submitted,
+                                Instant::now(),
+                                self.frame_interval,
+                            );
+                            self.last_frame = self
+                                .flush_burst
+                                .deadline()
+                                .is_some()
+                                .then_some(pixel_buffer);
                             continue;
                         }
-                        Ok(false) => {}
+                        Ok(crate::h264::FrameSubmission::Inactive) => {}
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
                     }
                 }
@@ -1737,7 +1773,7 @@ mod macos {
                 // Split oversized rects into strips so each BitmapUpdate stays
                 // within the size mstsc will render (see split_strips). No-op
                 // for already-small rects.
-                for (x, y, w, h) in rects {
+                for (x, y, w, h) in crate::bitmap_damage::coalesce_damage(rects) {
                     for (sx, sy, sw, sh) in split_strips(x, y, w, h) {
                         if let Some(update) = rect_update(src, stride_bytes, sx, sy, sw, sh) {
                             self.pending.push_back(update);

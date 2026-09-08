@@ -13,8 +13,12 @@ mod audio;
 mod auth;
 mod auth_guard;
 mod avc444;
+#[cfg(any(target_os = "macos", test))]
+mod bitmap_damage;
 mod camera;
 mod capture;
+#[cfg(any(target_os = "macos", test))]
+mod capture_fairness;
 mod clipboard;
 #[cfg(test)]
 mod conn_test;
@@ -23,6 +27,8 @@ mod cursor;
 mod file_promise;
 #[cfg(target_os = "macos")]
 mod file_promise_lazy;
+#[cfg(any(target_os = "macos", test))]
+mod frame_flush;
 #[cfg(target_os = "macos")]
 mod h264;
 mod health;
@@ -485,15 +491,12 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     h264_frames_in_flight: u32,
 
-    /// Number of trailing "flush" frames re-sent after the last on-screen change
-    /// (only with --enable-h264). ScreenCaptureKit stops delivering frames on a
-    /// static screen, so the last change before a pause (e.g. the final
-    /// keystroke) would otherwise sit in mstsc's ~2-frame AVC420 presentation
-    /// buffer until the next change or periodic keyframe — the "typing follows
-    /// the keyframe" lag. After each change we re-submit the last frame this many
-    /// times as cheap skip-P-frames to drain that buffer so the change appears
-    /// promptly. mstsc needs ≥2; default 4 gives margin. Raise if a slight
-    /// trailing lag remains; set 0 to disable the flush burst entirely.
+    /// Number of trailing pictures after the H.264 quiet-period refresh.
+    /// After at least 100 ms without a new capture, send the latest surface as
+    /// an IDR, followed by this many pictures to drain client presentation
+    /// buffering. This helps small final changes appear without more typing.
+    /// Default 4. Set 0 to disable the refresh burst; deferred real captures
+    /// are still retried so backpressure cannot discard the final update.
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
 

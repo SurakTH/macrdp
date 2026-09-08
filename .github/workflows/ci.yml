@@ -73,6 +73,11 @@ jobs:
           RUSTFLAGS: ''
         run: cargo test --locked
 
+      - name: Test bitmap and RemoteFX server logic
+        env:
+          RUSTFLAGS: ''
+        run: cargo test --locked -p ironrdp-server --lib
+
       # ironrdp-egfx is a vendored path dependency, not a workspace member.
       # Root `cargo test` compiles it but does not run its own PDU/region tests.
       - name: Test ironrdp-egfx (vendored AVC region logic)

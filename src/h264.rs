@@ -24,8 +24,9 @@
 //!        `WireFormat`), then hands it to the matching AVC420 or AVC444
 //!        `GraphicsPipelineServer` send method (StartFrame / WireToSurface /
 //!        EndFrame), and ships the resulting
-//!        `DvcMessage`s through DRDYNVC via `ServerEvent::Egfx(SendMessages)`,
-//!        and bumps `shipped`.
+//!        `DvcMessage`s through DRDYNVC via a tracked ServerEvent. The event
+//!        loop bumps `shipped` AFTER transport dispatch, so queued frames and
+//!        a blocked socket write still occupy pipeline slots.
 //!
 //!   The EGFX send window is `u32::MAX` (see `GfxHandler::max_frames_in_flight`)
 //!   so the EGFX send methods NEVER drop an encoded frame — dropping one (a
@@ -63,8 +64,8 @@ use ironrdp_egfx::pdu::{
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{
-    EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
-    ServerEventSender,
+    EgfxFrameCompletion, EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle,
+    ServerEvent, ServerEventSender,
 };
 use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
@@ -234,8 +235,9 @@ struct ConnectionContext {
     egfx_declined: Arc<AtomicBool>,
     /// Drop-to-latest throttle counters for the push pipeline. `submitted` is
     /// bumped by `submit_bgra` (capture thread) per frame handed to VT;
-    /// `shipped` is bumped by the ship thread per frame pulled back out and
-    /// sent. `submitted - shipped` is how many frames are in the VT/ship
+    /// `shipped` is bumped only after transport dispatch completes (or the
+    /// batch is abandoned). `submitted - shipped` includes the event queue
+    /// and pending socket write as well as frames in the VT/ship
     /// pipeline; when it reaches `max_in_flight` the capture thread skips
     /// (drops to latest) — an ack-INDEPENDENT throttle, since clients commonly
     /// suspend frame acks (queue_depth=0xFFFFFFFF) which disables the EGFX
@@ -1183,6 +1185,14 @@ fn recovery_config_from_env() -> (bool, RecoveryParams) {
     (enabled, params)
 }
 
+/// Whether EGFX consumed a capture and actually queued it for encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSubmission {
+    Inactive,
+    Deferred,
+    Submitted,
+}
+
 /// Cloneable factory + frame-submit handle. One clone is boxed into
 /// `RdpServer::builder().with_gfx_factory(...)`; another lives on the capture
 /// side as the `submit_bgra` entry point.
@@ -1649,12 +1659,15 @@ impl Gfx {
     /// some clients (mstsc) only resolve cleanly at the next periodic IDR (the
     /// "takes a while to come to front" lag); a forced IDR lands them at once.
     ///
-    /// Returns `Ok(true)` when EGFX is the active display path (so the caller
-    /// should suppress legacy BitmapUpdates for this frame — even if this
-    /// particular frame was skipped for backpressure or isn't encoded yet).
-    /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
-    /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
-    pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
+    /// `Submitted` means queued for encoding; `Deferred` means EGFX owns the
+    /// display but skipped this capture. Only `Inactive` permits legacy bitmap
+    /// fallback. Trailing-frame callers must retry a deferred submission.
+    pub fn submit_bgra(
+        &self,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+    ) -> Result<FrameSubmission> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -1669,10 +1682,10 @@ impl Gfx {
         let force_keyframe = {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
-                return Ok(false); // no active connection
+                return Ok(FrameSubmission::Inactive); // no active connection
             };
             if !ctx.is_ready {
-                return Ok(false); // channel not negotiated yet (or non-EGFX client)
+                return Ok(FrameSubmission::Inactive); // channel not negotiated yet (or non-EGFX client)
             }
             // Arm the keyframe BEFORE the throttle check so a large change that
             // lands on a dropped frame still forces the IDR on the next encoded
@@ -1948,7 +1961,7 @@ impl Gfx {
                     trace!(
                         "EGFX at bitrate floor + congested; dropping capture (frame-rate floor)"
                     );
-                    return Ok(true);
+                    return Ok(FrameSubmission::Deferred);
                 }
                 if at_floor && ctx.adaptive_congested {
                     ctx.last_floor_fps_pass = now;
@@ -1971,7 +1984,7 @@ impl Gfx {
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
                 );
-                return Ok(true); // still the active path; just dropped this frame
+                return Ok(FrameSubmission::Deferred); // still the active path; just dropped this frame
             }
             // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
             // socket backpressure to pace us to the client (unlike TCP), so without
@@ -2008,7 +2021,7 @@ impl Gfx {
                             lag,
                             "EGFX-on-UDP lag high; dropping capture (trickle floor)"
                         );
-                        return Ok(true);
+                        return Ok(FrameSubmission::Deferred);
                     }
                     ctx.last_throttle_ship = now;
                     trace!(
@@ -2035,7 +2048,7 @@ impl Gfx {
             if let Err(e) = result {
                 warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
             }
-            return Ok(true);
+            return Ok(FrameSubmission::Deferred);
         }
 
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
@@ -2043,7 +2056,7 @@ impl Gfx {
         {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
-                return Ok(true);
+                return Ok(FrameSubmission::Deferred);
             };
             let force_keyframe =
                 force_keyframe || ctx.encoder_resync.swap(false, Ordering::Relaxed);
@@ -2053,7 +2066,7 @@ impl Gfx {
             // adaptive is enabled AND EGFX is on a UDP tunnel.
             let adaptive = self.adaptive_bitrate_step(ctx);
             let Some(encoder) = ctx.encoder.as_mut() else {
-                return Ok(true);
+                return Ok(FrameSubmission::Deferred);
             };
             if let Some(bps) = adaptive.bitrate_bps {
                 if let Err(e) = encoder.set_bitrate(bps) {
@@ -2068,7 +2081,7 @@ impl Gfx {
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(true)
+        Ok(FrameSubmission::Submitted)
     }
 
     /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
@@ -2321,8 +2334,8 @@ impl Gfx {
 
     /// Ship loop for the push pipeline: owns VideoToolbox's output receiver and
     /// ships each encoded frame the instant it arrives, fully decoupled from the
-    /// capture tick. Bumps `shipped` per frame so the capture thread's
-    /// drop-to-latest throttle can bound the pipeline depth. Exits when the
+    /// capture tick. Transfers completion tokens to the event loop so the
+    /// capture throttle includes queued and writing frames. Exits when the
     /// channel closes (encoder dropped on connection teardown).
     fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
         // Reuse the batch allocation for the lifetime of the connection. VT
@@ -2334,14 +2347,16 @@ impl Gfx {
             frames.push(frame);
             frames.extend(rx.try_iter());
             let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&mut frames) {
+            if let Err(e) =
+                self.ship_frames(&mut frames, EgfxFrameCompletion::new(shipped.clone(), n))
+            {
                 warn!(error = ?e, "EGFX ship_frames failed");
             }
             // ship_frames normally drains the batch. It can fail before it
             // reaches the drain (for example during teardown), so explicitly
             // discard anything left rather than retrying stale frames later.
             frames.clear();
-            shipped.fetch_add(n, Ordering::Relaxed);
+            // The queued event owns completion until the transport write ends.
         }
         debug!("EGFX ship loop exiting (output channel closed)");
     }
@@ -2392,11 +2407,12 @@ impl Gfx {
                 continue;
             }
 
-            if let Err(error) = self.ship_avc444_pair(main, frame) {
+            if let Err(error) =
+                self.ship_avc444_pair(main, frame, EgfxFrameCompletion::new(shipped.clone(), 1))
+            {
                 warn!(?error, "EGFX AVC444 ship failed");
                 resync.store(true, Ordering::Relaxed);
             }
-            shipped.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(main) = pending_main {
             if self.ctx.lock().unwrap().is_some() {
@@ -2409,7 +2425,12 @@ impl Gfx {
         debug!("EGFX AVC444 ship loop exiting (encoder output channel closed)");
     }
 
-    fn ship_avc444_pair(&self, main: EncodedFrame, auxiliary: EncodedFrame) -> Result<()> {
+    fn ship_avc444_pair(
+        &self,
+        main: EncodedFrame,
+        auxiliary: EncodedFrame,
+        completion: EgfxFrameCompletion,
+    ) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Preserve the same lock order as the AVC420 ship path: copy the
             // context data first, then release ctx before locking the server.
@@ -2493,8 +2514,9 @@ impl Gfx {
             .clone()
             .ok_or_else(|| anyhow!("EGFX AVC444: server-event sender not set"))?;
         sender
-            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendTrackedMessages {
                 messages: svc_messages,
+                completion,
             }))
             .map_err(|_| anyhow!("EGFX AVC444: ServerEvent send failed (event loop closed)"))?;
         Ok(())
@@ -2559,8 +2581,11 @@ impl Gfx {
             // (slow link) or the controller already adjusted it (encoder
             // rebuild mid-connection).
             // Fresh throttle counters for this connection.
-            ctx.submitted.store(0, Ordering::Relaxed);
-            ctx.shipped.store(0, Ordering::Relaxed);
+            // Old queued batches may finish after an encoder rebuild. Give the
+            // new generation separate counters so those completions cannot
+            // release its slots or hide its backlog.
+            ctx.submitted = Arc::new(AtomicU64::new(0));
+            ctx.shipped = Arc::new(AtomicU64::new(0));
             ctx.encoder_resync.store(false, Ordering::Relaxed);
 
             if self.avc444_enabled && ctx.client_supports_avc444 {
@@ -2861,7 +2886,11 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &mut Vec<EncodedFrame>) -> Result<()> {
+    fn ship_frames(
+        &self,
+        frames: &mut Vec<EncodedFrame>,
+        completion: EgfxFrameCompletion,
+    ) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -2980,8 +3009,9 @@ impl Gfx {
             .clone()
             .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
         sender
-            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendTrackedMessages {
                 messages: svc_messages,
+                completion,
             }))
             .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
         Ok(())
