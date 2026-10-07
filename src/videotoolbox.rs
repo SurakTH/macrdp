@@ -44,17 +44,56 @@ pub struct EncodedFrame {
     pub parameter_sets: Vec<Vec<u8>>,
 }
 
+/// Every accepted picture produces an outcome, including encoder drops.
+#[derive(Debug)]
+pub enum EncodeOutput {
+    Picture(EncodedFrame),
+    Dropped { pts: i64 },
+}
+
+impl EncodeOutput {
+    pub fn pts(&self) -> i64 {
+        match self {
+            Self::Picture(frame) => frame.pts,
+            Self::Dropped { pts } => *pts,
+        }
+    }
+}
+
+struct OutputContext {
+    tx: mpsc::Sender<EncodeOutput>,
+    pending: std::sync::Mutex<std::collections::HashSet<i64>>,
+}
+
+impl OutputContext {
+    fn begin(&self, pts: i64) {
+        self.pending.lock().unwrap().insert(pts);
+    }
+
+    fn cancel(&self, pts: i64) {
+        self.pending.lock().unwrap().remove(&pts);
+    }
+
+    fn complete(&self, output: EncodeOutput) {
+        // VT can report a synchronous drop as well as call the callback.
+        // Deliver exactly one outcome, whichever arrives first.
+        if self.pending.lock().unwrap().remove(&output.pts()) {
+            let _ = self.tx.send(output);
+        }
+    }
+}
+
 pub struct Encoder {
     inner: ffi::SessionGuard,
     /// VideoToolbox output channel. `Option` because the push pipeline
     /// (`h264.rs`) takes the receiver out via `take_receiver` and runs it on a
     /// dedicated ship thread; once taken, `drain`/`flush` are no-ops here. Tests
     /// keep it and use `flush`.
-    rx: Option<mpsc::Receiver<EncodedFrame>>,
+    rx: Option<mpsc::Receiver<EncodeOutput>>,
     /// Heap-allocated sender pointed at by VT's `outputCallbackRefCon`.
     /// Owned here so it outlives the session; freed when the session is
     /// invalidated in `Drop`.
-    _tx_ctx: Box<mpsc::Sender<EncodedFrame>>,
+    _tx_ctx: Box<OutputContext>,
     width: u16,
     height: u16,
     next_pts: i64,
@@ -227,12 +266,14 @@ impl Encoder {
         keyframe_secs: f32,
         full_range: bool,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::channel::<EncodedFrame>();
-        // The callback receives the raw `*mut Sender` and clones it per
-        // delivery — see `ffi::output_callback`. Keep the original Box
-        // alive on the Encoder so the pointer stays valid.
-        let tx_box = Box::new(tx);
-        let tx_ptr = Box::as_ref(&tx_box) as *const mpsc::Sender<EncodedFrame> as *mut c_void;
+        let (tx, rx) = mpsc::channel::<EncodeOutput>();
+        // The callback context stays alive until the VT session is invalidated.
+        // It deduplicates callback and synchronous-drop completion reports.
+        let tx_box = Box::new(OutputContext {
+            tx,
+            pending: Default::default(),
+        });
+        let tx_ptr = Box::as_ref(&tx_box) as *const OutputContext as *mut c_void;
 
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
@@ -261,7 +302,7 @@ impl Encoder {
     /// thread (the push pipeline). After this, `drain`/`flush` on this encoder
     /// return nothing; the encoder is submit-only. Returns `None` if already
     /// taken.
-    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodedFrame>> {
+    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodeOutput>> {
         self.rx.take()
     }
 
@@ -379,8 +420,10 @@ impl Encoder {
     pub fn drain(&mut self) -> Vec<EncodedFrame> {
         let mut out = Vec::new();
         if let Some(rx) = self.rx.as_ref() {
-            while let Ok(frame) = rx.try_recv() {
-                out.push(frame);
+            while let Ok(output) = rx.try_recv() {
+                if let EncodeOutput::Picture(frame) = output {
+                    out.push(frame);
+                }
             }
         }
         out
@@ -444,7 +487,7 @@ impl Avc444Encoder {
         self.all_intra
     }
 
-    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodedFrame>> {
+    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodeOutput>> {
         self.encoder.take_receiver()
     }
 
@@ -525,11 +568,10 @@ fn avc444_all_intra_setting(value: Option<&str>) -> bool {
 unsafe impl Send for Encoder {}
 
 mod ffi {
-    use super::EncodedFrame;
+    use super::{EncodeOutput, EncodedFrame, OutputContext};
     use anyhow::{anyhow, bail, Result};
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::mpsc;
 
     pub(super) type OSStatus = i32;
     pub(super) type Boolean = u8;
@@ -768,6 +810,7 @@ mod ffi {
     /// counterpart to `VTCompressionSessionCreate`'s implicit retain.
     pub(super) struct SessionGuard {
         pub(super) session: VTCompressionSessionRef,
+        pub(super) output_context: *mut c_void,
     }
 
     impl Drop for SessionGuard {
@@ -884,7 +927,10 @@ mod ffi {
             }
             bail!("VTCompressionSessionCreate failed: OSStatus {status}");
         }
-        let guard = SessionGuard { session };
+        let guard = SessionGuard {
+            session,
+            output_context: tx_ctx,
+        };
 
         // Real-time low-latency profile. Disable frame reordering so
         // every emitted frame is immediately decodable in order — RDP
@@ -1549,6 +1595,8 @@ mod ffi {
                 ptr::null()
             };
 
+            let context = &*(guard.output_context as *const OutputContext);
+            context.begin(pts);
             let mut info_flags: VTEncodeInfoFlags = 0;
             let encode_status = VTCompressionSessionEncodeFrame(
                 guard.session,
@@ -1556,17 +1604,22 @@ mod ffi {
                 presentation,
                 duration,
                 frame_props,
-                ptr::null_mut(),
+                pts as usize as *mut c_void,
                 &mut info_flags,
             );
             if !frame_props.is_null() {
                 CFRelease(frame_props);
             }
             if encode_status != 0 {
+                context.cancel(pts);
                 Err(anyhow!(
                     "VTCompressionSessionEncodeFrame failed: OSStatus {encode_status}"
                 ))
             } else {
+                if info_flags & 2 != 0 {
+                    // kVTEncodeInfo_FrameDropped
+                    context.complete(EncodeOutput::Dropped { pts });
+                }
                 Ok(())
             }
         };
@@ -1691,6 +1744,8 @@ mod ffi {
             } else {
                 ptr::null()
             };
+            let context = &*(guard.output_context as *const OutputContext);
+            context.begin(pts);
             let mut info_flags: VTEncodeInfoFlags = 0;
             let encode_status = VTCompressionSessionEncodeFrame(
                 guard.session,
@@ -1698,17 +1753,22 @@ mod ffi {
                 presentation,
                 duration,
                 frame_props,
-                ptr::null_mut(),
+                pts as usize as *mut c_void,
                 &mut info_flags,
             );
             if !frame_props.is_null() {
                 CFRelease(frame_props);
             }
             if encode_status != 0 {
+                context.cancel(pts);
                 Err(anyhow!(
                     "AVC444 VTCompressionSessionEncodeFrame failed: OSStatus {encode_status}"
                 ))
             } else {
+                if info_flags & 2 != 0 {
+                    // kVTEncodeInfo_FrameDropped
+                    context.complete(EncodeOutput::Dropped { pts });
+                }
                 Ok(())
             }
         };
@@ -1734,28 +1794,53 @@ mod ffi {
     }
 
     /// VT output callback. Runs on a VT-internal thread; gets a pointer
-    /// back to the `mpsc::Sender<EncodedFrame>` we stashed in
-    /// `outputCallbackRefCon`. We clone the sender per delivery so its
-    /// lifetime is tied to the Encoder, not the callback.
+    /// back to the `OutputContext` we stashed in
+    /// `outputCallbackRefCon`. The Encoder keeps it alive until session
+    /// invalidation has finished all callbacks.
     unsafe extern "C" fn output_callback(
         output_callback_ref_con: *mut c_void,
-        _source_frame_ref_con: *mut c_void,
+        source_frame_ref_con: *mut c_void,
         status: OSStatus,
-        _info_flags: VTEncodeInfoFlags,
+        info_flags: VTEncodeInfoFlags,
         sample_buffer: CMSampleBufferRef,
     ) {
-        if status != 0 || sample_buffer.is_null() || output_callback_ref_con.is_null() {
-            // TODO(phase-2-step-2): surface this via the channel as an
-            // error variant so the EGFX bridge can react (drop session,
-            // request keyframe, etc.). Silently dropping is fine for the
-            // scaffold only.
+        if output_callback_ref_con.is_null() {
             return;
         }
-        let tx = &*(output_callback_ref_con as *const mpsc::Sender<EncodedFrame>);
-        let Ok(frame) = extract_frame(sample_buffer) else {
-            return;
+        let context = &*(output_callback_ref_con as *const OutputContext);
+        // Opaque integer tag; never dereference sourceFrameRefCon.
+        let pts = source_frame_ref_con as usize as i64;
+        let result = if status != 0 || sample_buffer.is_null() || info_flags & 2 != 0 {
+            Err(anyhow!(
+                "VideoToolbox output unavailable: status={status}, flags={info_flags}"
+            ))
+        } else {
+            extract_frame(sample_buffer)
         };
-        let _ = tx.send(frame);
+        match result {
+            Ok(mut frame) => {
+                frame.pts = pts;
+                if let Some(stats) = crate::stats::global() {
+                    stats
+                        .encoded_pictures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                context.complete(EncodeOutput::Picture(frame));
+            }
+            Err(error) => {
+                if let Some(stats) = crate::stats::global() {
+                    stats
+                        .encode_output_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                tracing::warn!(
+                    ?error,
+                    pts,
+                    "VideoToolbox dropped a picture; retiring submission and requesting IDR"
+                );
+                context.complete(EncodeOutput::Dropped { pts });
+            }
+        }
     }
 
     unsafe fn extract_frame(sbuf: CMSampleBufferRef) -> Result<EncodedFrame> {
@@ -1830,11 +1915,62 @@ mod ffi {
             parameter_sets,
         })
     }
+    #[cfg(test)]
+    mod callback_tests {
+        use super::*;
+
+        #[test]
+        fn error_and_null_sample_callbacks_report_drops_once() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let context = OutputContext {
+                tx,
+                pending: Default::default(),
+            };
+            let callback_context = &context as *const OutputContext as *mut c_void;
+            for (pts, status, flags) in [(0, -1, 0), (1, 0, 2), (2, 0, 0)] {
+                context.begin(pts);
+                unsafe {
+                    output_callback(
+                        callback_context,
+                        pts as usize as *mut c_void,
+                        status,
+                        flags,
+                        ptr::null_mut(),
+                    );
+                }
+            }
+            context.complete(EncodeOutput::Dropped { pts: 0 });
+            let outputs: Vec<_> = rx.try_iter().map(|output| output.pts()).collect();
+            assert_eq!(outputs, [0, 1, 2]);
+            assert!(context.pending.lock().unwrap().is_empty());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_callbacks_and_synchronous_drops_complete_each_picture_once() {
+        let (tx, rx) = mpsc::channel();
+        let context = OutputContext {
+            tx,
+            pending: Default::default(),
+        };
+        for pts in 0..20 {
+            context.begin(pts);
+            context.complete(EncodeOutput::Dropped { pts });
+            context.complete(EncodeOutput::Dropped { pts });
+        }
+        let outcomes: Vec<_> = rx.try_iter().collect();
+        assert_eq!(outcomes.len(), 20);
+        assert!(context.pending.lock().unwrap().is_empty());
+        context.begin(21);
+        context.cancel(21); // rejected submission must not release another slot
+        context.complete(EncodeOutput::Dropped { pts: 21 });
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn avc444_alignment_and_single_stream_pts() {

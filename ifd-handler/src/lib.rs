@@ -1,7 +1,7 @@
 //! macrdp PC/SC **IFD handler** — the user-space reader driver macOS's
 //! SmartCardServices (`com.apple.ifdreader.slotd`) loads. It implements the
 //! public **IFDHandler v3.0** C ABI and forwards every card operation to the
-//! macrdp process over a tiny loopback-TCP protocol; macrdp turns those into
+//! macrdp process over a kernel-authenticated Unix-socket protocol; macrdp turns those into
 //! MS-RDPESC calls to the *client's* real reader. Written from scratch so we
 //! don't ship the GPL `vpcd` from vsmartcard.
 //!
@@ -12,7 +12,7 @@
 //! single global `Mutex` guards the connection + cached ATR.
 //!
 //! Protocol (handler → macrdp request / macrdp → handler reply), all on
-//! `127.0.0.1:MACRDP_SCARD_PORT`:
+//! `/private/tmp/macrdp-scard-<MACRDP_SCARD_PORT>/bridge.sock`:
 //!   POWER_ON  (1)            → [status:u8]; if 0: [atr_len:u8][atr…]  (1 = no card)
 //!   POWER_OFF (2)            → [status:u8]
 //!   TRANSMIT  (3)[send_len:u32][apdu…][recv_len:u32] → [status:u8]; if 0: [resp_len:u32][resp…]
@@ -26,7 +26,12 @@
 #![allow(non_snake_case)]
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixStream;
+#[path = "../../src/scard_ipc.rs"]
+#[allow(dead_code)]
+mod scard_ipc;
 use std::os::raw::c_char;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -64,7 +69,6 @@ const TAG_IFD_SLOTS_NUMBER: Dword = 0x0FAE;
 const TAG_IFD_SIMULTANEOUS_ACCESS: Dword = 0x0FAF;
 
 const MAX_ATR: usize = 33;
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const IO_TIMEOUT: Duration = Duration::from_millis(5000);
 
 // ---- protocol opcodes ----
@@ -73,7 +77,7 @@ const CMD_POWER_OFF: u8 = 2;
 const CMD_TRANSMIT: u8 = 3;
 const CMD_PRESENCE: u8 = 4;
 
-/// The loopback port macrdp listens on. Overridable via `MACRDP_SCARD_PORT`
+/// The socket namespace macrdp listens on. Overridable via `MACRDP_SCARD_PORT`
 /// (read once at load) so a non-default macrdp build still connects.
 fn port() -> u16 {
     std::env::var("MACRDP_SCARD_PORT")
@@ -84,7 +88,7 @@ fn port() -> u16 {
 
 #[derive(Default)]
 struct State {
-    stream: Option<TcpStream>,
+    stream: Option<UnixStream>,
     atr: Vec<u8>,
 }
 
@@ -96,14 +100,39 @@ fn state() -> &'static Mutex<State> {
 impl State {
     /// Ensure a live connection to macrdp, dialing on demand. Returns the stream
     /// or `None` if macrdp isn't listening (no client / no redirected reader).
-    fn conn(&mut self) -> Option<&mut TcpStream> {
+    fn conn(&mut self) -> Option<&mut UnixStream> {
         if self.stream.is_none() {
-            let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port());
-            match TcpStream::connect_timeout(&addr.into(), CONNECT_TIMEOUT) {
+            let path = scard_ipc::socket_path(port());
+            // The installer pins the serving UID in a root-owned file. Validate
+            // both directory and peer; do not trust a squatted socket.
+            let owner_file =
+                std::path::Path::new("/Library/Application Support/macrdp/ifd-server.uid");
+            let owner_parent = std::fs::symlink_metadata(owner_file.parent()?).ok()?;
+            if !owner_parent.is_dir() || owner_parent.uid() != 0 || owner_parent.mode() & 0o022 != 0
+            {
+                return None;
+            }
+            let meta = std::fs::symlink_metadata(owner_file).ok()?;
+            if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+                return None;
+            }
+            let configured_uid: u32 = std::fs::read_to_string(owner_file)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            let owner = std::fs::symlink_metadata(path.parent()?).ok()?.uid();
+            if owner != configured_uid {
+                return None;
+            }
+            scard_ipc::validate_directory(path.parent()?, owner).ok()?;
+            match scard_ipc::connect_timeout(&path, Duration::from_millis(300)) {
                 Ok(s) => {
                     let _ = s.set_read_timeout(Some(IO_TIMEOUT));
                     let _ = s.set_write_timeout(Some(IO_TIMEOUT));
-                    let _ = s.set_nodelay(true);
+                    if scard_ipc::peer_uid(s.as_raw_fd()).ok()? != owner {
+                        return None;
+                    }
                     self.stream = Some(s);
                 }
                 Err(_) => return None,
@@ -122,7 +151,7 @@ impl State {
 /// Run `f` with a live connection; on any I/O error, reset and yield `Err(())`.
 fn with_conn<T>(
     s: &mut State,
-    f: impl FnOnce(&mut TcpStream) -> std::io::Result<T>,
+    f: impl FnOnce(&mut UnixStream) -> std::io::Result<T>,
 ) -> Result<T, ()> {
     let Some(stream) = s.conn() else {
         return Err(());
@@ -136,19 +165,19 @@ fn with_conn<T>(
     }
 }
 
-fn read_u8(s: &mut TcpStream) -> std::io::Result<u8> {
+fn read_u8(s: &mut UnixStream) -> std::io::Result<u8> {
     let mut b = [0u8; 1];
     s.read_exact(&mut b)?;
     Ok(b[0])
 }
 
-fn read_u32(s: &mut TcpStream) -> std::io::Result<u32> {
+fn read_u32(s: &mut UnixStream) -> std::io::Result<u32> {
     let mut b = [0u8; 4];
     s.read_exact(&mut b)?;
     Ok(u32::from_be_bytes(b))
 }
 
-fn read_vec(s: &mut TcpStream, len: usize) -> std::io::Result<Vec<u8>> {
+fn read_vec(s: &mut UnixStream, len: usize) -> std::io::Result<Vec<u8>> {
     let mut v = vec![0u8; len];
     s.read_exact(&mut v)?;
     Ok(v)
@@ -183,8 +212,11 @@ pub extern "C" fn IFDHCloseChannel(_Lun: Dword) -> ResponseCode {
 
 /// Report fixed capabilities. The buffer at `Value` has capacity `*Length` on
 /// input; we write the value and set `*Length` to its real size.
+/// # Safety
+/// Pointer arguments must reference valid buffers of the sizes specified by
+/// the IFDHandler v3.0 ABI for the duration of this call.
 #[no_mangle]
-pub extern "C" fn IFDHGetCapabilities(
+pub unsafe extern "C" fn IFDHGetCapabilities(
     _Lun: Dword,
     Tag: Dword,
     Length: PDword,
@@ -256,8 +288,11 @@ pub extern "C" fn IFDHSetProtocolParameters(
 }
 
 /// Power up / reset → fetch the card's ATR; power down → release it.
+/// # Safety
+/// Pointer arguments must reference valid buffers of the sizes specified by
+/// the IFDHandler v3.0 ABI for the duration of this call.
 #[no_mangle]
-pub extern "C" fn IFDHPowerICC(
+pub unsafe extern "C" fn IFDHPowerICC(
     _Lun: Dword,
     Action: Dword,
     Atr: PUchar,
@@ -315,8 +350,11 @@ pub extern "C" fn IFDHPowerICC(
 }
 
 /// Forward one command APDU to the client's card and return its response.
+/// # Safety
+/// Pointer arguments must reference valid buffers of the sizes specified by
+/// the IFDHandler v3.0 ABI for the duration of this call.
 #[no_mangle]
-pub extern "C" fn IFDHTransmitToICC(
+pub unsafe extern "C" fn IFDHTransmitToICC(
     _Lun: Dword,
     _SendPci: ScardIoHeader,
     TxBuffer: PUchar,
@@ -372,8 +410,11 @@ pub extern "C" fn IFDHTransmitToICC(
     }
 }
 
+/// # Safety
+/// Pointer arguments must reference valid buffers of the sizes specified by
+/// the IFDHandler v3.0 ABI for the duration of this call.
 #[no_mangle]
-pub extern "C" fn IFDHControl(
+pub unsafe extern "C" fn IFDHControl(
     _Lun: Dword,
     _dwControlCode: Dword,
     _TxBuffer: PUchar,

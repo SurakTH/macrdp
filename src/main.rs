@@ -40,6 +40,8 @@ mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
+#[cfg(target_os = "macos")]
+mod scard_ipc;
 mod shield;
 mod stats;
 mod switcher_hud;
@@ -491,14 +493,21 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     h264_frames_in_flight: u32,
 
-    /// Number of trailing pictures after the H.264 quiet-period refresh.
-    /// After at least 100 ms without a new capture, send the latest surface as
-    /// an IDR, followed by this many pictures to drain client presentation
-    /// buffering. This helps small final changes appear without more typing.
+    /// Number of trailing pictures before and after the H.264 quiet refresh.
+    /// Send this many pictures at frame cadence immediately after a change.
+    /// After at least 100 ms without another capture, refresh the latest
+    /// surface with an IDR and repeat the burst for decoder recovery. This
+    /// drains presentation buffering without delaying sparse typing by 100 ms.
     /// Default 4. Set 0 to disable the refresh burst; deferred real captures
     /// are still retried so backpressure cannot discard the final update.
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
+
+    /// Experimental interval for H.264 trailing pictures and deferred retries,
+    /// in milliseconds (8..1000). Unset uses the capture frame interval.
+    /// Does not change capture FPS, burst counts, or the 100 ms quiet IDR.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(8..=1000))]
+    flush_interval_ms: Option<u64>,
 
     /// Disable lazy Windows→Mac file paste. Lazy paste is ON by default:
     /// temp files are pre-sized but empty when the Windows copy lands,
@@ -1729,7 +1738,45 @@ fn args_from_config(path: &Path) -> Result<Args> {
         }
     }
 
+    // An explicit empty value restores stable cadence, including when an
+    // older EXTRA_FLAGS entry still requests the experimental interval.
+    if let Some(value) = cfg.get("FLUSH_INTERVAL_MS") {
+        configured_value_flags.push("--flush-interval-ms");
+        if !value.is_empty() {
+            argv.push("--flush-interval-ms".into());
+            argv.push(value.clone());
+        }
+    }
+
+    // Physical capture sizing is separate from virtual-display sizing. An
+    // explicit empty value restores automatic sizing and retires old CLI pins.
+    let physical_size_configured =
+        !on("VIRTUAL_DISPLAY", false) && cfg.contains_key("CAPTURE_SIZE");
+    if on("VIRTUAL_DISPLAY", false) || physical_size_configured {
+        configured_value_flags.extend(["--width", "--height"]);
+    }
+    if physical_size_configured {
+        if let Some(spec) = cfg.get("CAPTURE_SIZE").filter(|value| !value.is_empty()) {
+            let (width, height) =
+                parse_max_client_size(spec).map_err(|error| anyhow!("CAPTURE_SIZE: {error}"))?;
+            if width % 2 != 0 || height % 2 != 0 {
+                return Err(anyhow!("CAPTURE_SIZE requires even width and height"));
+            }
+            argv.extend([
+                "--width".into(),
+                width.to_string(),
+                "--height".into(),
+                height.to_string(),
+                "--no-client-resolution".into(),
+            ]);
+        }
+    }
+
     let mut configured_switch_flags: Vec<&str> = Vec::new();
+    if physical_size_configured {
+        configured_switch_flags.extend(["--no-client-resolution", "--hidpi"]);
+    }
+
     for (cfg_key, cli_flag) in [("KEYFRAME_ON_CHANGE", "--keyframe-on-change")] {
         if cfg.contains_key(cfg_key) {
             configured_switch_flags.push(cli_flag);
@@ -1866,11 +1913,15 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if let Some(extra) = cfg.get("EXTRA_FLAGS") {
         let mut toks = extra.split_whitespace();
         while let Some(tok) = toks.next() {
-            if (bitrate.is_some() && tok == "--bitrate") || configured_value_flags.contains(&tok) {
-                toks.next(); // consume its value so it isn't pushed either
+            let flag = tok.split_once('=').map_or(tok, |(flag, _)| flag);
+            if (bitrate.is_some() && flag == "--bitrate") || configured_value_flags.contains(&flag)
+            {
+                if !tok.contains('=') {
+                    toks.next(); // only separate-value arguments consume the next token
+                }
                 continue;
             }
-            if configured_switch_flags.contains(&tok) {
+            if configured_switch_flags.contains(&flag) {
                 continue;
             }
             argv.push(tok.to_string());
@@ -2566,6 +2617,7 @@ async fn async_main() -> Result<()> {
         keyframe_on_change,
         click_signal: click_signal.clone(),
         flush_frames: args.flush_frames,
+        flush_interval: args.flush_interval_ms.map(std::time::Duration::from_millis),
         display_suppressed: Some(display_suppressed.clone()),
         // Live in-session resize (client drags its window, sending an
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the
@@ -3005,6 +3057,79 @@ mod max_client_size_tests {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    #[test]
+    fn fast_flush_is_opt_in_and_interval_is_bounded() {
+        let default = Args::try_parse_from(["macrdp"]).unwrap();
+        assert_eq!(default.flush_interval_ms, None);
+        for ms in ["8", "16", "1000"] {
+            let args = Args::try_parse_from(["macrdp", "--flush-interval-ms", ms]).unwrap();
+            assert_eq!(args.flush_interval_ms, Some(ms.parse().unwrap()));
+            assert_eq!(args.fps, default.fps);
+            assert_eq!(args.flush_frames, default.flush_frames);
+            assert_eq!(args.h264_frames_in_flight, default.h264_frames_in_flight);
+        }
+        for ms in ["0", "7", "1001", "invalid"] {
+            assert!(Args::try_parse_from(["macrdp", "--flush-interval-ms", ms]).is_err());
+        }
+    }
+
+    #[test]
+    fn config_flush_interval_overrides_extra_flags_without_duplication() {
+        let path = write_temp(
+            "flush-interval",
+            "FLUSH_INTERVAL_MS=8\nEXTRA_FLAGS=--flush-interval-ms 16\n",
+        );
+        let args = args_from_config(&path).unwrap();
+        assert_eq!(args.flush_interval_ms, Some(8));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn empty_flush_interval_disables_legacy_extra_flags() {
+        let path = write_temp(
+            "flush-off",
+            "FLUSH_INTERVAL_MS=\nEXTRA_FLAGS=--flush-interval-ms 8 --fps 60\n",
+        );
+        let args = args_from_config(&path).unwrap();
+        assert_eq!(args.flush_interval_ms, None);
+        assert_eq!(args.fps, Some(60));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn physical_capture_size_pins_and_replaces_legacy_resolution_flags() {
+        let path = write_temp("physical-size", "CAPTURE_SIZE=2560x1440\nEXTRA_FLAGS=--width=1920 --height 1080 --fps 60 --no-client-resolution\n");
+        let args = args_from_config(&path).unwrap();
+        assert_eq!((args.width, args.height), (Some(2560), Some(1440)));
+        assert!(args.no_client_resolution);
+        assert_eq!(args.fps, Some(60));
+        fs::write(&path, "CAPTURE_SIZE=\nHIDPI=1\nEXTRA_FLAGS=--width 1280 --height=720 --no-client-resolution --hidpi\n").unwrap();
+        let args = args_from_config(&path).unwrap();
+        assert_eq!((args.width, args.height), (None, None));
+        assert!(!args.no_client_resolution);
+        assert!(args.hidpi);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn virtual_display_ignores_physical_capture_size() {
+        let path = write_temp("virtual-size", "VIRTUAL_DISPLAY=1\nVD_WIDTH=1920\nVD_HEIGHT=1080\nCAPTURE_SIZE=2560x1440\nEXTRA_FLAGS=--width=1280 --height 720\n");
+        let args = args_from_config(&path).unwrap();
+        assert_eq!((args.width, args.height), (Some(1920), Some(1080)));
+        assert!(!args.no_client_resolution);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn invalid_physical_size_is_rejected_before_startup() {
+        let path = write_temp("bad-size", "");
+        for size in ["bad", "0x1080", "8194x1080", "1919x1080"] {
+            fs::write(&path, format!("CAPTURE_SIZE={size}\n")).unwrap();
+            assert!(args_from_config(&path).is_err());
+        }
+        fs::remove_file(path).unwrap();
+    }
 
     fn write_temp(name: &str, body: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

@@ -1,6 +1,6 @@
 # Production-readiness roadmap
 
-> Scoped 2026-06-29. **Not started** — a planning doc to come back to. Companion to
+> Scoped 2026-06-29; status refreshed 2026-10-07. Several items have shipped. Companion to
 > the "Production readiness" section in `README.md` (which describes the *current*
 > state); this describes what would *raise* it.
 
@@ -47,12 +47,18 @@ are scope limits, not gaps to close.
 
 ## Tier 2 — Reliability / unattended operation
 
+**Latest recorded soak evidence:** the repository also records a 27.4-hour
+v0.9.5 pin-bump soak (`docs/pin-bump-soak-results.md`). Neither that run nor the
+older 31-hour foundation soak validates the current uncommitted fixes or closes
+the 48–72-hour target. The July observations below are historical evidence.
+
+
 4. **A real multi-day soak.** *(highest confidence per hour.)* The biggest unknown for
    "leave it running" is leaks/drift over time. Known suspects: the *audio long-session
    drift* item, and documented SCStream / NFS-mount leaks on hard kill (`SIGKILL` skips
    `Drop`). Run a 48–72 h soak (idle + active, with reconnect cycles) and fix what it
    surfaces.
-   - **Status — foundation core PASSED a 31 h leak/drift soak; full 48–72 h on v0.8.24 still
+   - **Status — foundation core PASSED a 31 h leak/drift soak; full 48–72 h on the current build still
      pending.** The soak run (started 2026-07-01 18:39, **pre-v0.8.22 / pre-ARC** build, 31 h /
      1861 one-minute samples; data recovered on a clean re-copy after a first transfer came back
      zero-filled) shows the **foundation core is clean over time, not just alive:**
@@ -74,7 +80,7 @@ are scope limits, not gaps to close.
      per-QoE-callback, can drop the connection) and the ARC auto-reconnect cookie. So the
      *foundation core* (capture → encode → ship → audio → input steady state) is
      **production-validated for leak/drift + no-crash longevity over 31 h**; a **full 48–72 h
-     re-soak on v0.8.24** (deployed 2026-07-04; also exercises the RTT-aware controller + faster blank recovery in the field), biased toward reconnect cycles, is still needed to (1) extend the
+     re-soak on the current build**, biased toward reconnect cycles, is still needed to (1) extend the
      duration and (2) validate the v0.8.22 deltas (esp. blank-recovery false-positive resistance
      over hours). Two logging notes for that run: harden the soak logger to `fsync`/`F_FULLFSYNC`
      periodically (or tee key events to the crash-durable macOS unified log) so a transfer/
@@ -123,8 +129,10 @@ are scope limits, not gaps to close.
    on the git-pinned `ironrdp-acceptor`'s single-monitor `MonitorLayoutPdu`; scoped/paused
    (see the multi-virtual-monitor TODO + memory).
 8. **Auto-update** (e.g. Sparkle) so deployed instances stay current.
-9. **A status / metrics surface** (active connections, fps, bitrate, error counts) for
-   monitoring.
+9. **A status / metrics surface — SHIPPED.** Opt-in `--stats-endpoint` serves local
+   JSON metrics; the controller shows live status. Pipeline counters and the
+   collector in `docs/video-diagnostics.md` help locate video stalls. Counters
+   do not establish client presentation; `connected` is best-effort.
 10. **Upstream the vendored IronRDP forks.** Reduces the long-term maintenance / bus-factor
     risk that "solo v0 on vendored forks" carries. See `project_upstream_ironrdp_open_prs`.
 
@@ -147,10 +155,10 @@ If picking a starting batch, do these three:
 3. **A 48–72 h soak to shake out leaks/drift** (Tier 2.4) — **foundation core PASSED (31 h).**
    A 31 h run confirmed no memory/fd/thread/stream/mount leak, 0 panics, and **field-validated
    the v0.8.21 auth-guard fix** (pre-fix lockouts captured; post-fix window clean); see Tier 2.4
-   above. Remaining to fully close it out: a **48–72 h re-soak on v0.8.24** (deployed 2026-07-04; also exercises the RTT-aware controller + faster blank recovery in the field) exercising reconnect
+   above. Remaining to fully close it out: a **48–72 h re-soak on the current build** exercising reconnect
    cycles (ARC cookie + blank-recovery detector).
 
 That trio takes it from "daily-driver I babysit" to "I can deploy this and walk away on a
 network I control." With 1.1 + 1.2 landed, the foundation core is soak-validated for leak/drift
-+ no-crash longevity (31 h); closing out Tier 2.4 (full 48–72 h on v0.8.24) is the remaining
++ no-crash longevity (31 h); closing out Tier 2.4 (full 48–72 h on the current build) is the remaining
 high-value item; everything else is incremental.

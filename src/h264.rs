@@ -71,7 +71,7 @@ use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::videotoolbox::{Avc444Encoder, EncodedFrame, Encoder};
+use crate::videotoolbox::{Avc444Encoder, EncodeOutput, EncodedFrame, Encoder};
 
 /// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
 /// backpressure gate while the client's frame-ack lag is over the threshold.
@@ -194,6 +194,15 @@ impl ActiveEncoder {
             Self::Avc420(encoder) => encoder.encode_bgra(bgra, stride, force_keyframe),
             Self::Avc444(encoder) => encoder.encode_bgra(bgra, stride, force_keyframe),
         }
+    }
+}
+
+fn tracked_completion(counter: Arc<AtomicU64>, frames: u64) -> EgfxFrameCompletion {
+    let token = EgfxFrameCompletion::new(counter, frames);
+    if let Some(stats) = crate::stats::global() {
+        token.with_observer(stats.transport_retired.clone())
+    } else {
+        token
     }
 }
 
@@ -1961,6 +1970,9 @@ impl Gfx {
                     trace!(
                         "EGFX at bitrate floor + congested; dropping capture (frame-rate floor)"
                     );
+                    if let Some(stats) = crate::stats::global() {
+                        stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                    }
                     return Ok(FrameSubmission::Deferred);
                 }
                 if at_floor && ctx.adaptive_congested {
@@ -1984,6 +1996,9 @@ impl Gfx {
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
                 );
+                if let Some(stats) = crate::stats::global() {
+                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(FrameSubmission::Deferred); // still the active path; just dropped this frame
             }
             // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
@@ -2021,6 +2036,9 @@ impl Gfx {
                             lag,
                             "EGFX-on-UDP lag high; dropping capture (trickle floor)"
                         );
+                        if let Some(stats) = crate::stats::global() {
+                            stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                        }
                         return Ok(FrameSubmission::Deferred);
                     }
                     ctx.last_throttle_ship = now;
@@ -2048,6 +2066,9 @@ impl Gfx {
             if let Err(e) = result {
                 warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
             }
+            if let Some(stats) = crate::stats::global() {
+                stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(FrameSubmission::Deferred);
         }
 
@@ -2056,6 +2077,9 @@ impl Gfx {
         {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
+                if let Some(stats) = crate::stats::global() {
+                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(FrameSubmission::Deferred);
             };
             let force_keyframe =
@@ -2066,6 +2090,9 @@ impl Gfx {
             // adaptive is enabled AND EGFX is on a UDP tunnel.
             let adaptive = self.adaptive_bitrate_step(ctx);
             let Some(encoder) = ctx.encoder.as_mut() else {
+                if let Some(stats) = crate::stats::global() {
+                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(FrameSubmission::Deferred);
             };
             if let Some(bps) = adaptive.bitrate_bps {
@@ -2080,6 +2107,9 @@ impl Gfx {
             }
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
+            if let Some(stats) = crate::stats::global() {
+                stats.encode_submitted.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(FrameSubmission::Submitted)
     }
@@ -2337,26 +2367,36 @@ impl Gfx {
     /// capture tick. Transfers completion tokens to the event loop so the
     /// capture throttle includes queued and writing frames. Exits when the
     /// channel closes (encoder dropped on connection teardown).
-    fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
+    fn ship_loop(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodeOutput>,
+        shipped: Arc<AtomicU64>,
+        resync: Arc<AtomicBool>,
+    ) {
         // Reuse the batch allocation for the lifetime of the connection. VT
         // normally yields one frame at a time, but can deliver a short burst
         // after startup or a keyframe.
         let mut frames = Vec::with_capacity(4);
-        while let Ok(frame) = rx.recv() {
-            // Sweep up any others VT delivered alongside it (keeps order).
-            frames.push(frame);
-            frames.extend(rx.try_iter());
-            let n = frames.len() as u64;
-            if let Err(e) =
-                self.ship_frames(&mut frames, EgfxFrameCompletion::new(shipped.clone(), n))
-            {
-                warn!(error = ?e, "EGFX ship_frames failed");
+        while let Ok(output) = rx.recv() {
+            for output in std::iter::once(output).chain(rx.try_iter()) {
+                match output {
+                    EncodeOutput::Picture(frame) => frames.push(frame),
+                    EncodeOutput::Dropped { .. } => {
+                        shipped.fetch_add(1, Ordering::Relaxed);
+                        resync.store(true, Ordering::Relaxed);
+                    }
+                }
             }
-            // ship_frames normally drains the batch. It can fail before it
-            // reaches the drain (for example during teardown), so explicitly
-            // discard anything left rather than retrying stale frames later.
-            frames.clear();
-            // The queued event owns completion until the transport write ends.
+            if !frames.is_empty() {
+                let n = frames.len() as u64;
+                if let Err(e) =
+                    self.ship_frames(&mut frames, tracked_completion(shipped.clone(), n))
+                {
+                    warn!(error = ?e, "EGFX ship_frames failed");
+                    resync.store(true, Ordering::Relaxed);
+                }
+                frames.clear();
+            }
         }
         debug!("EGFX ship loop exiting (output channel closed)");
     }
@@ -2368,61 +2408,51 @@ impl Gfx {
     /// Missing output is discarded and the next main picture is forced to IDR.
     fn ship_loop_avc444(
         &self,
-        rx: std::sync::mpsc::Receiver<EncodedFrame>,
+        rx: std::sync::mpsc::Receiver<EncodeOutput>,
         shipped: Arc<AtomicU64>,
         resync: Arc<AtomicBool>,
     ) {
-        let mut pending_main: Option<EncodedFrame> = None;
-        while let Ok(frame) = rx.recv() {
-            if frame.pts & 1 == 0 {
-                if let Some(stale_main) = pending_main.replace(frame) {
-                    warn!(
-                        main_pts = stale_main.pts,
-                        "EGFX AVC444 dropped unmatched main output; forcing stream IDR"
-                    );
-                    resync.store(true, Ordering::Relaxed);
+        let mut pending_main: Option<EncodeOutput> = None;
+        while let Ok(output) = rx.recv() {
+            if output.pts() & 1 == 0 {
+                if pending_main.replace(output).is_some() {
                     shipped.fetch_add(1, Ordering::Relaxed);
+                    resync.store(true, Ordering::Relaxed);
                 }
                 continue;
             }
-
             let Some(main) = pending_main.take() else {
-                warn!(
-                    auxiliary_pts = frame.pts,
-                    "EGFX AVC444 dropped orphan auxiliary output; forcing stream IDR"
-                );
-                resync.store(true, Ordering::Relaxed);
                 shipped.fetch_add(1, Ordering::Relaxed);
+                resync.store(true, Ordering::Relaxed);
                 continue;
             };
-
-            if main.pts.wrapping_add(1) != frame.pts {
-                warn!(
-                    main_pts = main.pts,
-                    auxiliary_pts = frame.pts,
-                    "EGFX AVC444 dropped non-adjacent output pair; forcing stream IDR"
-                );
-                resync.store(true, Ordering::Relaxed);
+            if main.pts().wrapping_add(1) != output.pts() {
                 shipped.fetch_add(2, Ordering::Relaxed);
+                resync.store(true, Ordering::Relaxed);
                 continue;
             }
-
-            if let Err(error) =
-                self.ship_avc444_pair(main, frame, EgfxFrameCompletion::new(shipped.clone(), 1))
-            {
-                warn!(?error, "EGFX AVC444 ship failed");
-                resync.store(true, Ordering::Relaxed);
+            match (main, output) {
+                (EncodeOutput::Picture(main), EncodeOutput::Picture(auxiliary)) => {
+                    if let Err(error) = self.ship_avc444_pair(
+                        main,
+                        auxiliary,
+                        tracked_completion(shipped.clone(), 1),
+                    ) {
+                        warn!(?error, "EGFX AVC444 ship failed");
+                        resync.store(true, Ordering::Relaxed);
+                    }
+                }
+                _ => {
+                    // Retire the logical submission once, even if both views failed.
+                    shipped.fetch_add(1, Ordering::Relaxed);
+                    resync.store(true, Ordering::Relaxed);
+                }
             }
         }
-        if let Some(main) = pending_main {
-            if self.ctx.lock().unwrap().is_some() {
-                warn!(
-                    main_pts = main.pts,
-                    "EGFX AVC444 output closed with an unmatched main picture"
-                );
-            }
+        if pending_main.is_some() {
+            shipped.fetch_add(1, Ordering::Relaxed);
         }
-        debug!("EGFX AVC444 ship loop exiting (encoder output channel closed)");
+        debug!("EGFX AVC444 ship loop exiting (output channel closed)");
     }
 
     fn ship_avc444_pair(
@@ -2634,9 +2664,10 @@ impl Gfx {
                 ctx.encoder = Some(ActiveEncoder::Avc420(encoder));
                 let gfx = self.clone();
                 let shipped = ctx.shipped.clone();
+                let resync = ctx.encoder_resync.clone();
                 std::thread::Builder::new()
                     .name("egfx-ship".into())
-                    .spawn(move || gfx.ship_loop(rx, shipped))
+                    .spawn(move || gfx.ship_loop(rx, shipped, resync))
                     .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
                 if self.avc444_enabled {
                     info!(
@@ -3583,6 +3614,70 @@ fn retain_avc444_nals(mut avcc: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completion_test_gfx() -> Gfx {
+        Gfx::new(
+            crate::capture::SharedDesktopSize::new(64, 64),
+            30,
+            1_000_000,
+            false,
+            2.0,
+            2,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        )
+    }
+
+    #[test]
+    fn encoder_failures_release_avc420_slots_and_arm_resync() {
+        let gfx = completion_test_gfx();
+        let shipped = Arc::new(AtomicU64::new(0));
+        let resync = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        // More failures than the configured window must all retire, so later
+        // captures can still enter the encoder instead of being deferred forever.
+        for pts in 0..20 {
+            tx.send(EncodeOutput::Dropped { pts }).unwrap();
+        }
+        drop(tx);
+        gfx.ship_loop(rx, shipped.clone(), resync.clone());
+        assert_eq!(shipped.load(Ordering::Relaxed), 20);
+        assert!(resync.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn avc444_failed_views_retire_one_logical_submission_per_pair() {
+        let gfx = completion_test_gfx();
+        let shipped = Arc::new(AtomicU64::new(0));
+        let resync = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        fn picture(pts: i64) -> EncodeOutput {
+            EncodeOutput::Picture(EncodedFrame {
+                data: vec![],
+                is_keyframe: false,
+                pts,
+                parameter_sets: vec![],
+            })
+        }
+        for output in [
+            EncodeOutput::Dropped { pts: 0 },
+            picture(1),
+            picture(2),
+            EncodeOutput::Dropped { pts: 3 },
+            EncodeOutput::Dropped { pts: 4 },
+            EncodeOutput::Dropped { pts: 5 },
+        ] {
+            tx.send(output).unwrap();
+        }
+        drop(tx);
+        gfx.ship_loop_avc444(rx, shipped.clone(), resync.clone());
+        assert_eq!(shipped.load(Ordering::Relaxed), 3);
+        assert!(resync.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn avc444_requires_positive_v10_avc_capability() {

@@ -65,6 +65,11 @@ impl MacInputHandler {
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
+        if let Some(stats) = crate::stats::global() {
+            stats
+                .keyboard_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         #[cfg(target_os = "macos")]
         self.inner.keyboard(event);
         #[cfg(not(target_os = "macos"))]

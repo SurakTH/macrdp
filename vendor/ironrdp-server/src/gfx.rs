@@ -131,11 +131,23 @@ impl DvcServerProcessor for GfxDvcBridge {}
 pub struct EgfxFrameCompletion {
     completed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     frames: u64,
+    observer: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl EgfxFrameCompletion {
     pub fn new(completed: std::sync::Arc<std::sync::atomic::AtomicU64>, frames: u64) -> Self {
-        Self { completed, frames }
+        Self {
+            completed,
+            frames,
+            observer: None,
+        }
+    }
+
+    /// Optional process-wide diagnostic counter. Retired includes abandoned
+    /// batches as well as completed writes; it is not a client presentation ACK.
+    pub fn with_observer(mut self, observer: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 }
 
@@ -143,6 +155,9 @@ impl Drop for EgfxFrameCompletion {
     fn drop(&mut self) {
         self.completed
             .fetch_add(self.frames, std::sync::atomic::Ordering::Relaxed);
+        if let Some(observer) = &self.observer {
+            observer.fetch_add(self.frames, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -176,6 +191,18 @@ mod completion_tests {
         atomic::{AtomicU64, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn diagnostic_observer_follows_batch_lifetime_without_releasing_early() {
+        let completed = Arc::new(AtomicU64::new(0));
+        let observed = Arc::new(AtomicU64::new(7));
+        let token = EgfxFrameCompletion::new(completed.clone(), 2).with_observer(observed.clone());
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+        assert_eq!(observed.load(Ordering::Relaxed), 7);
+        drop(token);
+        assert_eq!(completed.load(Ordering::Relaxed), 2);
+        assert_eq!(observed.load(Ordering::Relaxed), 9);
+    }
 
     #[tokio::test]
     async fn slow_transport_keeps_video_slots_occupied_until_write_completes() {

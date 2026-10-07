@@ -43,7 +43,7 @@ How it behaves:
 - **Color.** The stream is encoded as full-range BT.709. This matters for `mstsc`, which reads AVC420 luma as full-range regardless of the bitstream flag — video-range output otherwise renders washed-out / lighter there. FreeRDP honors the flag and is correct either way. To get full range we convert each captured BGRA frame to full-range NV12 ourselves (VideoToolbox would otherwise emit video-range from a BGRA source); that conversion is **vImage**-accelerated — see [Color conversion: scalar vs vImage](#color-conversion-scalar-vs-vimage).
 - **Frame rate.** `--enable-h264` defaults to **60fps** (vs 15 for legacy). mstsc holds a fixed ~2-frame presentation buffer for the H.264 stream, so at 30fps typing lags ~2 keystrokes (~66ms) while at 60fps that buffer is ~33ms and feels immediate. FreeRDP-based clients don't buffer this way and are snappy at any rate. Set `--fps` explicitly to override (lower it to save CPU/bandwidth if your client/link doesn't need 60).
 - **Keyframes.** A keyframe (IDR) is forced on the first frame, then periodically every `--keyframe-interval` seconds (default `2`) as a safety net — some clients (mstsc) only fully recover a transient decode glitch on the next IDR, so a long interval leaves garbled regions (notably text) lingering. Lower it for faster recovery at the cost of bandwidth/quality; raise it for smoother typing. Optionally, pass **`--keyframe-on-change`** (off by default) to additionally force an IDR whenever a large area changes at once (window-to-front, scroll, app launch) and briefly after a mouse click, so big updates land immediately instead of waiting for the periodic interval (rising-edge detection keeps sustained churn like video from forcing an IDR every frame). It's off by default because the periodic interval plus the trailing flush-burst (`--flush-frames`) already drain mstsc's presentation buffer, so the extra forced IDRs mostly just spend bitrate/quality at a fixed bitrate for no typing benefit — enable it only if large updates visibly lag on your client/link. When enabled, the trigger thresholds are tunable: `--keyframe-change-pct` (default 20, the dirty-area % that fires an IDR), `--keyframe-click-pct` (default 5, the lowered threshold after a click), and `--keyframe-click-window-ms` (default 400, how long that lowered threshold lasts).
-- **Flush frames (`--flush-frames`, default `4`).** ScreenCaptureKit only delivers a frame when the screen changes, so after the last keystroke before a pause there are no further frames to push it through mstsc's ~2-frame AVC420 presentation buffer — it would strand there until the next change or periodic keyframe (the classic "typing follows the keyframe" lag). After each change the server re-submits the last frame this many times as cheap skip-P-frames, draining the buffer so the change appears within a couple of frame intervals (~33 ms at 60fps), then goes quiet. mstsc needs ≥2; raise if a slight trailing lag remains, or set `0` to disable. The capture path retains exactly one CoreVideo pixel buffer until this bounded burst completes, then releases it; it does not copy the full BGRA desktop on every accepted frame.
+- **Flush frames (`--flush-frames`, default `4`).** ScreenCaptureKit only delivers a frame when the screen changes, so after the last keystroke before a pause there are no further frames to push it through mstsc's ~2-frame AVC420 presentation buffer — it would strand there until the next change or periodic keyframe (the classic "typing follows the keyframe" lag). After each change the server re-submits the latest frame this many times at frame cadence, without first waiting for the 100 ms quiet period. After at least 100 ms without new content it also sends an IDR followed by another burst of this many pictures for recovery. These bounded bursts help drain presentation buffering; actual key-to-screen latency must be measured on the client. Continuous captures postpone the quiet-period IDR, so motion does not force one for every capture. mstsc needs ≥2; raise if a slight trailing lag remains, or set `0` to disable. The capture path retains exactly one CoreVideo pixel buffer until this bounded burst completes, then releases it; it does not copy the full BGRA desktop on every accepted frame.
 
 For two machines on a clean LAN, `./start.sh lan` is the maximum-practical
 AVC420 preset: HiDPI, 60 FPS, fixed 50 Mbps, stable TCP EGFX, a one-frame
@@ -52,6 +52,20 @@ live-verified on the target mstsc client; 80 Mbps made mstsc build 26100 reset
 as soon as the first AVC420 frame arrived, over both TCP and UDP. Set
 `MACRDP_LAN_TRANSPORT=udp` to explicitly test reliable-UDP EGFX migration; no
 source edit or rebuild is needed.
+
+For an explicit typing-latency experiment, `--flush-interval-ms 8` sends the
+same bounded trailing-picture bursts at 8 ms intervals. Capture FPS, bitrate,
+pipeline limit, and the 100 ms quiet-period IDR threshold stay unchanged. The
+option is off by default: without it, trailing pictures follow capture cadence.
+It can increase short-term encode/transport load; compare typing, scrolling,
+and motion before adopting it. Its accepted range is 8–1000 ms. Config-file
+users can set `FLUSH_INTERVAL_MS`; remove the option to restore the default.
+The Windows comparison found faster-feeling typing with more transient image
+artifacts, while stable cadence looked clean. Keep this option off for normal
+use and enable it only when that trade-off is acceptable. The Controller's
+Video → Experimental → Fast flush toggle exposes an adjustable interval (initially 10 ms); turning it off restores
+stable cadence. `FLUSH_INTERVAL_MS=` explicitly disables an older
+`--flush-interval-ms` entry in `EXTRA_FLAGS` as well.
 
 ### AVC444: sharp text plus H.264 motion
 

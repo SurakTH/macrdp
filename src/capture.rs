@@ -373,6 +373,8 @@ pub struct CaptureDisplay {
     /// Trailing flush frames re-sent after the last change to drain mstsc's
     /// presentation buffer (`--flush-frames`; EGFX/H.264 path only). 0 disables.
     pub flush_frames: u32,
+    /// Experimental trailing-picture cadence; None preserves capture cadence.
+    pub flush_interval: Option<std::time::Duration>,
     /// Shared "client minimized" flag from the vendor server's
     /// `SuppressOutput` handler. When set, `next_update` short-circuits
     /// (no SCK pull, no encode, no ship) and waits on a short timer
@@ -822,6 +824,7 @@ impl CaptureDisplay {
                 self.keyframe_on_change,
                 self.click_signal.clone(),
                 self.flush_frames,
+                self.flush_interval,
                 self.display_suppressed.clone(),
                 self.auto_size,
                 self.stretch,
@@ -957,11 +960,12 @@ mod macos {
         click_signal: Option<ClickSignal>,
         /// Interval between trailing pictures and deferred-submit retries.
         frame_interval: Duration,
-        /// Number of trailing pictures after the quiet-period IDR refresh.
+        flush_interval: Duration,
+        /// Number of trailing pictures before and after the quiet IDR refresh.
         /// Zero disables the refresh burst, but not retries of deferred input.
         flush_frames: u32,
-        /// After at least 100 ms without a new capture, refresh the latest
-        /// surface with an IDR, then drain the client's presentation queue.
+        /// Drain presentation buffering immediately at frame cadence; after
+        /// 100 ms of quiet, refresh the latest surface with an IDR and drain again.
         /// Only accepted submissions consume this budget.
         flush_burst: crate::frame_flush::FrameFlush,
         /// Latest capture retained until its deferred submission or refresh
@@ -1044,6 +1048,7 @@ mod macos {
             keyframe_on_change: KeyframeOnChange,
             click_signal: Option<ClickSignal>,
             flush_frames: u32,
+            flush_interval: Option<Duration>,
             display_suppressed: Option<Arc<AtomicBool>>,
             auto_size: bool,
             stretch: bool,
@@ -1228,6 +1233,7 @@ mod macos {
                 kf_armed: true,
                 click_signal,
                 frame_interval,
+                flush_interval: flush_interval.unwrap_or(frame_interval),
                 flush_frames,
                 flush_burst: crate::frame_flush::FrameFlush::default(),
                 last_frame: None,
@@ -1552,7 +1558,7 @@ mod macos {
                                 self.flush_burst.attempted(
                                     submitted,
                                     Instant::now(),
-                                    self.frame_interval,
+                                    self.flush_interval,
                                 );
                                 if self.flush_burst.deadline().is_none() {
                                     // Return the retained surface to SCK's pool
@@ -1570,9 +1576,15 @@ mod macos {
                     }
                 };
 
+                if let Some(stats) = crate::stats::global() {
+                    stats.capture_samples.fetch_add(1, Ordering::Relaxed);
+                }
                 // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
                 if let Some(status) = sample.frame_status() {
                     if !status.has_content() {
+                        if let Some(stats) = crate::stats::global() {
+                            stats.capture_idle.fetch_add(1, Ordering::Relaxed);
+                        }
                         continue;
                     }
                 }
@@ -1581,6 +1593,9 @@ mod macos {
                     continue;
                 };
 
+                if let Some(stats) = crate::stats::global() {
+                    stats.capture_content.fetch_add(1, Ordering::Relaxed);
+                }
                 let guard = pixel_buffer
                     .lock(CVPixelBufferLockFlags::READ_ONLY)
                     .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))?;
@@ -1714,7 +1729,7 @@ mod macos {
                                 self.flush_frames,
                                 outcome == crate::h264::FrameSubmission::Submitted,
                                 Instant::now(),
-                                self.frame_interval,
+                                self.flush_interval,
                             );
                             self.last_frame = self
                                 .flush_burst

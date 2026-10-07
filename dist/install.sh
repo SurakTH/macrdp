@@ -37,14 +37,25 @@ if ! security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" >/dev/null
     echo -n "Mac password for $USER: "
     read -rs PW
     echo
-    security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$USER" -w "$PW"
+    printf '%s' "$PW" | "$REPO_ROOT/scripts/store-keychain-password.sh" "$USER"
     unset PW
 else
     echo "==> Keychain entry already exists; leaving it alone"
 fi
 
 echo "==> Writing $PLIST_PATH"
-sed "s|BINARY_PATH|$BIN_PATH|g" "$REPO_ROOT/dist/com.user.macrdp.plist.template" > "$PLIST_PATH"
+mkdir -p "$HOME/Library/Logs" "$HOME/Library/LaunchAgents"
+# plistlib escapes XML metacharacters in installation/home paths.
+python3 - "$REPO_ROOT/dist/com.user.macrdp.plist.template" "$PLIST_PATH" "$BIN_PATH" "$HOME" <<'PYPLIST'
+import plistlib, sys
+with open(sys.argv[1], 'rb') as source:
+    spec = plistlib.load(source)
+spec['ProgramArguments'][0] = sys.argv[3]
+for key in ('StandardOutPath', 'StandardErrorPath'):
+    spec[key] = spec[key].replace('HOME_PATH', sys.argv[4])
+with open(sys.argv[2], 'wb') as output:
+    plistlib.dump(spec, output)
+PYPLIST
 
 # Unload first in case it was already loaded.
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
@@ -56,7 +67,7 @@ cat <<EOF
 Installed. The agent will start automatically at login.
 
 Verify:   launchctl print gui/$UID/$LABEL | head
-Logs:     /tmp/macrdp.out.log  /tmp/macrdp.err.log
+Logs:     $HOME/Library/Logs/macrdp.out.log  $HOME/Library/Logs/macrdp.err.log
 Stop:     launchctl bootout gui/$UID/$LABEL
 Restart:  launchctl kickstart -k gui/$UID/$LABEL
 

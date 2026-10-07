@@ -7,12 +7,13 @@ import SwiftUI
 /// Network exposure is deliberately not part of a performance profile; the
 /// user enables LAN access separately and sees the existing security warning.
 enum PerformanceProfile: String, CaseIterable, Identifiable {
-    case ultimate, lan, native, fast
+    case stable, ultimate, lan, native, fast
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .stable: return "Stable"
         case .ultimate: return "Ultimate"
         case .lan: return "LAN Max"
         case .native: return "Native"
@@ -22,6 +23,8 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
+        case .stable:
+            return "Recommended for typing: 1080p AVC420, 60 FPS, 25 Mbps adaptive, TCP and stable flush cadence."
         case .ultimate:
             return "Best overall balance: AVC420 at 60 FPS, 25 Mbps adaptive, UDP offered, AAC."
         case .lan:
@@ -36,6 +39,7 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
     var settings: [String: String] {
         var values = [
             "AVC444": "0",
+            "CAPTURE_SIZE": "",
             "MAP_CTRL_TO_CMD": "1",
             "ALT_TAB_SWITCH": "1",
             "UDP_MIGRATE_EGFX": "0",
@@ -44,9 +48,19 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             "KEYFRAME_CLICK_PCT": "5",
             "H264_FRAMES_IN_FLIGHT": "2",
             "FLUSH_FRAMES": "4",
+            "FLUSH_INTERVAL_MS": "",
             "STATS_ENDPOINT": "1",
         ]
         switch self {
+        case .stable:
+            values.merge([
+                "ENABLE_H264": "1", "HIDPI": "0", "CAPTURE_SIZE": "1920x1080",
+                "ENABLE_AAC": "0", "ADAPTIVE_BITRATE": "1", "ENABLE_UDP_MULTITRANSPORT": "0",
+                "BITRATE": "25", "FPS": "60", "KEYFRAME_ON_CHANGE": "1",
+                "KEYFRAME_CHANGE_PCT": "15", "KEYFRAME_CLICK_PCT": "3",
+                "H264_FRAMES_IN_FLIGHT": "1", "FLUSH_FRAMES": "2",
+                "UNMINIMIZE": "0", "BLANK_RECOVERY": "0",
+            ]) { _, new in new }
         case .ultimate:
             values.merge([
                 "ENABLE_H264": "1", "HIDPI": "0", "ENABLE_AAC": "1",
@@ -127,6 +141,8 @@ final class SettingsModel: ObservableObject {
     /// Which section the sidebar shows. Hoisted here (not local @State) so the
     /// main-menu "Section" items can navigate the window too.
     @Published var section: SettingsSection = .status
+    @Published private var customCaptureSelected = false
+    @Published private var fastFlushSelected = false
 
     init(controller: AppController,
          initialConfig: [String: String]? = nil,
@@ -177,6 +193,20 @@ final class SettingsModel: ObservableObject {
                 return "\(label) must be a positive whole number."
             }
         }
+        if fastFlushEnabled && fastFlushInterval.isEmpty {
+            return "Enter a fast-flush interval from 8 to 1000 ms, or turn Fast flush off."
+        }
+        let interval = fastFlushInterval
+        if !interval.isEmpty, UInt64(interval).map({ (8...1000).contains($0) }) != true {
+            return "Fast-flush interval must be a whole number from 8 to 1000 ms."
+        }
+        if !bool("VIRTUAL_DISPLAY"), let size = draft["CAPTURE_SIZE"], !size.isEmpty,
+           !Self.validCaptureSize(size) {
+            return "Resolution must use even dimensions from 200 to 8192, e.g. 2560x1440."
+        }
+        if !bool("VIRTUAL_DISPLAY") && customCaptureSelected && string("CAPTURE_SIZE").isEmpty {
+            return "Enter a custom resolution, e.g. 2560x1600."
+        }
         if draft.values.contains(where: { $0.rangeOfCharacter(from: .newlines) != nil }) {
             return "Each setting must fit on one line."
         }
@@ -187,9 +217,11 @@ final class SettingsModel: ObservableObject {
         let cfg = controller.readConfig()
         saved = cfg
         draft = cfg
+        customCaptureSelected = false
+        fastFlushSelected = false
     }
 
-    func revert() { draft = saved; applyError = nil }
+    func revert() { draft = saved; customCaptureSelected = false; fastFlushSelected = false; applyError = nil }
 
     /// A failed write leaves the entire draft intact and never restarts the server.
     func apply() {
@@ -268,6 +300,7 @@ final class SettingsModel: ObservableObject {
         // Honor the control the user touched: disabling H.264 must not be
         // undone by the dependent UDP-video setting during normalization.
         if key == "ENABLE_H264", !value {
+            setFastFlushEnabled(false)
             if draft["UDP_MIGRATE_EGFX"] == "1" { draft["UDP_MIGRATE_EGFX"] = "0" }
         }
         normalize()
@@ -365,12 +398,84 @@ final class SettingsModel: ObservableObject {
     // MARK: - Performance profiles
 
     func applyProfile(_ profile: PerformanceProfile) {
+        customCaptureSelected = false
+        fastFlushSelected = false
         for (key, value) in profile.settings { draft[key] = value }
         if let fps = profile.settings["FPS"] { setFrameRate(fps) }
         if let bitrate = profile.settings["BITRATE"], !bitrate.isEmpty {
             setBitrate(bitrate)
         }
+        cleanExtraFlags(["--flush-interval-ms", "--width", "--height", "--hidpi", "--no-client-resolution"])
         normalize()
+    }
+
+    /// A stored empty key explicitly overrides old EXTRA_FLAGS values.
+    var fastFlushInterval: String {
+        if let value = draft["FLUSH_INTERVAL_MS"] { return value }
+        return Self.extraFlagValue("--flush-interval-ms", in: string("EXTRA_FLAGS")) ?? ""
+    }
+    var fastFlushEnabled: Bool { fastFlushSelected || !fastFlushInterval.isEmpty }
+
+    func setFastFlushEnabled(_ enabled: Bool) {
+        let previous = fastFlushInterval
+        fastFlushSelected = enabled
+        draft["FLUSH_INTERVAL_MS"] = enabled ? (previous.isEmpty ? "10" : previous) : ""
+        cleanExtraFlags(["--flush-interval-ms"])
+    }
+
+    func setFastFlushInterval(_ value: String) {
+        fastFlushSelected = true
+        draft["FLUSH_INTERVAL_MS"] = value.trimmingCharacters(in: .whitespaces)
+        cleanExtraFlags(["--flush-interval-ms"])
+    }
+
+    static let capturePresets = ["1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160"]
+    var captureResolutionChoice: String {
+        if customCaptureSelected { return "custom" }
+        let size = string("CAPTURE_SIZE")
+        if !size.isEmpty { return Self.capturePresets.contains(size) ? size : "custom" }
+        return bool("HIDPI") ? "hidpi" : "auto"
+    }
+
+    func setCaptureResolutionChoice(_ value: String) {
+        customCaptureSelected = value == "custom"
+        if value == "auto" || value == "hidpi" {
+            draft["CAPTURE_SIZE"] = ""
+            draft["HIDPI"] = value == "hidpi" ? "1" : "0"
+        } else {
+            draft["HIDPI"] = "0"
+            draft["CAPTURE_SIZE"] = value == "custom" ? "2560x1600" : value
+        }
+        cleanExtraFlags(["--width", "--height", "--hidpi", "--no-client-resolution"])
+    }
+
+    func setCustomCaptureSize(_ value: String) {
+        customCaptureSelected = true
+        draft["CAPTURE_SIZE"] = value.trimmingCharacters(in: .whitespaces).lowercased()
+    }
+
+    private static func validCaptureSize(_ value: String) -> Bool {
+        let parts = value.lowercased().split(separator: "x", omittingEmptySubsequences: false)
+        guard parts.count == 2, let width = Int(parts[0]), let height = Int(parts[1]) else { return false }
+        return (200...8192).contains(width) && (200...8192).contains(height)
+            && width % 2 == 0 && height % 2 == 0
+    }
+
+    private func cleanExtraFlags(_ flags: [String]) {
+        let original = string("EXTRA_FLAGS")
+        let cleaned = flags.reduce(original) { Self.strippingFlag($1, from: $0) }
+        if cleaned != original { draft["EXTRA_FLAGS"] = cleaned }
+    }
+
+    var savedCaptureSummary: String {
+        if saved["VIRTUAL_DISPLAY"] == "1" { return "Virtual display (see Display settings)" }
+        let size = saved["CAPTURE_SIZE"] ?? ""
+        return !size.isEmpty ? size : saved["HIDPI"] == "1" ? "Native Retina" : "Automatic / client size"
+    }
+    var savedFlushSummary: String {
+        let value = saved["FLUSH_INTERVAL_MS"]
+            ?? Self.extraFlagValue("--flush-interval-ms", in: saved["EXTRA_FLAGS"] ?? "") ?? ""
+        return value.isEmpty ? "Stable (capture cadence)" : "Fast flush · \(value) ms"
     }
 
     // MARK: - Primary-screen mode

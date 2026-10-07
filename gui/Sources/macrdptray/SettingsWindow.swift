@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Network
 
 // The tabbed Settings window opened by "Show macrdp Controller…". A SwiftUI view hosted
 // in a plain NSWindow (the status-bar item stays AppKit). While the window is
@@ -15,9 +16,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.model = SettingsModel(controller: controller)
         self.onClose = onClose
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 700),
+            contentRect: NSRect(x: 0, y: 0, width: 820, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
+        window.minSize = NSSize(width: 740, height: 650)
         window.title = "macrdp Controller Settings"
         window.contentViewController = NSHostingController(rootView: SettingsView(model: model))
         window.isReleasedWhenClosed = false
@@ -362,13 +364,53 @@ private struct VideoTab: View {
                     + "clean link it stays at the ceiling. H.264 only.")
                     .font(.caption).foregroundColor(.secondary)
             }
-            Section {
-                Toggle("HiDPI capture (Retina pixels)", isOn: model.boolBinding("HIDPI"))
-                Text("Captures the primary display at backing (Retina) resolution — crisper, ~4× the "
-                    + "pixels. Best with H.264 and a fast client; mstsc can feel laggy at HiDPI.")
+            Section("Capture resolution") {
+                Picker("Physical screen", selection: Binding(
+                    get: { model.captureResolutionChoice },
+                    set: { model.setCaptureResolutionChoice($0) })) {
+                    Text("Automatic — follow client").tag("auto")
+                    Text("Native Retina").tag("hidpi")
+                    ForEach(SettingsModel.capturePresets, id: \.self) { size in
+                        Text(size.replacingOccurrences(of: "x", with: " × ")).tag(size)
+                    }
+                    Text("Custom…").tag("custom")
+                }
+                .disabled(model.bool("VIRTUAL_DISPLAY"))
+                if model.captureResolutionChoice == "custom" {
+                    TextField("Width × height", text: Binding(
+                        get: { model.string("CAPTURE_SIZE") },
+                        set: { model.setCustomCaptureSize($0) }), prompt: Text("2560x1600"))
+                        .disabled(model.bool("VIRTUAL_DISPLAY"))
+                }
+                Text(model.bool("VIRTUAL_DISPLAY")
+                    ? "Virtual-display resolution is configured in Display. Your physical-screen selection is retained."
+                    : "1080p is the tested starting point for typing. Higher resolutions sharpen detail but increase load. Fixed sizes stay fixed when the client window changes.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Experimental") {
+                Toggle("Fast flush (optional)", isOn: Binding(
+                    get: { model.fastFlushEnabled },
+                    set: { model.setFastFlushEnabled($0) }))
+                    .disabled(!model.bool("ENABLE_H264"))
+                if model.fastFlushEnabled {
+                    TextField("Interval (ms)", text: Binding(
+                        get: { model.fastFlushInterval },
+                        set: { model.setFastFlushInterval($0) }), prompt: Text("10"))
+                        .disabled(!model.bool("ENABLE_H264"))
+                    HStack {
+                        Text("Try:").foregroundColor(.secondary)
+                        ForEach([8, 10, 12, 16], id: \.self) { interval in
+                            Button("\(interval) ms") { model.setFastFlushInterval(String(interval)) }
+                                .controlSize(.small)
+                                .disabled(!model.bool("ENABLE_H264"))
+                        }
+                    }
+                    Text("8–1000 ms. Lower values send the same trailing pictures closer together; capture FPS and bitrate stay the same.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                Text("Off by default. May make typing feel faster, but can increase image artifacts. "
+                    + "Turn off to restore stable video. Apply restarts a running server.")
+                    .font(.caption).foregroundColor(.secondary)
                 Toggle("AVC444 diagnostics", isOn: model.boolBinding("AVC444"))
                     .disabled(!model.bool("ENABLE_H264"))
                 Text("Known issue: tested mstsc clients render severe gray/pink color corruption. "
@@ -620,6 +662,9 @@ struct ConnectionInfo {
 
 /// Live H.264 telemetry from the server's opt-in loopback stats endpoint.
 struct LiveStats {
+    let processId: Int
+    let width: Int
+    let height: Int
     let bitrateBps: Int
     let ceilingBps: Int
     let rttMs: Int
@@ -634,6 +679,7 @@ private struct StatusView: View {
     @State private var stats: ServerStats = .stopped
     @State private var conn: ConnectionInfo = .none
     @State private var live: LiveStats?
+    private var externalServer: Bool { !stats.running && (live?.processId ?? 0) > 0 }
     @State private var connectTarget = "—"
     @State private var copiedAddress = false
     // Only ticks while this pane is on screen (subscription cancels on disappear).
@@ -647,6 +693,13 @@ private struct StatusView: View {
                         ? (stats.running ? "Running (pid \(stats.pid))" : "Running")
                         : "Stopped"))
                 row("Profile", model.appliedProfile?.title ?? "Custom")
+                row("Saved capture", model.savedCaptureSummary)
+                row("Saved flush", model.savedFlushSummary)
+                if externalServer, let pid = live?.processId {
+                    Label("Terminal server detected (pid \(pid))", systemImage: "terminal")
+                    Text("These controls manage the installed server. Stop the terminal test before starting it here. Live video statistics below belong to the terminal server.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
                 HStack {
                     Text("Connect to")
                     Spacer()
@@ -670,7 +723,7 @@ private struct StatusView: View {
                     Button(model.serverRunning ? "Restart Server" : "Start Server") {
                         model.beginServerAction(model.serverRunning ? .restart : .start)
                     }
-                    .disabled(model.serverBusy || !model.serverStatusKnown)
+                    .disabled(model.serverBusy || !model.serverStatusKnown || externalServer)
                     if model.serverRunning {
                         Button("Stop Server") {
                             model.beginServerAction(.stop)
@@ -679,7 +732,7 @@ private struct StatusView: View {
                     }
                     Spacer()
                     Button("Repair Installation") { model.beginServerAction(.repair) }
-                        .disabled(model.serverBusy || !model.serverStatusKnown)
+                        .disabled(model.serverBusy || !model.serverStatusKnown || externalServer)
                         .help("Rebuild the LaunchAgent with the current macrdp.app path, then start it")
                 }
                 if model.serverBusy {
@@ -720,11 +773,12 @@ private struct StatusView: View {
                     }
                 }
             }
-            if conn.connected {
-                Section("Video (H.264)") {
+            if conn.connected || externalServer {
+                Section("Video telemetry") {
                     if let l = live {
+                        if l.width > 0 && l.height > 0 { row("Session size", "\(l.width) × \(l.height)") }
                         row("Bitrate", bitrateText(l))
-                        row("Frame rate", "\(l.fps) fps")
+                        row("Capture FPS limit", "\(l.fps) fps")
                         if l.rttMs > 0 { row("Link RTT", "\(l.rttMs) ms") }
                         if l.adaptive { row("Standing queue", "\(l.queueMs) ms") }
                         row("Frames sent", "\(l.frames)")
@@ -749,7 +803,7 @@ private struct StatusView: View {
         DispatchQueue.global(qos: .utility).async {
             let s = controller.serverStats()
             let c = controller.currentConnection()
-            let l = c.connected ? controller.liveStats() : nil
+            let l = (c.connected || !s.running) ? controller.liveStats() : nil
             let target = controller.connectionTarget()
             DispatchQueue.main.async {
                 stats = s
@@ -794,14 +848,21 @@ extension AppController {
     /// the active default-route interface so the UI shows a useful LAN address
     /// instead of the non-connectable 0.0.0.0 wildcard.
     func connectionTarget() -> String {
-        let bind = readConfig()["BIND"] ?? "127.0.0.1:3390"
+        let config = readConfig()
+        let bind = config["BIND"] ?? "127.0.0.1:3390"
         let port = bind.split(separator: ":").last.map(String.init) ?? "3390"
         guard bind.hasPrefix("0.0.0.0:") else { return bind }
-        return "\(localLANAddress() ?? "<Mac LAN IP>"):\(port)"
+        // Prefer the interface actually routed to an allowed Windows client;
+        // the internet default route may be on another LAN or a VPN.
+        let clients = (config["ALLOW_IP"] ?? "").split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { IPv4Address($0) != nil }
+        let preferred = clients.lazy.compactMap { self.localLANAddress(to: $0) }.first
+        return "\(preferred ?? localLANAddress() ?? "<Mac LAN IP>"):\(port)"
     }
 
-    private func localLANAddress() -> String? {
-        let route = run("/sbin/route", ["-n", "get", "default"])
+    private func localLANAddress(to client: String = "default") -> String? {
+        let route = run("/sbin/route", ["-n", "get", client])
         guard route.code == 0 else { return nil }
         let interface = route.stdout
             .split(separator: "\n")
@@ -872,6 +933,7 @@ extension AppController {
         func int(_ k: String) -> Int { (o[k] as? NSNumber)?.intValue ?? 0 }
         func bool(_ k: String) -> Bool { (o[k] as? NSNumber)?.boolValue ?? false }
         return LiveStats(
+            processId: int("process_id"), width: int("width"), height: int("height"),
             bitrateBps: int("bitrate_bps"), ceilingBps: int("ceiling_bps"),
             rttMs: int("rtt_ms"), queueMs: int("queue_delay_ms"),
             fps: int("fps"), frames: int("frames_sent"), adaptive: bool("adaptive"))

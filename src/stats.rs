@@ -53,11 +53,21 @@ pub struct SessionStats {
     pub frames_sent: AtomicU64,
     pub adaptive: AtomicBool,
     pub aac: AtomicBool,
+    // Process-lifetime diagnostic counters; no input text or pixel data.
+    pub keyboard_events: AtomicU64,
+    pub capture_samples: AtomicU64,
+    pub capture_content: AtomicU64,
+    pub capture_idle: AtomicU64,
+    pub encode_submitted: AtomicU64,
+    pub encode_deferred: AtomicU64,
+    pub encoded_pictures: AtomicU64,
+    pub encode_output_errors: AtomicU64,
+    pub transport_retired: Arc<AtomicU64>,
 }
 
 impl SessionStats {
     fn to_json(&self) -> String {
-        format!(
+        let mut json = format!(
             concat!(
                 "{{\"connected\":{},\"width\":{},\"height\":{},\"bitrate_bps\":{},",
                 "\"ceiling_bps\":{},\"rtt_ms\":{},\"queue_delay_ms\":{},\"fps\":{},",
@@ -74,7 +84,50 @@ impl SessionStats {
             self.frames_sent.load(Ordering::Relaxed),
             self.adaptive.load(Ordering::Relaxed),
             self.aac.load(Ordering::Relaxed),
-        )
+        );
+        json.pop(); // Append fields while preserving the existing GUI schema.
+        json.push_str(&format!(
+            ",\"keyboard_events\":{}",
+            self.keyboard_events.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"capture_samples\":{}",
+            self.capture_samples.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"capture_content\":{}",
+            self.capture_content.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"capture_idle\":{}",
+            self.capture_idle.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encode_submitted\":{}",
+            self.encode_submitted.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encode_deferred\":{}",
+            self.encode_deferred.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encoded_pictures\":{}",
+            self.encoded_pictures.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encode_output_errors\":{}",
+            self.encode_output_errors.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"transport_retired\":{}",
+            self.transport_retired.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"diagnostics_version\":1,\"process_id\":{}",
+            std::process::id()
+        ));
+        json.push('}');
+        json
     }
 }
 
@@ -149,10 +202,17 @@ mod tests {
         s.height.store(1080, Ordering::Relaxed);
         s.bitrate_bps.store(4_000_000, Ordering::Relaxed);
         s.fps.store(60, Ordering::Relaxed);
+        s.keyboard_events.store(7, Ordering::Relaxed);
+        s.encoded_pictures.store(3, Ordering::Relaxed);
+        s.transport_retired.store(2, Ordering::Relaxed);
         let j = s.to_json();
         // Spot-check a few fields + that it's a single line with the expected keys.
         assert!(j.starts_with('{') && j.ends_with('}'));
         assert!(!j.contains('\n'));
+        assert!(j.contains("\"keyboard_events\":7"));
+        assert!(j.contains("\"encoded_pictures\":3"));
+        assert!(j.contains("\"transport_retired\":2"));
+        assert!(j.contains("\"diagnostics_version\":1"));
         assert!(j.contains("\"connected\":true"));
         assert!(j.contains("\"width\":1920"));
         assert!(j.contains("\"bitrate_bps\":4000000"));

@@ -120,10 +120,16 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           to-front, scroll, app launch) and briefly after a click.
                           The periodic interval + flush-burst already cover this,
                           so enable it only if big updates lag. See [video.md](video.md).
---flush-frames N          Trailing frames re-sent after each change to drain
-                          mstsc's presentation buffer (default 4; only with
-                          --enable-h264). Stops the last keystroke before a pause
-                          lagging until the next keyframe. 0 disables. See [video.md](video.md).
+--flush-frames N          Trailing pictures at frame cadence after each change,
+                          and again after the 100 ms quiet-period IDR (default 4;
+                          only with --enable-h264). Helps drain presentation
+                          buffering without waiting for quiet first. 0 disables
+                          both bursts. See [video.md](video.md).
+--flush-interval-ms N     Experimental trailing-picture/retry interval, 8–1000 ms.
+                          Default unset: use the capture frame interval. Does not
+                          change capture FPS, frame budget, or the quiet IDR delay.
+                          Config key: FLUSH_INTERVAL_MS (empty restores stable cadence).
+                          Faster typing may come with transient image artifacts.
 --enable-aac              Compress system audio as AAC-LC over RDPSND
                           (WAVE_FORMAT_AAC_MS) instead of raw PCM — ~11x less
                           audio bandwidth. Clients that don't decode AAC fall
@@ -471,3 +477,25 @@ Both restore the original layout when the last client disconnects, and both auto
 # Use the eager Windows→Mac file paste path (default is lazy / on-demand).
 ./macrdp --no-lazy-paste
 ```
+
+## Controller video controls
+
+The Stable profile uses the Windows-tested 1920×1080 AVC420 settings: 60 FPS,
+25 Mbps adaptive bitrate, TCP, one frame in flight, two trailing pictures, and
+fast flush off. Selecting a profile stages changes; Apply saves and restarts a
+running managed server once. Existing config is preserved until Apply.
+
+Video → Capture resolution controls the physical-screen capture via
+`CAPTURE_SIZE=WIDTHxHEIGHT`. Presets cover 720p through 4K, with a custom field.
+Dimensions must be even and within 200–8192. Empty restores automatic sizing
+and removes old width/height pins from EXTRA_FLAGS. Virtual displays retain
+their independent VD_WIDTH/VD_HEIGHT and ignore CAPTURE_SIZE.
+
+Fast flush is optional. Its interval accepts 8–1000 ms, with quick choices at
+8, 10, 12, and 16 ms; enabling a fresh toggle starts at 10 ms. The tested client
+felt faster at 8 ms but sometimes showed image artifacts. Disabling the toggle
+restores capture cadence. Normal profiles also turn the experiment off.
+
+Status distinguishes saved settings from the live session size and the
+configured capture FPS limit. A separate terminal test detected via diagnostics
+is shown as external; Start/Repair will not compete with that server.

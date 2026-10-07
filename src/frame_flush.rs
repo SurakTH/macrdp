@@ -5,32 +5,29 @@ use std::time::{Duration, Instant};
 pub(crate) struct FrameFlush {
     remaining: u32,
     next: Option<Instant>,
-    refresh_pending: bool,
+    refresh_at: Option<Instant>,
+    trailing_after_refresh: u32,
 }
 
 impl FrameFlush {
     pub(crate) fn arm(&mut self, count: u32, submitted: bool, now: Instant, interval: Duration) {
-        // A quiet-period IDR refreshes small changes independently of the
-        // preceding prediction chain. Keep all requested trailing pictures
-        // AFTER that refresh to drain the client's presentation queue.
-        // With trailing refresh disabled, a deferred real capture still needs
-        // one retry: an explicit zero must not discard the final keystroke.
-        self.refresh_pending = count > 0;
+        // Start ordinary trailing pictures at frame cadence. Waiting for the
+        // quiet-period IDR first leaves sparse typing in the client's
+        // presentation buffer for at least 100 ms.
+        // Keep the independent IDR and its own trailing pictures after quiet;
+        // continuous content rearms it, so motion doesn't force an IDR per tick.
+        self.trailing_after_refresh = count;
+        self.refresh_at = (count > 0).then_some(now + interval.max(Duration::from_millis(100)));
         self.remaining = if count > 0 {
-            count.saturating_add(1)
+            count
         } else {
             u32::from(!submitted)
         };
-        let delay = if self.refresh_pending {
-            interval.max(Duration::from_millis(100))
-        } else {
-            interval
-        };
-        self.next = (self.remaining > 0).then_some(now + delay);
+        self.next = (self.remaining > 0).then_some(now + interval);
     }
 
     pub(crate) fn force_keyframe(&self) -> bool {
-        self.refresh_pending
+        self.refresh_at.is_some() && self.remaining == 0
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -39,10 +36,23 @@ impl FrameFlush {
 
     pub(crate) fn attempted(&mut self, submitted: bool, now: Instant, interval: Duration) {
         if submitted {
-            self.refresh_pending = false;
-            self.remaining = self.remaining.saturating_sub(1);
+            if self.remaining > 0 {
+                self.remaining -= 1;
+            } else if self.refresh_at.take().is_some() {
+                self.remaining = self.trailing_after_refresh;
+            }
         }
-        self.next = (self.remaining > 0).then_some(now + interval);
+        self.next = if self.remaining > 0 {
+            Some(now + interval)
+        } else {
+            self.refresh_at.map(|deadline| {
+                if submitted {
+                    deadline.max(now)
+                } else {
+                    now + interval
+                }
+            })
+        };
     }
 
     pub(crate) fn clear(&mut self) {
@@ -57,45 +67,80 @@ mod tests {
     const QUIET: Duration = Duration::from_millis(100);
 
     #[test]
-    fn typing_ls_then_stopping_refreshes_latest_frame_before_trailing_frames() {
+    fn sparse_typing_gets_immediate_trailing_pictures_before_quiet_refresh() {
         let now = Instant::now();
         let mut flush = FrameFlush::default();
         flush.arm(2, true, now, INTERVAL); // l
         flush.arm(2, true, now + INTERVAL, INTERVAL); // ls supersedes l
-        assert_eq!(flush.deadline(), Some(now + INTERVAL + QUIET));
+        let last_change = now + INTERVAL;
+        // Push the latest capture through presentation buffering without first
+        // waiting 100 ms or forcing a keyframe for every keystroke.
+        for n in 1..=2 {
+            assert_eq!(flush.deadline(), Some(last_change + INTERVAL * n));
+            assert!(!flush.force_keyframe());
+            flush.attempted(true, last_change + INTERVAL * n, INTERVAL);
+        }
+        assert_eq!(flush.deadline(), Some(last_change + QUIET));
         assert!(flush.force_keyframe());
-        flush.attempted(true, now + INTERVAL + QUIET, INTERVAL);
-        assert!(!flush.force_keyframe());
-        for _ in 0..2 {
-            assert!(flush.deadline().is_some());
-            flush.attempted(true, now + QUIET, INTERVAL);
+        flush.attempted(true, last_change + QUIET, INTERVAL);
+        for n in 1..=2 {
+            assert_eq!(flush.deadline(), Some(last_change + QUIET + INTERVAL * n));
+            assert!(!flush.force_keyframe());
+            flush.attempted(true, last_change + QUIET + INTERVAL * n, INTERVAL);
         }
         assert!(flush.deadline().is_none());
     }
 
     #[test]
-    fn backpressure_does_not_consume_refresh_or_trailing_budget() {
+    fn backpressure_preserves_both_bursts_and_retries_quiet_refresh() {
         let now = Instant::now();
         let mut flush = FrameFlush::default();
         flush.arm(2, false, now, INTERVAL);
-        for _ in 0..20 {
-            flush.attempted(false, now, INTERVAL);
-            assert!(flush.force_keyframe());
+        for n in 1..=20 {
+            flush.attempted(false, now + INTERVAL * n, INTERVAL);
+            assert!(!flush.force_keyframe());
         }
-        for _ in 0..3 {
-            assert!(flush.deadline().is_some());
-            flush.attempted(true, now, INTERVAL);
+        let later = now + INTERVAL * 21;
+        flush.attempted(true, later, INTERVAL);
+        flush.attempted(true, later + INTERVAL, INTERVAL);
+        assert!(flush.force_keyframe());
+        assert_eq!(flush.deadline(), Some(later + INTERVAL));
+        flush.attempted(false, later + INTERVAL, INTERVAL);
+        assert!(flush.force_keyframe());
+        assert_eq!(flush.deadline(), Some(later + INTERVAL * 2));
+        for n in 2..=4 {
+            flush.attempted(true, later + INTERVAL * n, INTERVAL);
         }
         assert!(flush.deadline().is_none());
     }
 
     #[test]
-    fn idle_samples_do_not_postpone_refresh_deadline() {
+    fn continuous_content_postpones_idr_without_postponing_early_trailing_frames() {
+        let now = Instant::now();
+        let mut flush = FrameFlush::default();
+        for n in 0..100 {
+            let change = now + INTERVAL * n;
+            flush.arm(2, true, change, INTERVAL);
+            assert_eq!(flush.deadline(), Some(change + INTERVAL));
+            assert!(!flush.force_keyframe());
+            flush.attempted(true, change + INTERVAL, INTERVAL);
+            assert!(!flush.force_keyframe());
+        }
+    }
+
+    #[test]
+    fn idle_samples_do_not_postpone_either_deadline() {
         let now = Instant::now();
         let mut flush = FrameFlush::default();
         flush.arm(2, true, now, INTERVAL);
         for _ in 0..100 {
+            assert_eq!(flush.deadline(), Some(now + INTERVAL));
+        }
+        flush.attempted(true, now + INTERVAL, INTERVAL);
+        flush.attempted(true, now + INTERVAL * 2, INTERVAL);
+        for _ in 0..100 {
             assert_eq!(flush.deadline(), Some(now + QUIET));
+            assert!(flush.force_keyframe());
         }
     }
 
@@ -115,10 +160,33 @@ mod tests {
     }
 
     #[test]
+    fn fast_burst_keeps_the_quiet_idr_delay_and_the_same_frame_budget() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(8);
+        let mut flush = FrameFlush::default();
+        flush.arm(2, true, now, interval);
+        for n in 1..=2 {
+            assert_eq!(flush.deadline(), Some(now + interval * n));
+            assert!(!flush.force_keyframe());
+            flush.attempted(true, now + interval * n, interval);
+        }
+        assert_eq!(flush.deadline(), Some(now + QUIET));
+        assert!(flush.force_keyframe());
+        flush.attempted(true, now + QUIET, interval);
+        for n in 1..=2 {
+            assert_eq!(flush.deadline(), Some(now + QUIET + interval * n));
+            assert!(!flush.force_keyframe());
+            flush.attempted(true, now + QUIET + interval * n, interval);
+        }
+        assert!(flush.deadline().is_none());
+    }
+
+    #[test]
     fn resize_or_suppression_cancels_refresh() {
         let mut flush = FrameFlush::default();
         flush.arm(4, true, Instant::now(), INTERVAL);
         flush.clear();
+        flush.attempted(false, Instant::now(), INTERVAL);
         assert!(flush.deadline().is_none());
         assert!(!flush.force_keyframe());
     }

@@ -22,7 +22,8 @@ let package = Package(
     name: "macrdptray",
     platforms: [.macOS(.v13)],
     targets: [
-        .target(name: "ControllerCore", path: "Sources/ControllerCore"),
+        .target(name: "ControllerCore", path: "Sources/ControllerCore",
+                linkerSettings: [.linkedFramework("Security")]),
         .executableTarget(
             name: "macrdptray",
             dependencies: ["ControllerCore"],

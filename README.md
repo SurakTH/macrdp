@@ -1,5 +1,6 @@
-# macrdp
+# macrdp Surak
 
+[![Fork release](https://img.shields.io/github/v/release/SurakTH/macrdp?include_prereleases&label=fork%20release)](https://github.com/SurakTH/macrdp/releases)
 [![Upstream release](https://img.shields.io/github/v/release/clintcan/macrdp?sort=semver&label=upstream%20release)](https://github.com/clintcan/macrdp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-buy%20me%20a%20coffee-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/clintcan)
@@ -16,7 +17,16 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-v0 — daily-driver usable on a trusted LAN, and usable **over the internet** (VPN / ZeroTier / high-latency links, including mobile). **Latest upstream release: [v0.9.6](https://github.com/clintcan/macrdp/releases/latest)** — *bug-fix patch* (both fixes @antonmos): corrects a **scroll-down regression** from v0.9.5 (a vendored wheel-decode compensation double-corrected once the pin bump moved past upstream's own fix — every downward scroll inflated ~255× while up stayed correct, #179) and an **unauthenticated remote DoS** latent since v0.9.3 (a single silent TCP connection could wedge the second-client-preemption accept loop — health-watchdog-invisible — now bounded; #180 also fixes two more preemption correctness bugs). Builds on **v0.9.5** (*maintenance*: the IronRDP dependency pin was bumped `879ffed8` → `a5d1c682` (133 upstream commits) and vendored divergence shrank — two vendored forks retired, one divergence harvested; no user-facing change). Builds on **v0.9.4** (*security hotfix*: an unauthenticated remote client could wedge the **entire server** with a single malformed 2-byte frame — a pre-TLS 100%-CPU spin in the IronRDP framing reader that both the auth-guard and the health-check watchdog miss; now cleanly rejected instead of spinning, macrdp's upstream PR #1556). Builds on **v0.9.3** (*storm-guard fix + the connection/input batch*): the mstsc/Windows-App reconnect-blank drop loop can no longer run away — the reconnect-storm guard's counter now resets only on a genuinely **established** (sustained) session, so a brief-present-then-blank counts toward the cap and the loop bounds/trips instead of cycling forever (live-verified over ZeroTier). Ships with four merged contributions (@antonmos): a second client now **takes over** the live session (full-auth-gated) instead of hanging (#174), a blank-recovery heal-confirmation deadline (#175), relative-mouse + edge-clamp input fixes (#176), and a clipboard pre-connect-sync fix (#173). The default runtime path is unchanged. Builds on **v0.9.2** (*blank-recovery clean-presentation latch*) and **v0.9.1** (*the lockable-headless release*: the opt-in **`--shield-primary`** headless blanking mode that keeps the Mac lockable, client-resolution auto-adopt on `--virtual-display`, and a `--detach-primary` launchd-restart stopgap for the macOS-26 panel-re-enable bug) and **v0.9.0** (*the webcam release*: a client webcam presents as a **real macOS camera** via `--enable-camera-redirection` — as far as is known the first known open-source RDP _server_ to do so; H.264 over MS-RDPECAM → VideoToolbox decode → a CoreMediaIO Camera system extension, live-verified at 1080p/~30 fps), v0.8.40 (the *headless-laptop release*), and v0.8.39 (the *smooth-resize release*).
+**Fork release: v0.96.1**, based on upstream **v0.9.6**. This fork uses its
+own version sequence; 0.96.1 does not imply that upstream v0.9.7–v0.9.11
+changes have been merged. Upstream retains its independent release line.
+
+This pre-release includes server video scheduling and encoder recovery fixes,
+Controller resolution and flush controls, safer Keychain handling, and drive /
+smart-card hardening. Start with **Connection → Stable** for the tested 1080p
+AVC420 settings. Fast flush is optional and can increase image artifacts;
+AVC444 remains a diagnostics mode. See the
+[v0.96.1 release notes](docs/releases/v0.96.1.md) for validation and upgrade details.
 
 Full per-release notes (what shipped, what was verified live, and the war stories): **[docs/release-history.md](docs/release-history.md)**.
 
@@ -29,6 +39,11 @@ Short version: **a polished v0 daily-driver for trusted LANs and your own VPN �
 **Know before relying on it:** single session/single user; no multi-monitor or printer redirection; DRM video and password-manager windows capture black (macOS policy, not fixable); synthetic input can't reach the login window/secure fields (same); reconnecting *mstsc* can briefly show a blank screen (client quirk — the server now auto-heals it in ~4 s by reactivating the RDP core in place, no user action); the UDP paths are opt-in and newer than the TCP core; it's a solo v0 on vendored [IronRDP] forks, no SLA. **Never expose any RDP server on a raw public IP — reach it over a VPN or RD Gateway.**
 
 Details and the path to closing the gaps: [docs/production-readiness-roadmap.md](docs/production-readiness-roadmap.md).
+
+Rust is pinned to **1.95.0**, matching CI, in `rust-toolchain.toml`. When using
+Homebrew Rust without rustup, select that version explicitly for reproducible
+builds. The October hardening changes require reinstalling the smart-card IFD
+handler together with the server; see [smart-card setup](docs/smart-card-redirection.md#ipc-authentication-and-upgrading).
 
 ## Quick start
 

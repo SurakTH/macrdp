@@ -1,6 +1,7 @@
 import AppKit
 import ControllerCore
 import Darwin
+import Security
 import UniformTypeIdentifiers
 
 enum ServerAction: Equatable {
@@ -404,8 +405,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         print("installed: \(plistURL.path) -> \(serverApp.path)")
         print(result.message)
         if !hasKeychainPassword() {
-            print("note: Keychain password not set — store it with:")
-            print("  security add-generic-password -U -s macrdp -a \(NSUserName()) -w '<password>'")
+            print("note: Keychain password not set — open macrdp Controller and choose Set Password…")
         }
         return 0
     }
@@ -673,8 +673,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Keychain password onboarding
 
     /// The server (run headless by launchd) reads its account password from the
-    /// Keychain via the `security` CLI, so we write it the same way — keeping the
-    /// item's access context as /usr/bin/security so no read-time prompt appears.
+    /// Keychain via the `security` CLI. Native writes explicitly trust that
+    /// reader so the headless server keeps working without an access prompt.
     func hasKeychainPassword() -> Bool {
         run("/usr/bin/security", ["find-generic-password", "-s", "macrdp", "-a", NSUserName()]).code == 0
     }
@@ -694,10 +694,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.window.initialFirstResponder = field
         NSApp.activate(ignoringOtherApps: true)
         guard a.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return false }
-        let r = run("/usr/bin/security",
-                    ["add-generic-password", "-U", "-s", "macrdp", "-a", NSUserName(),
-                     "-w", field.stringValue])
-        if r.code != 0 {
+        let status = PasswordKeychain.save(account: NSUserName(), password: field.stringValue)
+        field.stringValue = ""
+        if status != errSecSuccess {
             alert(style: .critical, "Couldn't save password", "Keychain returned an error.")
             return false
         }

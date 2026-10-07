@@ -111,13 +111,124 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(model.bindDisplay, "0.0.0.0:4400")
     }
 
+    func testFastFlushIsIndependentAndProfilesRestoreStableCadence() {
+        let initial = PerformanceProfile.ultimate.settings
+        let model = SettingsModel(controller: controller, initialConfig: initial)
+        XCTAssertFalse(model.fastFlushEnabled)
+        model.setFastFlushEnabled(true)
+        XCTAssertTrue(model.fastFlushEnabled)
+        XCTAssertEqual(model.draft["FLUSH_INTERVAL_MS"], "10")
+        for (key, value) in initial where key != "FLUSH_INTERVAL_MS" {
+            XCTAssertEqual(model.draft[key], value)
+        }
+        model.setFastFlushEnabled(false)
+        XCTAssertEqual(model.draft["FLUSH_INTERVAL_MS"], "")
+        for profile in PerformanceProfile.allCases {
+            model.setFastFlushEnabled(true)
+            model.applyProfile(profile)
+            XCTAssertFalse(model.fastFlushEnabled)
+            XCTAssertEqual(model.selectedProfile, profile)
+        }
+    }
+
+    func testFastFlushReadsLegacyValueAndClearsItAuthoritatively() {
+        let model = SettingsModel(controller: controller, initialConfig: [
+            "BIND": "127.0.0.1:3390", "ENABLE_H264": "1",
+            "EXTRA_FLAGS": "--flush-interval-ms=12 --fps 60"])
+        XCTAssertTrue(model.fastFlushEnabled)
+        XCTAssertEqual(model.fastFlushInterval, "12")
+        model.setFastFlushEnabled(false)
+        XCTAssertFalse(model.fastFlushEnabled)
+        XCTAssertEqual(model.draft["FLUSH_INTERVAL_MS"], "")
+        XCTAssertEqual(model.draft["EXTRA_FLAGS"], "--fps 60")
+        model.revert()
+        XCTAssertEqual(model.fastFlushInterval, "12")
+        model.setFastFlushInterval("10")
+        XCTAssertEqual(model.fastFlushInterval, "10")
+    }
+
+    func testInvalidFlushValuesBlockApplyWithoutSavingOrRestarting() {
+        var saves = 0
+        var restarts = 0
+        let model = SettingsModel(controller: controller,
+            initialConfig: ["BIND": "127.0.0.1:3390", "ENABLE_H264": "1"],
+            saveSettings: { _ in saves += 1 }, performAction: { _, _ in restarts += 1 })
+        model.updateServerRunning(true)
+        for value in ["", "7", "1001", "1.5", "bad"] {
+            model.setFastFlushInterval(value)
+            XCTAssertTrue(model.fastFlushEnabled) // editor stays visible while empty
+            XCTAssertNotNil(model.validationError)
+            model.apply()
+        }
+        XCTAssertEqual(saves, 0)
+        XCTAssertEqual(restarts, 0)
+        for value in ["8", "10", "1000"] {
+            model.setFastFlushInterval(value)
+            XCTAssertNil(model.validationError)
+        }
+    }
+
+    func testPhysicalCaptureSelectionClearsLegacyPinsAndRetainsNetwork() {
+        let model = SettingsModel(controller: controller, initialConfig: [
+            "BIND": "192.168.137.2:3390", "EXTRA_FLAGS": "--width=1920 --height 1080 --hidpi --no-client-resolution --fps 60"])
+        model.setCaptureResolutionChoice("2560x1440")
+        XCTAssertEqual(model.captureResolutionChoice, "2560x1440")
+        XCTAssertEqual(model.draft["CAPTURE_SIZE"], "2560x1440")
+        XCTAssertEqual(model.draft["HIDPI"], "0")
+        XCTAssertEqual(model.draft["EXTRA_FLAGS"], "--fps 60")
+        XCTAssertEqual(model.bindDisplay, "192.168.137.2:3390")
+        model.setCaptureResolutionChoice("hidpi")
+        XCTAssertEqual(model.draft["CAPTURE_SIZE"], "")
+        XCTAssertEqual(model.draft["HIDPI"], "1")
+        model.setCaptureResolutionChoice("auto")
+        XCTAssertEqual(model.captureResolutionChoice, "auto")
+    }
+
+    func testCustomResolutionValidationAndVirtualDisplayIndependence() {
+        let model = SettingsModel(controller: controller, initialConfig: ["BIND": "127.0.0.1:3390"])
+        model.setCaptureResolutionChoice("custom")
+        model.setCustomCaptureSize("")
+        XCTAssertEqual(model.captureResolutionChoice, "custom")
+        XCTAssertNotNil(model.validationError)
+        for size in ["bad", "199x1080", "8194x1080", "1919x1080"] {
+            model.setCustomCaptureSize(size)
+            XCTAssertNotNil(model.validationError)
+        }
+        model.setCustomCaptureSize("2560X1600")
+        XCTAssertNil(model.validationError)
+        XCTAssertEqual(model.draft["CAPTURE_SIZE"], "2560x1600")
+        model.setBool("VIRTUAL_DISPLAY", true)
+        model.setResolution("1920x1080")
+        XCTAssertEqual(model.draft["CAPTURE_SIZE"], "2560x1600")
+        XCTAssertEqual(model.draft["VD_WIDTH"], "1920")
+        model.revert()
+        XCTAssertEqual(model.captureResolutionChoice, "auto")
+    }
+
+    func testStableProfileIsTheAcceptedVideoSettingsWithFastFlushOff() {
+        let model = SettingsModel(controller: controller, initialConfig: ["BIND": "0.0.0.0:3390"])
+        model.setFastFlushInterval("8")
+        model.applyProfile(.stable)
+        XCTAssertEqual(model.selectedProfile, .stable)
+        XCTAssertEqual(model.draft["CAPTURE_SIZE"], "1920x1080")
+        XCTAssertEqual(model.frameRate, "60")
+        XCTAssertEqual(model.bitrateMbps, "25")
+        XCTAssertEqual(model.draft["FLUSH_FRAMES"], "2")
+        XCTAssertEqual(model.draft["H264_FRAMES_IN_FLIGHT"], "1")
+        XCTAssertEqual(model.draft["ENABLE_UDP_MULTITRANSPORT"], "0")
+        XCTAssertFalse(model.fastFlushEnabled)
+        XCTAssertEqual(model.bindDisplay, "0.0.0.0:3390")
+    }
+
     func testDisablingParentSettingsKeepsThemDisabled() {
         let model = SettingsModel(controller: controller, initialConfig: [:])
         model.setBool("ENABLE_UDP_MULTITRANSPORT", true)
         model.setBool("UDP_MIGRATE_EGFX", true)
         model.setBool("AVC444", true)
         XCTAssertTrue(model.bool("ENABLE_H264"))
+        model.setFastFlushInterval("7")
         model.setBool("ENABLE_H264", false)
+        XCTAssertFalse(model.fastFlushEnabled)
         XCTAssertFalse(model.bool("ENABLE_H264"))
         XCTAssertFalse(model.bool("UDP_MIGRATE_EGFX"))
         XCTAssertFalse(model.bool("AVC444"))

@@ -23,9 +23,9 @@
          the password from `security find-generic-password -s macrdp`. -->
 
     <key>StandardOutPath</key>
-    <string>/tmp/macrdp.out.log</string>
+    <string>HOME_PATH/Library/Logs/macrdp.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/macrdp.err.log</string>
+    <string>HOME_PATH/Library/Logs/macrdp.err.log</string>
 
     <!-- ProcessType=Interactive so it stays high-priority and isn't
          throttled like a background daemon. -->

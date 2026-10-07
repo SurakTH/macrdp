@@ -81,8 +81,8 @@ Then verify the reader registered with `system_profiler SPSmartCardsDataType`.
 > matching the bundle's VID/PID, so a headless server needs a USB device
 > permanently attached (any stick works as the trigger — pick it during install
 > or bind it with `IFD_VID`/`IFD_PID`); after installing, unplug/replug it so
-> `slotd` loads the driver. The handler talks to macrdp on loopback port 40242
-> (`MACRDP_SCARD_PORT`). No physical card needed to try it: create a Windows
+> `slotd` loads the driver. The handler talks to macrdp over a Unix socket
+> (`MACRDP_SCARD_PORT` selects its namespace; default 40242). No physical card needed to try it: create a Windows
 > **TPM virtual smart card** (`tpmvscmgr create …`) and redirect that.
 
 > **Reloading after an upgrade.** `slotd` keeps the loaded handler in memory for
@@ -94,3 +94,22 @@ Then verify the reader registered with `system_profiler SPSmartCardsDataType`.
 > `slotd` loads the new driver. (If you ever do it by hand, note that
 > `killall com.apple.ifdreader` won't match — the process name is truncated past
 > 15 chars; use `pkill -9 -f`.)
+
+## IPC authentication and upgrading
+
+The bridge uses `/private/tmp/macrdp-scard-40242/bridge.sock`, not a TCP
+listener. `MACRDP_SCARD_PORT` still selects the numeric namespace and must match
+in the server and driver. Commands are accepted only from kernel peer UID 0 or
+macOS's `_ctkd` system account. Ordinary user processes cannot submit APDUs.
+There are at most eight reader sessions, with a 30-second idle timeout and a
+five-second command deadline. An idle driver reconnects on its next operation.
+
+**Upgrade the server and reinstall the IFD handler together.** There is no
+unauthenticated TCP compatibility fallback. The installer records the serving
+user's UID in root-owned `/Library/Application Support/macrdp/ifd-server.uid` and restarts slotd.
+The driver validates that the socket directory and the server peer belong to
+that UID; it does not rely on `/dev/console`, whose ownership changes on logout.
+Run the installer from the account running macrdp (`SUDO_UID` is honored when
+invoked through sudo), then unplug/replug the trigger device as described above.
+Changing the serving account requires reinstalling the driver. Root or a
+compromised serving account remains outside the local isolation guarantee.

@@ -116,6 +116,14 @@ jobs:
           set -euo pipefail
           cargo clippy --locked --all-targets --target "${{ matrix.target }}" -- -D warnings
 
+      - name: Test server, smart-card handler and Controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --target "${{ matrix.target }}"
+          cargo test --locked --manifest-path ifd-handler/Cargo.toml
+          ( cd gui && swift test )
+
       - name: Build release binary
         shell: bash
         run: |
@@ -284,6 +292,12 @@ jobs:
         with:
           egress-policy: audit
 
+      - name: Checkout release notes
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -306,8 +320,11 @@ jobs:
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          draft: true                 # human reviews before publishing
-          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          # v0.96.1 publication was explicitly requested; other tags stay drafts.
+          draft: ${{ (inputs.tag || github.ref_name) != 'v0.96.1' }}
+          prerelease: ${{ (inputs.tag || github.ref_name) == 'v0.96.1' || contains(inputs.tag || github.ref_name, '-') }}
+          name: ${{ (inputs.tag || github.ref_name) == 'v0.96.1' && 'macrdp Surak v0.96.1' || (inputs.tag || github.ref_name) }}
+          body_path: ${{ (inputs.tag || github.ref_name) == 'v0.96.1' && 'docs/releases/v0.96.1.md' || '' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

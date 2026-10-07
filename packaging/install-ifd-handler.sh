@@ -59,7 +59,7 @@ fi
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Removing $DEST (admin required)"
-    run_admin "rm -rf '$DEST'; $RESTART_SLOTD"
+    run_admin "rm -rf '$DEST'; rm -f '/Library/Application Support/macrdp/ifd-server.uid'; $RESTART_SLOTD"
     echo "Removed. (slotd restarted; the reader is gone on its next load.)"
     exit 0
 fi
@@ -135,12 +135,17 @@ fi
 STAGE_DIR="$(mktemp -d)"
 STAGED="$STAGE_DIR/ifd-macrdp.bundle"
 cp -R "$SRC" "$STAGED"
+# Root-owned server identity is independent of /dev/console (which changes on
+# lock/logout). Keep it outside the signed bundle so its signature stays intact.
+SERVER_UID="${SUDO_UID:-$(id -u)}"
+[[ "$SERVER_UID" =~ ^[0-9]+$ ]] || { echo "Invalid server UID" >&2; exit 1; }
+printf '%s\n' "$SERVER_UID" > "$STAGE_DIR/server-uid"
 
 # 5. Install (privileged): copy in, fix ownership, restart slotd. The copy/chown
 #    are &&-guarded (a failure aborts and surfaces via osascript's nonzero exit —
 #    NOT masked); only the slotd restart is best-effort.
 echo "==> Installing to $DEST (admin required)"
-run_admin "mkdir -p '$DRIVERS' && rm -rf '$DEST' && cp -R '$STAGED' '$DEST' && chown -R root:wheel '$DEST' && $RESTART_SLOTD"
+run_admin "mkdir -p '$DRIVERS' && rm -rf '$DEST' && cp -R '$STAGED' '$DEST' && chown -R root:wheel '$DEST' && mkdir -p '/Library/Application Support/macrdp' && chown root:wheel '/Library/Application Support/macrdp' && chmod 755 '/Library/Application Support/macrdp' && rm -f '/Library/Application Support/macrdp/ifd-server.uid' && cp '$STAGE_DIR/server-uid' '/Library/Application Support/macrdp/ifd-server.uid' && chown root:wheel '/Library/Application Support/macrdp/ifd-server.uid' && chmod 644 '/Library/Application Support/macrdp/ifd-server.uid' && $RESTART_SLOTD"
 rm -rf "$STAGE_DIR"
 
 # Verify the copy actually landed (osascript can mask some failures).

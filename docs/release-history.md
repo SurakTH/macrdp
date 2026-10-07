@@ -4,7 +4,15 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
-## Unreleased — fork controller, optimized presets, keyboard shortcuts, and AVC444 diagnostics
+## v0.96.1 — Surak fork: video latency, Controller controls, and hardening
+
+Based on upstream v0.9.6, with an independent fork version sequence. This
+pre-release updates both server and Controller. See the
+[release notes](releases/v0.96.1.md) for new Stable and capture/flush controls,
+encoder recovery, drive/Keychain/smart-card hardening, upgrade requirements,
+and validation limits.
+
+### Earlier fork changes included in this release
 
 - **Controller lifecycle and upgrades are now self-healing.** Start compares
   the full LaunchAgent contract with the currently located `macrdp.app`; a stale
