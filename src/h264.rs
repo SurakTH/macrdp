@@ -24,8 +24,9 @@
 //!        `WireFormat`), then hands it to the matching AVC420 or AVC444
 //!        `GraphicsPipelineServer` send method (StartFrame / WireToSurface /
 //!        EndFrame), and ships the resulting
-//!        `DvcMessage`s through DRDYNVC via `ServerEvent::Egfx(SendMessages)`,
-//!        and bumps `shipped`.
+//!        `DvcMessage`s through DRDYNVC via a tracked ServerEvent. The event
+//!        loop bumps `shipped` AFTER transport dispatch, so queued frames and
+//!        a blocked socket write still occupy pipeline slots.
 //!
 //!   The EGFX send window is `u32::MAX` (see `GfxHandler::max_frames_in_flight`)
 //!   so the EGFX send methods NEVER drop an encoded frame — dropping one (a
@@ -63,14 +64,14 @@ use ironrdp_egfx::pdu::{
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{
-    EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
-    ServerEventSender,
+    EgfxFrameCompletion, EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle,
+    ServerEvent, ServerEventSender,
 };
 use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::videotoolbox::{Avc444Encoder, EncodedFrame, Encoder};
+use crate::videotoolbox::{Avc444Encoder, EncodeOutput, EncodedFrame, Encoder};
 
 /// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
 /// backpressure gate while the client's frame-ack lag is over the threshold.
@@ -79,6 +80,13 @@ use crate::videotoolbox::{Avc444Encoder, EncodedFrame, Encoder};
 /// full 60 fps so the client's decode queue drains net. See the gate in
 /// `submit_bgra` and `ConnectionContext::last_throttle_ship`.
 const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
+const TCP_THROTTLE_INTERVAL: Duration = Duration::from_millis(40);
+
+fn tcp_decode_backlog(unacknowledged: u64, queue_ms: f64, ack_age: Duration) -> bool {
+    // Require both outstanding frames and delay above the measured RTT floor.
+    // Ignore the last delay reading once the client stops producing fresh ACKs.
+    unacknowledged > 6 && queue_ms >= 80.0 && ack_age <= Duration::from_millis(250)
+}
 
 /// P3 cold-start guard: how long after the first frame-ack the adaptive controller
 /// ignores the ack-lag congestion signal. At connect the encoder ships an initial
@@ -196,6 +204,15 @@ impl ActiveEncoder {
     }
 }
 
+fn tracked_completion(counter: Arc<AtomicU64>, frames: u64) -> EgfxFrameCompletion {
+    let token = EgfxFrameCompletion::new(counter, frames);
+    if let Some(stats) = crate::stats::global() {
+        token.with_observer(stats.transport_retired.clone())
+    } else {
+        token
+    }
+}
+
 /// Per-connection state, shared between the `Gfx` factory/handle (capture
 /// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
 struct ConnectionContext {
@@ -234,8 +251,9 @@ struct ConnectionContext {
     egfx_declined: Arc<AtomicBool>,
     /// Drop-to-latest throttle counters for the push pipeline. `submitted` is
     /// bumped by `submit_bgra` (capture thread) per frame handed to VT;
-    /// `shipped` is bumped by the ship thread per frame pulled back out and
-    /// sent. `submitted - shipped` is how many frames are in the VT/ship
+    /// `shipped` is bumped only after transport dispatch completes (or the
+    /// batch is abandoned). `submitted - shipped` includes the event queue
+    /// and pending socket write as well as frames in the VT/ship
     /// pipeline; when it reaches `max_in_flight` the capture thread skips
     /// (drops to latest) — an ack-INDEPENDENT throttle, since clients commonly
     /// suspend frame acks (queue_depth=0xFFFFFFFF) which disables the EGFX
@@ -288,6 +306,7 @@ struct ConnectionContext {
     /// nanoseconds; never taken while holding another lock), read in
     /// `on_frame_ack` to time each frame's ship→ack round trip.
     ship_times: Arc<Mutex<Vec<(u64, Instant)>>>,
+    video_queued: Arc<AtomicBool>,
     /// Windowed-minimum ack RTT (two `RTT_MIN_WINDOW` buckets, so a route
     /// change re-baselines within ~2 windows). The minimum over the window is
     /// the link's base RTT including the empty-pipe server-side path;
@@ -1183,6 +1202,14 @@ fn recovery_config_from_env() -> (bool, RecoveryParams) {
     (enabled, params)
 }
 
+/// Whether EGFX consumed a capture and actually queued it for encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSubmission {
+    Inactive,
+    Deferred,
+    Submitted,
+}
+
 /// Cloneable factory + frame-submit handle. One clone is boxed into
 /// `RdpServer::builder().with_gfx_factory(...)`; another lives on the capture
 /// side as the `submit_bgra` entry point.
@@ -1232,6 +1259,7 @@ pub struct Gfx {
     /// that a healthy high-RTT link never trips it; low enough to cap the decode
     /// backlog so video degrades to choppy-but-live instead of freezing.
     max_frame_lag: u64,
+    tcp_video_backpressure: bool,
     /// EGFX-over-UDP → TCP watchdog. On by default (disable with
     /// `MACRDP_UDP_EGFX_WATCHDOG=0`); only ever acts while EGFX is on the RELIABLE
     /// UDP tunnel (`egfx_on_udp && !egfx_on_lossy`), so it's a no-op unless
@@ -1575,6 +1603,8 @@ impl Gfx {
             egfx_on_lossy,
             egfx_on_udp,
             max_frame_lag,
+            tcp_video_backpressure: std::env::var("MACRDP_TCP_VIDEO_BACKPRESSURE").as_deref()
+                == Ok("1"),
             watchdog_enabled,
             watchdog_wedge_timeout,
             watchdog_active_window,
@@ -1649,12 +1679,15 @@ impl Gfx {
     /// some clients (mstsc) only resolve cleanly at the next periodic IDR (the
     /// "takes a while to come to front" lag); a forced IDR lands them at once.
     ///
-    /// Returns `Ok(true)` when EGFX is the active display path (so the caller
-    /// should suppress legacy BitmapUpdates for this frame — even if this
-    /// particular frame was skipped for backpressure or isn't encoded yet).
-    /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
-    /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
-    pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
+    /// `Submitted` means queued for encoding; `Deferred` means EGFX owns the
+    /// display but skipped this capture. Only `Inactive` permits legacy bitmap
+    /// fallback. Trailing-frame callers must retry a deferred submission.
+    pub fn submit_bgra(
+        &self,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+    ) -> Result<FrameSubmission> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -1666,13 +1699,13 @@ impl Gfx {
         // `server_handle`, which is never taken while holding ctx — the ship/ack
         // lock-order invariant). The decision extracts what the action needs here.
         let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
-        let force_keyframe = {
+        {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
-                return Ok(false); // no active connection
+                return Ok(FrameSubmission::Inactive); // no active connection
             };
             if !ctx.is_ready {
-                return Ok(false); // channel not negotiated yet (or non-EGFX client)
+                return Ok(FrameSubmission::Inactive); // channel not negotiated yet (or non-EGFX client)
             }
             // Arm the keyframe BEFORE the throttle check so a large change that
             // lands on a dropped frame still forces the IDR on the next encoded
@@ -1948,7 +1981,10 @@ impl Gfx {
                     trace!(
                         "EGFX at bitrate floor + congested; dropping capture (frame-rate floor)"
                     );
-                    return Ok(true);
+                    if let Some(stats) = crate::stats::global() {
+                        stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(FrameSubmission::Deferred);
                 }
                 if at_floor && ctx.adaptive_congested {
                     ctx.last_floor_fps_pass = now;
@@ -1971,55 +2007,44 @@ impl Gfx {
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
                 );
-                return Ok(true); // still the active path; just dropped this frame
+                if let Some(stats) = crate::stats::global() {
+                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(FrameSubmission::Deferred); // still the active path; just dropped this frame
             }
-            // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
-            // socket backpressure to pace us to the client (unlike TCP), so without
-            // this the server floods frames and the client's DECODE queue runs away
-            // → frozen video while audio (on TCP) keeps playing. When the client's
-            // decode backlog (shipped − decoded, from FrameAcknowledge) exceeds the
-            // threshold, drop this capture so the client catches up — video degrades
-            // to choppy-but-live instead of freezing. Gated to the UDP tunnel
-            // (TCP push path stays byte-identical), to acks actually flowing (a
-            // suspended-ack client falls back to the submitted−shipped throttle
-            // above), and to having seen ≥1 ack (no cold-start false drop). Dropping
-            // before encode keeps the H.264 reference chain valid.
-            if self.egfx_on_udp.load(Ordering::Relaxed) && ctx.egfx_acks_seen && !ctx.acks_suspended
+            // Reduce work before encode when the client is behind. Keep
+            // sending at a limited cadence so the client can drain its decoder.
+            let on_udp = self.egfx_on_udp.load(Ordering::Relaxed);
+            if (on_udp || self.tcp_video_backpressure) && ctx.egfx_acks_seen && !ctx.acks_suspended
             {
                 let lag = ctx
                     .last_shipped_frame_id
                     .load(Ordering::Relaxed)
                     .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
-                if lag > self.max_frame_lag {
-                    // Client is behind. Drop MOST captures so it catches up — but
-                    // keep a low-rate trickle, never zero: mstsc only presents (and
-                    // thus frame-acks) an H.264 frame once a couple more arrive
-                    // behind it, so dropping to zero means it never acks the
-                    // in-flight frames, `lag` never falls back under the threshold,
-                    // and the video freezes PERMANENTLY (recovers only on
-                    // reconnect). The trickle keeps trailing frames flowing so the
-                    // presentation buffer drains and the window reopens. Dropping
-                    // before encode keeps the H.264 reference chain valid (the
-                    // encoder never sees the dropped frames, so the next encoded
-                    // frame is a valid P-frame from the client's last reference).
-                    let now = Instant::now();
-                    if now.duration_since(ctx.last_throttle_ship) < UDP_THROTTLE_FLOOR {
-                        trace!(
-                            lag,
-                            "EGFX-on-UDP lag high; dropping capture (trickle floor)"
-                        );
-                        return Ok(true);
+                let now = Instant::now();
+                let interval = if on_udp {
+                    (lag > self.max_frame_lag).then_some(UDP_THROTTLE_FLOOR)
+                } else {
+                    tcp_decode_backlog(lag, ctx.queue_delay_ms, now.duration_since(ctx.last_ack_at))
+                        .then_some(TCP_THROTTLE_INTERVAL)
+                };
+                if let Some(interval) = interval {
+                    if now.duration_since(ctx.last_throttle_ship) < interval {
+                        trace!(lag, on_udp, "EGFX ACK backlog; deferring capture");
+                        if let Some(stats) = crate::stats::global() {
+                            stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                            if !on_udp {
+                                stats
+                                    .encode_tcp_backpressure
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        return Ok(FrameSubmission::Deferred);
                     }
                     ctx.last_throttle_ship = now;
-                    trace!(
-                        lag,
-                        "EGFX-on-UDP lag high; letting a trickle frame through to drain client buffer"
-                    );
-                    // fall through: ship this one to keep the client presenting/acking
                 }
             }
-            std::mem::replace(&mut ctx.need_keyframe, false)
-        };
+        }
 
         // Run the armed recovery action now that ctx is released (lock order).
         // This capture is dropped either way: a remap re-arms `need_keyframe`,
@@ -2035,7 +2060,10 @@ impl Gfx {
             if let Err(e) = result {
                 warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
             }
-            return Ok(true);
+            if let Some(stats) = crate::stats::global() {
+                stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(FrameSubmission::Deferred);
         }
 
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
@@ -2043,18 +2071,24 @@ impl Gfx {
         {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
-                return Ok(true);
+                if let Some(stats) = crate::stats::global() {
+                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(FrameSubmission::Deferred);
             };
-            let force_keyframe =
-                force_keyframe || ctx.encoder_resync.swap(false, Ordering::Relaxed);
             // Congestion-responsive control (P1 bitrate + P2a IDR backoff): compute
             // the adjustments (mutates ctx adaptive state, may set need_keyframe)
             // BEFORE borrowing the encoder, then apply them live. No-op unless
             // adaptive is enabled AND EGFX is on a UDP tunnel.
             let adaptive = self.adaptive_bitrate_step(ctx);
             let Some(encoder) = ctx.encoder.as_mut() else {
-                return Ok(true);
+                if let Some(stats) = crate::stats::global() {
+                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(FrameSubmission::Deferred);
             };
+            let resync_requested = ctx.encoder_resync.swap(false, Ordering::Relaxed);
+            let force_keyframe = std::mem::take(&mut ctx.need_keyframe) || resync_requested;
             if let Some(bps) = adaptive.bitrate_bps {
                 if let Err(e) = encoder.set_bitrate(bps) {
                     trace!(error = ?e, bps, "adaptive set_bitrate failed");
@@ -2065,10 +2099,22 @@ impl Gfx {
                     trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
                 }
             }
-            encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            if let Err(error) = encoder.encode_bgra(bgra, stride, force_keyframe) {
+                // The EGFX channel still owns this surface. Let capture retry
+                // the retained image with a keyframe instead of sending a bitmap.
+                ctx.need_keyframe = true;
+                if let Some(stats) = crate::stats::global() {
+                    stats.encode_submit_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                warn!(%error, "EGFX encoder submission failed; retrying with a keyframe");
+                return Ok(FrameSubmission::Deferred);
+            }
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
+            if let Some(stats) = crate::stats::global() {
+                stats.encode_submitted.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        Ok(true)
+        Ok(FrameSubmission::Submitted)
     }
 
     /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
@@ -2321,27 +2367,62 @@ impl Gfx {
 
     /// Ship loop for the push pipeline: owns VideoToolbox's output receiver and
     /// ships each encoded frame the instant it arrives, fully decoupled from the
-    /// capture tick. Bumps `shipped` per frame so the capture thread's
-    /// drop-to-latest throttle can bound the pipeline depth. Exits when the
+    /// capture tick. Transfers completion tokens to the event loop so the
+    /// capture throttle includes queued and writing frames. Exits when the
     /// channel closes (encoder dropped on connection teardown).
-    fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
+    fn ship_loop(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodeOutput>,
+        shipped: Arc<AtomicU64>,
+        resync: Arc<AtomicBool>,
+    ) {
+        self.ship_loop_with_dispatch(rx, shipped, resync, |frames, completion| {
+            self.ship_frames(frames, completion)
+        });
+    }
+
+    fn ship_loop_with_dispatch(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodeOutput>,
+        shipped: Arc<AtomicU64>,
+        resync: Arc<AtomicBool>,
+        mut dispatch: impl FnMut(&mut Vec<EncodedFrame>, EgfxFrameCompletion) -> Result<()>,
+    ) {
         // Reuse the batch allocation for the lifetime of the connection. VT
         // normally yields one frame at a time, but can deliver a short burst
         // after startup or a keyframe.
         let mut frames = Vec::with_capacity(4);
-        while let Ok(frame) = rx.recv() {
-            // Sweep up any others VT delivered alongside it (keeps order).
-            frames.push(frame);
-            frames.extend(rx.try_iter());
-            let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&mut frames) {
-                warn!(error = ?e, "EGFX ship_frames failed");
+        let mut awaiting_keyframe = false;
+        while let Ok(output) = rx.recv() {
+            for output in std::iter::once(output).chain(rx.try_iter()) {
+                match output {
+                    EncodeOutput::Picture(frame) => {
+                        if awaiting_keyframe && !frame.is_keyframe {
+                            shipped.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            awaiting_keyframe = false;
+                            frames.push(frame);
+                        }
+                    }
+                    EncodeOutput::Dropped { .. } => {
+                        shipped.fetch_add(1, Ordering::Relaxed);
+                        awaiting_keyframe = true;
+                        resync.store(true, Ordering::Relaxed);
+                    }
+                }
             }
-            // ship_frames normally drains the batch. It can fail before it
-            // reaches the drain (for example during teardown), so explicitly
-            // discard anything left rather than retrying stale frames later.
-            frames.clear();
-            shipped.fetch_add(n, Ordering::Relaxed);
+            if !frames.is_empty() {
+                let n = frames.len() as u64;
+                if let Err(e) = dispatch(&mut frames, tracked_completion(shipped.clone(), n)) {
+                    warn!(error = ?e, "EGFX ship_frames failed");
+                    if let Some(stats) = crate::stats::global() {
+                        stats.video_ship_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    awaiting_keyframe = true;
+                    resync.store(true, Ordering::Relaxed);
+                }
+                frames.clear();
+            }
         }
         debug!("EGFX ship loop exiting (output channel closed)");
     }
@@ -2353,67 +2434,74 @@ impl Gfx {
     /// Missing output is discarded and the next main picture is forced to IDR.
     fn ship_loop_avc444(
         &self,
-        rx: std::sync::mpsc::Receiver<EncodedFrame>,
+        rx: std::sync::mpsc::Receiver<EncodeOutput>,
         shipped: Arc<AtomicU64>,
         resync: Arc<AtomicBool>,
     ) {
-        let mut pending_main: Option<EncodedFrame> = None;
-        while let Ok(frame) = rx.recv() {
-            if frame.pts & 1 == 0 {
-                if let Some(stale_main) = pending_main.replace(frame) {
-                    warn!(
-                        main_pts = stale_main.pts,
-                        "EGFX AVC444 dropped unmatched main output; forcing stream IDR"
-                    );
-                    resync.store(true, Ordering::Relaxed);
+        let mut pending_main: Option<EncodeOutput> = None;
+        while let Ok(output) = rx.recv() {
+            if output.pts() & 1 == 0 {
+                if pending_main.replace(output).is_some() {
                     shipped.fetch_add(1, Ordering::Relaxed);
+                    resync.store(true, Ordering::Relaxed);
                 }
                 continue;
             }
-
             let Some(main) = pending_main.take() else {
-                warn!(
-                    auxiliary_pts = frame.pts,
-                    "EGFX AVC444 dropped orphan auxiliary output; forcing stream IDR"
-                );
-                resync.store(true, Ordering::Relaxed);
                 shipped.fetch_add(1, Ordering::Relaxed);
+                resync.store(true, Ordering::Relaxed);
                 continue;
             };
-
-            if main.pts.wrapping_add(1) != frame.pts {
-                warn!(
-                    main_pts = main.pts,
-                    auxiliary_pts = frame.pts,
-                    "EGFX AVC444 dropped non-adjacent output pair; forcing stream IDR"
-                );
-                resync.store(true, Ordering::Relaxed);
+            if main.pts().wrapping_add(1) != output.pts() {
                 shipped.fetch_add(2, Ordering::Relaxed);
+                resync.store(true, Ordering::Relaxed);
                 continue;
             }
-
-            if let Err(error) = self.ship_avc444_pair(main, frame) {
-                warn!(?error, "EGFX AVC444 ship failed");
-                resync.store(true, Ordering::Relaxed);
+            match (main, output) {
+                (EncodeOutput::Picture(main), EncodeOutput::Picture(auxiliary)) => {
+                    if let Err(error) = self.ship_avc444_pair(
+                        main,
+                        auxiliary,
+                        tracked_completion(shipped.clone(), 1),
+                    ) {
+                        warn!(?error, "EGFX AVC444 ship failed");
+                        resync.store(true, Ordering::Relaxed);
+                    }
+                }
+                _ => {
+                    // Retire the logical submission once, even if both views failed.
+                    shipped.fetch_add(1, Ordering::Relaxed);
+                    resync.store(true, Ordering::Relaxed);
+                }
             }
+        }
+        if pending_main.is_some() {
             shipped.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(main) = pending_main {
-            if self.ctx.lock().unwrap().is_some() {
-                warn!(
-                    main_pts = main.pts,
-                    "EGFX AVC444 output closed with an unmatched main picture"
-                );
-            }
-        }
-        debug!("EGFX AVC444 ship loop exiting (encoder output channel closed)");
+        debug!("EGFX AVC444 ship loop exiting (output channel closed)");
     }
 
-    fn ship_avc444_pair(&self, main: EncodedFrame, auxiliary: EncodedFrame) -> Result<()> {
-        let (dvc_messages, egfx_channel_id) = {
+    fn ship_avc444_pair(
+        &self,
+        main: EncodedFrame,
+        auxiliary: EncodedFrame,
+        completion: EgfxFrameCompletion,
+    ) -> Result<()> {
+        let mut payload_bytes = 0;
+        let mut queued_frames = 0;
+        let (dvc_messages, egfx_channel_id, video_queued) = {
             // Preserve the same lock order as the AVC420 ship path: copy the
             // context data first, then release ctx before locking the server.
-            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
+            let (
+                surface_id,
+                width,
+                height,
+                epoch,
+                server_handle,
+                last_shipped,
+                ship_times,
+                video_queued,
+            ) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let ctx = guard
                     .as_mut()
@@ -2431,6 +2519,7 @@ impl Gfx {
                     ctx.server_handle.clone(),
                     ctx.last_shipped_frame_id.clone(),
                     ctx.ship_times.clone(),
+                    ctx.video_queued.clone(),
                 )
             };
 
@@ -2461,6 +2550,8 @@ impl Gfx {
                 ts_ms,
             );
             if let Some(frame_id) = sent {
+                queued_frames += 1;
+                payload_bytes += (main_payload.len() + auxiliary_payload.len()) as u64;
                 last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
                 ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
                     (u64::from(frame_id), Instant::now());
@@ -2477,7 +2568,7 @@ impl Gfx {
             } else {
                 debug!("send_avc444_frame returned None");
             }
-            (server.drain_output(), egfx_channel_id)
+            (server.drain_output(), egfx_channel_id, video_queued)
         };
 
         if dvc_messages.is_empty() {
@@ -2493,10 +2584,17 @@ impl Gfx {
             .clone()
             .ok_or_else(|| anyhow!("EGFX AVC444: server-event sender not set"))?;
         sender
-            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendTrackedMessages {
                 messages: svc_messages,
+                completion,
             }))
             .map_err(|_| anyhow!("EGFX AVC444: ServerEvent send failed (event loop closed)"))?;
+        if queued_frames != 0 {
+            video_queued.store(true, Ordering::Relaxed);
+        }
+        if let Some(stats) = crate::stats::global() {
+            stats.record_video_queued(queued_frames, payload_bytes);
+        }
         Ok(())
     }
 
@@ -2559,8 +2657,11 @@ impl Gfx {
             // (slow link) or the controller already adjusted it (encoder
             // rebuild mid-connection).
             // Fresh throttle counters for this connection.
-            ctx.submitted.store(0, Ordering::Relaxed);
-            ctx.shipped.store(0, Ordering::Relaxed);
+            // Old queued batches may finish after an encoder rebuild. Give the
+            // new generation separate counters so those completions cannot
+            // release its slots or hide its backlog.
+            ctx.submitted = Arc::new(AtomicU64::new(0));
+            ctx.shipped = Arc::new(AtomicU64::new(0));
             ctx.encoder_resync.store(false, Ordering::Relaxed);
 
             if self.avc444_enabled && ctx.client_supports_avc444 {
@@ -2609,9 +2710,10 @@ impl Gfx {
                 ctx.encoder = Some(ActiveEncoder::Avc420(encoder));
                 let gfx = self.clone();
                 let shipped = ctx.shipped.clone();
+                let resync = ctx.encoder_resync.clone();
                 std::thread::Builder::new()
                     .name("egfx-ship".into())
-                    .spawn(move || gfx.ship_loop(rx, shipped))
+                    .spawn(move || gfx.ship_loop(rx, shipped, resync))
                     .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
                 if self.avc444_enabled {
                     info!(
@@ -2625,6 +2727,7 @@ impl Gfx {
         // stats: publish the per-connection baseline (no-op unless --stats-endpoint).
         if let Some(s) = crate::stats::global() {
             let (w, h) = ctx.dims;
+            s.video_generation.fetch_add(1, Ordering::Relaxed);
             s.connected.store(true, Ordering::Relaxed);
             s.width.store(u32::from(w), Ordering::Relaxed);
             s.height.store(u32::from(h), Ordering::Relaxed);
@@ -2741,6 +2844,10 @@ impl Gfx {
     /// a graphics reset — the same position it occupies on every fresh
     /// connection.
     pub(crate) fn reset_for_live_resize(&self) {
+        if let Some(stats) = crate::stats::global() {
+            stats.end_video_session();
+        }
+
         let mut guard = self.ctx.lock().unwrap();
         if let Some(ctx) = guard.as_mut() {
             // Order matters only in that both must be cleared before the
@@ -2750,9 +2857,21 @@ impl Gfx {
             // encoder and resets the throttle counters).
             ctx.encoder = None;
             ctx.surface_id = None;
+            ctx.video_queued = Arc::new(AtomicBool::new(false));
             ctx.need_keyframe = true;
-            info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
+            info!(
+                "EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size"
+            );
         }
+    }
+
+    /// Whether this surface has queued an encoded frame for the client.
+    pub(crate) fn has_queued_video(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.video_queued.load(Ordering::Relaxed))
     }
 
     /// EXPERIMENTAL blank-recovery — request a bare core
@@ -2778,7 +2897,7 @@ impl Gfx {
     }
 
     /// Manual A/V resync (the `Ctrl+Alt+Shift+R` hotkey — see `input.rs` and the
-    /// `crate::RESYNC_VIDEO` flag). Arms a forced IDR keyframe so the next frame
+    /// `crate::RESYNC_VIDEO` wakeup). Arms a forced IDR keyframe so the next frame
     /// is a clean, self-contained repaint — enough to recover a stale/idle-blanked
     /// mstsc presentation without the heavyweight core Deactivation–Reactivation,
     /// which on the `--virtual-display`/`--capture-primary` headless path cascades
@@ -2786,7 +2905,7 @@ impl Gfx {
     /// live-resize surface reset → a headless re-capture — the visible reconnect
     /// flicker). If a plain IDR turns out not to un-blank the surface-retention
     /// case on some client, [`request_reactivation`] is the heavier escalation.
-    /// `capture.rs` calls this when it observes the flag.
+    /// `capture.rs` calls this when it receives the wakeup.
     pub(crate) fn force_keyframe(&self) {
         if let Ok(mut guard) = self.ctx.lock() {
             if let Some(ctx) = guard.as_mut() {
@@ -2861,8 +2980,15 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &mut Vec<EncodedFrame>) -> Result<()> {
-        let (dvc_messages, egfx_channel_id) = {
+    fn ship_frames(
+        &self,
+        frames: &mut Vec<EncodedFrame>,
+        completion: EgfxFrameCompletion,
+    ) -> Result<()> {
+        let expected_frames = frames.len() as u64;
+        let mut payload_bytes = 0;
+        let mut queued_frames = 0;
+        let (dvc_messages, egfx_channel_id, video_queued) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
             // (`GfxDvcBridge::process` → `GraphicsPipelineServer::process` →
@@ -2875,7 +3001,16 @@ impl Gfx {
             // few seconds" stall, far more likely once acks ride the UDP tunnel).
             // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
             // lock order consistent (server_handle is never nested under ctx).
-            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
+            let (
+                surface_id,
+                width,
+                height,
+                epoch,
+                server_handle,
+                last_shipped,
+                ship_times,
+                video_queued,
+            ) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let ctx = guard
                     .as_mut()
@@ -2899,6 +3034,7 @@ impl Gfx {
                     ctx.server_handle.clone(),
                     ctx.last_shipped_frame_id.clone(),
                     ctx.ship_times.clone(),
+                    ctx.video_queued.clone(),
                 )
             };
 
@@ -2935,6 +3071,8 @@ impl Gfx {
                 // into the RTT ring so `on_frame_ack` can time this frame's
                 // round trip for the queue-delay congestion signal.
                 if let Some(frame_id) = sent {
+                    queued_frames += 1;
+                    payload_bytes += payload.len() as u64;
                     last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
                     ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
                         (u64::from(frame_id), Instant::now());
@@ -2954,19 +3092,14 @@ impl Gfx {
                         payload_bytes = payload.len(),
                         "EGFX shipped frame"
                     ),
-                    None => debug!(
-                        keyframe = is_keyframe,
-                        param_sets = ps_count,
-                        bytes = payload.len(),
-                        "send_avc420_frame returned None"
-                    ),
+                    None => break,
                 }
             }
-            (server.drain_output(), egfx_channel_id)
+            (server.drain_output(), egfx_channel_id, video_queued)
         };
 
         if dvc_messages.is_empty() {
-            return Ok(());
+            anyhow::bail!("EGFX rejected AVC420 frame before transport dispatch");
         }
         // DRDYNVC framing, addressed to the EGFX dynamic channel. SHOW_PROTOCOL
         // matches what upstream's Echo handler uses for DRDYNVC-wrapped data.
@@ -2980,10 +3113,21 @@ impl Gfx {
             .clone()
             .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
         sender
-            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendTrackedMessages {
                 messages: svc_messages,
+                completion,
             }))
             .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+        if queued_frames != 0 {
+            video_queued.store(true, Ordering::Relaxed);
+        }
+        if let Some(stats) = crate::stats::global() {
+            stats.record_video_queued(queued_frames, payload_bytes);
+        }
+        anyhow::ensure!(
+            queued_frames == expected_frames,
+            "EGFX rejected part of an AVC420 batch"
+        );
         Ok(())
     }
 
@@ -3060,7 +3204,9 @@ impl GfxServerFactory for Gfx {
         // still-running macrdp, the id-0 `CreateSurface` no-ops against the
         // surface mstsc retained from the prior session → the reconnect-blank.
         // See the H.264 reconnect quirk note + `on_close` instrumentation below.
-        debug!("EGFX: building fresh GraphicsPipelineServer for new connection (surface-id counter resets to 0)");
+        debug!(
+            "EGFX: building fresh GraphicsPipelineServer for new connection (surface-id counter resets to 0)"
+        );
         let server = GraphicsPipelineServer::new(handler);
         let handle: GfxServerHandle = Arc::new(Mutex::new(server));
         // Channel-level decline flag, shared between this connection's ctx
@@ -3115,6 +3261,7 @@ impl GfxServerFactory for Gfx {
             last_acked_frame_id: Arc::new(AtomicU64::new(0)),
             egfx_acks_seen: false,
             ship_times: Arc::new(Mutex::new(vec![(u64::MAX, Instant::now()); RTT_RING])),
+            video_queued: Arc::new(AtomicBool::new(false)),
             rtt_min_cur_ms: f64::INFINITY,
             rtt_min_prev_ms: f64::INFINITY,
             rtt_bucket_started: Instant::now(),
@@ -3321,6 +3468,18 @@ impl GraphicsPipelineHandler for GfxHandler {
                         queue_delay_fold(sample_ms, ctx.rtt_min_cur_ms, ctx.rtt_min_prev_ms);
                     ctx.rtt_min_cur_ms = cur_min;
                     ctx.queue_delay_ms = delay;
+                    if let Some(stats) = crate::stats::global() {
+                        stats
+                            .ack_rtt_ms
+                            .store(sample_ms.round() as u32, Ordering::Relaxed);
+                        stats
+                            .ack_queue_ms
+                            .store(delay.round() as u32, Ordering::Relaxed);
+                        stats
+                            .ack_sample_uptime_ms
+                            .store(stats.uptime_ms(), Ordering::Relaxed);
+                        stats.ack_samples.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -3553,6 +3712,137 @@ fn retain_avc444_nals(mut avcc: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_backpressure_requires_recent_ack_delay_and_outstanding_frames() {
+        let recent = Duration::from_millis(200);
+        assert!(tcp_decode_backlog(7, 80.0, recent));
+        assert!(!tcp_decode_backlog(6, 120.0, recent));
+        assert!(!tcp_decode_backlog(30, 10.0, recent));
+        assert!(!tcp_decode_backlog(30, 120.0, Duration::from_millis(251)));
+    }
+
+    fn completion_test_gfx() -> Gfx {
+        Gfx::new(
+            crate::capture::SharedDesktopSize::new(64, 64),
+            30,
+            1_000_000,
+            false,
+            2.0,
+            2,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        )
+    }
+
+    #[test]
+    fn resized_surface_waits_for_its_own_first_queued_frame() {
+        let gfx = completion_test_gfx();
+        let _server = gfx.build_server_with_handle().unwrap();
+        assert!(!gfx.has_queued_video());
+        let old_surface = gfx
+            .ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .video_queued
+            .clone();
+        old_surface.store(true, Ordering::Relaxed);
+        assert!(gfx.has_queued_video());
+
+        gfx.reset_for_live_resize();
+        old_surface.store(true, Ordering::Relaxed);
+        assert!(!gfx.has_queued_video());
+    }
+
+    #[test]
+    fn encoder_failures_release_avc420_slots_and_arm_resync() {
+        let gfx = completion_test_gfx();
+        let shipped = Arc::new(AtomicU64::new(0));
+        let resync = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        // More failures than the configured window must all retire, so later
+        // captures can still enter the encoder instead of being deferred forever.
+        for pts in 0..20 {
+            tx.send(EncodeOutput::Dropped { pts }).unwrap();
+        }
+        drop(tx);
+        gfx.ship_loop(rx, shipped.clone(), resync.clone());
+        assert_eq!(shipped.load(Ordering::Relaxed), 20);
+        assert!(resync.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn avc420_send_failure_skips_dependent_pictures_until_keyframe() {
+        let gfx = completion_test_gfx();
+        let shipped = Arc::new(AtomicU64::new(0));
+        let resync = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let picture = |pts, is_keyframe| {
+            EncodeOutput::Picture(EncodedFrame {
+                pts,
+                is_keyframe,
+                data: vec![],
+                parameter_sets: vec![],
+            })
+        };
+        tx.send(picture(0, true)).unwrap();
+        let mut pending = Some(tx);
+        let mut batches = Vec::new();
+        gfx.ship_loop_with_dispatch(
+            rx,
+            shipped.clone(),
+            resync.clone(),
+            |frames, _completion| {
+                batches.push(frames.iter().map(|frame| frame.pts).collect::<Vec<_>>());
+                if let Some(sender) = pending.take() {
+                    for (pts, keyframe) in [(1, false), (2, false), (3, true), (4, false)] {
+                        sender.send(picture(pts, keyframe)).unwrap();
+                    }
+                    anyhow::bail!("simulated send failure");
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(batches, [vec![0], vec![3, 4]]);
+        assert_eq!(shipped.load(Ordering::Relaxed), 5);
+        assert!(resync.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn avc444_failed_views_retire_one_logical_submission_per_pair() {
+        let gfx = completion_test_gfx();
+        let shipped = Arc::new(AtomicU64::new(0));
+        let resync = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        fn picture(pts: i64) -> EncodeOutput {
+            EncodeOutput::Picture(EncodedFrame {
+                data: vec![],
+                is_keyframe: false,
+                pts,
+                parameter_sets: vec![],
+            })
+        }
+        for output in [
+            EncodeOutput::Dropped { pts: 0 },
+            picture(1),
+            picture(2),
+            EncodeOutput::Dropped { pts: 3 },
+            EncodeOutput::Dropped { pts: 4 },
+            EncodeOutput::Dropped { pts: 5 },
+        ] {
+            tx.send(output).unwrap();
+        }
+        drop(tx);
+        gfx.ship_loop_avc444(rx, shipped.clone(), resync.clone());
+        assert_eq!(shipped.load(Ordering::Relaxed), 3);
+        assert!(resync.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn avc444_requires_positive_v10_avc_capability() {

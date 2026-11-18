@@ -23,7 +23,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -560,10 +561,39 @@ impl NFSFileSystem for RdpdrFs {
 // Surface — the mount lifecycle
 // ---------------------------------------------------------------------------
 
-/// A live NFS mount of one redirected drive. Dropping it unmounts the volume,
-/// stops the in-process NFS server, and removes the mountpoint.
+/// Serialize mount and cleanup without blocking the async Drop path.
+#[derive(Debug, Default)]
+struct MountLifecycle {
+    cancelled: AtomicBool,
+    operation: Mutex<()>,
+}
+
+impl MountLifecycle {
+    fn mount(&self, mount: impl FnOnce() -> bool, publish: impl FnOnce(), cleanup: impl FnOnce()) {
+        let _guard = self.operation.lock().unwrap();
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        if mount() {
+            if self.cancelled.load(Ordering::Acquire) {
+                cleanup();
+            } else {
+                publish();
+            }
+        }
+    }
+
+    fn cleanup(&self, cleanup: impl FnOnce()) {
+        let _guard = self.operation.lock().unwrap();
+        cleanup();
+    }
+}
+
+/// A live NFS mount of one redirected drive. Dropping it stops the NFS server
+/// and schedules cleanup after any in-progress mount has finished.
 #[derive(Debug)]
 pub struct Surface {
+    lifecycle: Arc<MountLifecycle>,
     mountpoint: Option<PathBuf>,
     /// The task running the NFS accept loop; aborting it stops the server.
     serve: Option<JoinHandle<()>>,
@@ -575,12 +605,14 @@ impl Surface {
     /// Returns immediately; the bind + mount run on the current tokio runtime.
     /// Must be called from an async (runtime) context.
     pub fn start(handle: RdpdrHandle, device_id: u32, drive_label: &str) -> Self {
+        let lifecycle = Arc::new(MountLifecycle::default());
         let label = sanitize_label(drive_label);
         let mountpoint = match prepare_mountpoint(&label) {
             Ok(p) => p,
             Err(e) => {
                 warn!(label, error = %e, "rdpdr nfs: could not create mountpoint");
                 return Self {
+                    lifecycle,
                     mountpoint: None,
                     serve: None,
                 };
@@ -588,6 +620,7 @@ impl Surface {
         };
 
         let mp = mountpoint.clone();
+        let mount_lifecycle = lifecycle.clone();
         let serve = tokio::spawn(async move {
             let fs = RdpdrFs::new(handle, device_id);
             let listener = match NFSTcpListener::bind("127.0.0.1:0", fs).await {
@@ -610,21 +643,18 @@ impl Surface {
             tokio::time::sleep(MOUNT_DEFER).await;
             let mount_mp = mp.clone();
             tokio::task::spawn_blocking(move || {
-                if run_mount(port, &mount_mp) {
-                    // Track it so a signal-exit (process::exit skips Drop) can
-                    // still unmount it — see shutdown_cleanup().
-                    register_mount(&mount_mp);
-                    info!(mountpoint = ?mount_mp, "rdpdr nfs: drive mounted — opening in Finder (background)");
-                    // `-g`: open the window WITHOUT bringing Finder to the
-                    // foreground — foregrounding it mid-reflow steals focus and
-                    // breaks the desktop's migration to the virtual display.
-                    let _ = std::process::Command::new("/usr/bin/open")
-                        .arg("-g")
-                        .arg(&mount_mp)
-                        .spawn();
-                } else {
-                    warn!(mountpoint = ?mount_mp, "rdpdr nfs: mount_nfs failed");
-                }
+                mount_lifecycle.mount(
+                    || run_mount(port, &mount_mp),
+                    || {
+                        register_mount(&mount_mp);
+                        info!(mountpoint = ?mount_mp, "rdpdr nfs: drive mounted");
+                        let _ = std::process::Command::new("/usr/bin/open")
+                            .arg("-g")
+                            .arg(&mount_mp)
+                            .spawn();
+                    },
+                    || unmount_at(&mount_mp),
+                );
             });
 
             if let Err(e) = listener.handle_forever().await {
@@ -633,6 +663,7 @@ impl Surface {
         });
 
         Self {
+            lifecycle,
             mountpoint: Some(mountpoint),
             serve: Some(serve),
         }
@@ -641,16 +672,19 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
+        self.lifecycle.cancelled.store(true, Ordering::Release);
         if let Some(h) = self.serve.take() {
             h.abort();
         }
         if let Some(mp) = self.mountpoint.take() {
             // Unmount + remove the mountpoint off the async runtime (umount can
             // block briefly). Detached: cleanup is best-effort on disconnect.
+            let lifecycle = self.lifecycle.clone();
             std::thread::spawn(move || {
-                unmount_at(&mp);
-                // Already handled here, so shutdown_cleanup needn't touch it.
-                unregister_mount(&mp);
+                lifecycle.cleanup(|| {
+                    unmount_at(&mp);
+                    unregister_mount(&mp);
+                });
             });
         }
     }
@@ -768,21 +802,36 @@ fn run_mount(port: u16, mountpoint: &Path) -> bool {
     let opts = format!(
         "nolocks,vers=3,tcp,rsize=262144,wsize=262144,readahead=4,port={port},mountport={port},actimeo=5"
     );
-    match std::process::Command::new("/sbin/mount_nfs")
+    let mut child = match std::process::Command::new("/sbin/mount_nfs")
         .arg("-o")
         .arg(&opts)
         .arg("localhost:/")
         .arg(mountpoint)
-        .status()
+        .spawn()
     {
-        Ok(s) if s.success() => true,
-        Ok(s) => {
-            warn!(code = ?s.code(), "rdpdr nfs: mount_nfs exited nonzero");
-            false
-        }
+        Ok(child) => child,
         Err(e) => {
             warn!(error = %e, "rdpdr nfs: could not spawn mount_nfs");
-            false
+            return false;
+        }
+    };
+    // Disconnect aborts the NFS listener; mount_nfs must not retain the lifecycle
+    // lock indefinitely while retrying that now-unreachable export.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25))
+            }
+            result => {
+                warn!(?result, "rdpdr nfs: mount_nfs failed or exceeded deadline");
+                let _ = child.kill();
+                let _ = child.wait();
+                // A mount may have completed immediately before the deadline.
+                unmount_at(mountpoint);
+                return false;
+            }
         }
     }
 }
@@ -791,23 +840,68 @@ fn run_mount(port: u16, mountpoint: &Path) -> bool {
 /// (so it shows as a real volume in Finder's sidebar). Appends a numeric suffix
 /// on collision, and falls back to a temp dir if `/Volumes` isn't writable.
 fn prepare_mountpoint(label: &str) -> std::io::Result<PathBuf> {
-    let base = Path::new("/Volumes");
-    let mut candidate = base.join(label);
-    let mut n = 1;
-    while candidate.exists() && n < 50 {
-        candidate = base.join(format!("{label}-{n}"));
-        n += 1;
+    prepare_mountpoint_under(label, Path::new("/Volumes"), &std::env::temp_dir())
+}
+
+fn prepare_mountpoint_under(label: &str, volumes: &Path, temp: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::path::Component;
+    let mut components = Path::new(label).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid drive label",
+        ));
     }
-    match std::fs::create_dir(&candidate) {
-        Ok(()) => Ok(candidate),
-        Err(_) => {
-            let tmp = std::env::temp_dir()
-                .join(format!("macrdp-rdpdr-{}", std::process::id()))
-                .join(label);
-            std::fs::create_dir_all(&tmp)?;
-            Ok(tmp)
+    for n in 0..50 {
+        let name = if n == 0 {
+            label.to_owned()
+        } else {
+            format!("{label}-{n}")
+        };
+        let candidate = volumes.join(name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => break,
         }
     }
+    let parent = temp.join(format!("macrdp-rdpdr-{}", std::process::id()));
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&parent) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(&parent)?;
+            if !meta.is_dir()
+                || meta.uid() != unsafe { libc::geteuid() }
+                || meta.mode() & 0o077 != 0
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "unsafe mount directory",
+                ));
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    for n in 0..1000 {
+        let name = if n == 0 {
+            label.to_owned()
+        } else {
+            format!("{label}-{n}")
+        };
+        let candidate = parent.join(name);
+        match builder.create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free mountpoint",
+    ))
 }
 
 /// Make a drive label safe for a single path component (no `/`, `:` etc.).
@@ -823,9 +917,99 @@ fn sanitize_label(label: &str) -> String {
             }
         })
         .collect();
-    if cleaned.is_empty() {
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
         "drive".to_owned()
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "macrdp-mounttest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn labels_cannot_escape_mount_root_and_collisions_are_not_reused() {
+        for label in [".", "..", "...", " : ", ""] {
+            assert_eq!(sanitize_label(label), "drive");
+        }
+        let root = temp_root();
+        let volumes = root.join("missing-volumes");
+        for label in [".", "..", "/outside", "a/b"] {
+            assert!(prepare_mountpoint_under(label, &volumes, &root).is_err());
+        }
+        let first = prepare_mountpoint_under("C", &volumes, &root).unwrap();
+        let second = prepare_mountpoint_under("C", &volumes, &root).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), second.parent());
+        assert!(first.starts_with(root.join(format!("macrdp-rdpdr-{}", std::process::id()))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fallback_refuses_a_symlink_parent() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root();
+        let target = root.join("outside");
+        std::fs::create_dir(&target).unwrap();
+        symlink(
+            &target,
+            root.join(format!("macrdp-rdpdr-{}", std::process::id())),
+        )
+        .unwrap();
+        assert!(prepare_mountpoint_under("C", &root.join("absent"), &root).is_err());
+        assert!(!target.join("C").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disconnect_during_mount_unmounts_without_publishing() {
+        let lifecycle = Arc::new(MountLifecycle::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let worker_state = lifecycle.clone();
+        let worker_events = events.clone();
+        let worker = std::thread::spawn(move || {
+            worker_state.mount(
+                || {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    true
+                },
+                || worker_events.lock().unwrap().push("published"),
+                || worker_events.lock().unwrap().push("unmounted"),
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        lifecycle.cancelled.store(true, Ordering::Release);
+        finish_tx.send(()).unwrap();
+        worker.join().unwrap();
+        lifecycle.cleanup(|| events.lock().unwrap().push("cleaned"));
+        assert_eq!(*events.lock().unwrap(), ["unmounted", "cleaned"]);
+    }
+
+    #[test]
+    fn cancelled_mount_never_starts() {
+        let lifecycle = MountLifecycle::default();
+        lifecycle.cancelled.store(true, Ordering::Release);
+        lifecycle.mount(
+            || panic!("cancelled mount ran"),
+            || panic!("published"),
+            || panic!("cleanup"),
+        );
     }
 }

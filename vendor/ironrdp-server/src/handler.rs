@@ -73,6 +73,10 @@ pub enum MouseEvent {
 pub trait RdpServerInputHandler: Send {
     fn keyboard(&mut self, event: KeyboardEvent);
     fn mouse(&mut self, event: MouseEvent);
+
+    /// Release client-owned input state when the transport session ends.
+    /// Core reactivation (for example a resize) is not a disconnect.
+    fn session_ended(&mut self) {}
 }
 
 impl From<(u8, fast_path::KeyboardFlags)> for KeyboardEvent {

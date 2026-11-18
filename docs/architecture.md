@@ -2,6 +2,8 @@
 
 ```
 src/main.rs       CLI, TCC preflight, TLS cert mgmt, RdpServer assembly
+src/scard_ipc.rs  Shared Unix-socket paths, peer identity, and bounded dialing
+                  for the server and the separately-built IFD driver
 src/auth.rs       Startup PAM auth against the macOS account (libpam FFI)
 src/auth_guard.rs Connection-level auth hardening (Tier 1.2): per-source-IP
                   rate-limiting + escalating auto-expiring lockout + a greppable
@@ -96,7 +98,7 @@ src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
                   mount (MacRdpdrHandler keeps a HashMap<device_id, Surface>).
                   Surface::Drop unmounts on disconnect. smartcard.rs: the
                   smart-card bridge (--enable-smartcard-redirection). When a
-                  Smartcard device is announced, binds 127.0.0.1:40242 and serves
+                  Smartcard device is announced, binds a kernel-authenticated Unix socket and serves
                   macrdp's own PC/SC IFD handler (ifd-handler/ cdylib, loaded by
                   com.apple.ifdreader), mapping its POWER_ON/OFF/TRANSMIT/PRESENCE
                   protocol to RdpdrHandle::scard_* (MS-RDPESC) calls on the
@@ -104,7 +106,7 @@ src/rdpdr/        RDPDR drive redirection — the macrdp side of the server-side
 ifd-handler/      Standalone cdylib (NOT in the macrdp cargo package) — macrdp's
                   PC/SC IFD handler, the IFDHandler v3.0 C ABI macOS
                   SmartCardServices loads. Bridges every card op to macrdp over
-                  loopback TCP (src/rdpdr/smartcard.rs). From scratch (MIT/Apache)
+                  a Unix socket (src/rdpdr/smartcard.rs). From scratch (MIT/Apache)
                   so smart-card redirection ships no GPL vpcd. Built + embedded in
                   macrdp.app by packaging/; installed by install-ifd-handler.sh.
 src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
@@ -273,9 +275,12 @@ src/camera/       Camera redirection (MS-RDPECAM) — presents the CLIENT's webc
                   SampleResponse pull loop) lives in the vendored ironrdp-server
                   (src/rdcamera.rs, divergence 19). The virtual camera itself is a
                   separate process: gui/Sources/macrdpcamera (see the gui note above).
+gui/Sources/ControllerCore/PasswordKeychain.swift
+                  Native Security.framework credential writes with an explicit
+                  ACL trusting /usr/bin/security (the existing headless reader).
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
-vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via
+vendor/ironrdp-server/    Local fork of ironrdp-server 0.13.0, pulled in via
                           [patch.crates-io] in Cargo.toml. The live
                           divergences (audio-lag tracker, resize-stall
                           resync, per-batch dispatch priority, SuppressOutput
@@ -287,7 +292,7 @@ vendor/ironrdp-server/    Local fork of ironrdp-server 0.10.0, pulled in via
                           vendor dir until all of those are upstreamed AND
                           released.
 
-vendor/ironrdp-acceptor/  Local fork of ironrdp-acceptor 0.8.0 (added
+vendor/ironrdp-acceptor/  Local fork of ironrdp-acceptor 0.10.0 (added
                           2026-06-12, same upstream rev as the git pins).
                           Two divergences: (1) honor_client_desktop_size —
                           adopt the client's requested desktop size from its
@@ -302,7 +307,7 @@ vendor/ironrdp-acceptor/  Local fork of ironrdp-acceptor 0.8.0 (added
                           and the client-resolution / keyboard-layout quirk
                           notes for why these can't be done from server code.
 
-vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.5.0 (added 2026-06-16,
+vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.7.0 (added 2026-06-16,
                           same upstream rev). Upstream is client-only
                           (SvcClientProcessor); the fork adds the
                           server-direction decode halves the PDUs lack

@@ -4,7 +4,57 @@ What each release delivered, newest first. (This is the narrative version —
 see the [GitHub releases](https://github.com/clintcan/macrdp/releases) for
 tags, dates, and downloadable artifacts.)
 
-## Unreleased — fork controller, optimized presets, keyboard shortcuts, and AVC444 diagnostics
+## v0.9.6.2 — personal presets, live diagnostics, and session recovery
+
+Controller checks the macOS account password before saving it to Keychain.
+A rejected or unverifiable password leaves the previous entry untouched.
+The check uses OpenDirectory (adapted from [upstream #267](https://github.com/clintcan/macrdp/pull/267))
+and continues to use the fork's native Keychain writer.
+
+Controller checks for the upstream Homebrew server on the configured RDP port
+before changing its own LaunchAgent. Startup success requires a listener on
+that port owned by the managed process, rather than only a launchd PID.
+
+Fast wheel movement no longer leaves a backlog of whole lines. Small deltas
+still accumulate, but changing direction takes effect without consuming the
+old direction's remainder. Adapted from [upstream #210](https://github.com/clintcan/macrdp/pull/210).
+
+Clipboard data promised by another Apple device is skipped when advertising
+clipboard formats and rechecked before reading text, images or file lists.
+This avoids waiting for a Universal Clipboard transfer inside an RDP session.
+Normal on-Mac copies still sync. Adapted from [upstream #198](https://github.com/clintcan/macrdp/pull/198).
+
+On displays already refreshing at or below the requested FPS, capture avoids an
+extra ScreenCaptureKit pacing step. Faster and unknown-refresh displays keep the
+existing limit. Adapted from [upstream #220](https://github.com/clintcan/macrdp/pull/220);
+the encoder and trailing-frame cadence are unchanged.
+
+Disconnect now releases keyboard and mouse input left held by the remote
+client and clears transient keyboard, mouse and switcher state. This happens
+at transport-session teardown, not at resolution reactivation. A drag
+interrupted mid-session can finish as a drop at the last cursor position.
+
+Remote mouse events carry the current Mac keyboard modifiers. With Ctrl-to-Cmd
+mapping enabled, a plain Ctrl+left-click becomes Cmd-click for the whole
+gesture; scroll, right-click and middle-click keep their original modifiers.
+
+Personal presets save/load, replace, rename and delete the current video, audio
+and shortcut draft without changing network/account settings. The Performance
+page adds measured queued-frame FPS and payload throughput, encoder completion
+time, fresh ACK timing and a bounded in-memory history. See
+[configuration controls](configuration.md#personal-presets-and-performance).
+See [v0.9.6.2 release notes](releases/v0.9.6.2.md) for video recovery,
+upgrade details and Windows validation.
+
+## v0.96.1 — Surak fork: video latency, Controller controls, and hardening
+
+Based on upstream v0.9.6, with an independent fork version sequence. This
+pre-release updates both server and Controller. See the
+[release notes](releases/v0.96.1.md) for new Stable and capture/flush controls,
+encoder recovery, drive/Keychain/smart-card hardening, upgrade requirements,
+and validation limits.
+
+### Earlier fork changes included in this release
 
 - **Controller lifecycle and upgrades are now self-healing.** Start compares
   the full LaunchAgent contract with the currently located `macrdp.app`; a stale

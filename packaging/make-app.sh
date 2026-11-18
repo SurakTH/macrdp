@@ -209,7 +209,7 @@ codesign -dv "$APP_DIR/macrdp.app" 2>&1 | sed 's/^/    /'
 echo
 echo "Next:"
 echo "  1. Store the password once:"
-echo "       security add-generic-password -s macrdp -a \"\$(id -un)\" -w 'YOUR_PASSWORD'"
+echo "       Open macrdp Controller and use Set Password (password stays off command-line arguments)."
 echo "  2. Install + load the LaunchAgent:"
 echo "       APP_DIR=\"$APP_DIR\" packaging/install-launchagent.sh"
 echo "  3. Grant Screen Recording + Accessibility to macrdp.app when prompted"

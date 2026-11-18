@@ -22,7 +22,8 @@ let package = Package(
     name: "macrdptray",
     platforms: [.macOS(.v13)],
     targets: [
-        .target(name: "ControllerCore", path: "Sources/ControllerCore"),
+        .target(name: "ControllerCore", path: "Sources/ControllerCore",
+                linkerSettings: [.linkedFramework("Security"), .linkedFramework("OpenDirectory")]),
         .executableTarget(
             name: "macrdptray",
             dependencies: ["ControllerCore"],
@@ -38,6 +39,11 @@ let package = Package(
                 .linkedFramework("CoreMediaIO"),
                 .linkedFramework("Security"),
             ]
+        ),
+        .testTarget(
+            name: "SettingsModelTests",
+            dependencies: ["macrdptray"],
+            path: "Tests/SettingsModelTests"
         ),
         .testTarget(
             name: "ControllerCoreTests",

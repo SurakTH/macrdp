@@ -300,6 +300,10 @@ pub trait RdpServerDisplay: Send {
     /// Return a display updates receiver
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>>;
 
+    /// Clear display work owned by a disconnected client. A core reactivation
+    /// within the same transport does not end the session.
+    fn session_ended(&mut self) {}
+
     /// Request a new size for the display
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         debug!(?layout, "Requesting layout")

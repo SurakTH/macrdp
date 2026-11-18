@@ -26,15 +26,10 @@ use std::sync::{Arc, OnceLock};
 
 /// The live snapshot. Every field is an atomic so the encode path can update it
 /// lock-free; the listener reads it under no lock either. Values are best-effort
-/// and eventually-consistent — a slightly stale read between updates is fine for
-/// a status display. "Connected" is deliberately NOT authoritative here (there
-/// is no reliable EGFX teardown hook — see the h264 reconnect-blank note); the
-/// controller determines connected/disconnected from `lsof` and uses these
-/// numbers only while it independently sees a live client.
+/// and eventually-consistent. Video activity tracks the encoder session, not
+/// whether a client is authenticated or using bitmap graphics.
 #[derive(Default)]
 pub struct SessionStats {
-    /// Best-effort: set true at connection setup. Not cleared reliably (no
-    /// teardown hook) — the controller gates on its own `lsof` check instead.
     pub connected: AtomicBool,
     pub width: AtomicU32,
     pub height: AtomicU32,
@@ -53,11 +48,74 @@ pub struct SessionStats {
     pub frames_sent: AtomicU64,
     pub adaptive: AtomicBool,
     pub aac: AtomicBool,
+    // Process-lifetime diagnostic counters; no input text or pixel data.
+    pub keyboard_events: AtomicU64,
+    pub capture_samples: AtomicU64,
+    pub capture_content: AtomicU64,
+    pub capture_idle: AtomicU64,
+    pub capture_superseded: AtomicU64,
+    pub encode_submitted: AtomicU64,
+    /// Accepted submissions made from a retained capture, including retries.
+    pub encode_retained_submitted: AtomicU64,
+    pub encode_deferred: AtomicU64,
+    pub encode_tcp_backpressure: AtomicU64,
+    pub encoded_pictures: AtomicU64,
+    pub encode_output_errors: AtomicU64,
+    pub encode_submit_errors: AtomicU64,
+    pub transport_retired: Arc<AtomicU64>,
+    /// Process-wide counts of logical H.264 frames queued to the transport,
+    /// and compressed video payload bytes (not total network traffic).
+    pub video_frames_queued: AtomicU64,
+    pub video_ship_errors: AtomicU64,
+    pub video_payload_bytes: AtomicU64,
+    pub video_generation: AtomicU64,
+    pub encode_completed: AtomicU64,
+    pub encode_total_us: AtomicU64,
+    /// Source buffer allocation, copy or conversion before AVC420 submission.
+    pub encode_prepared: AtomicU64,
+    pub encode_prepare_total_us: AtomicU64,
+    pub ack_samples: AtomicU64,
+    pub ack_sample_uptime_ms: AtomicU64,
+    pub ack_rtt_ms: AtomicU32,
+    pub ack_queue_ms: AtomicU32,
+    clock: OnceLock<std::time::Instant>,
 }
 
 impl SessionStats {
+    pub fn end_video_session(&self) {
+        self.connected.store(false, Ordering::Relaxed);
+        self.ack_samples.store(0, Ordering::Relaxed);
+    }
+
+    pub fn uptime_ms(&self) -> u64 {
+        self.clock
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+
+    pub fn record_encode(&self, elapsed: std::time::Duration) {
+        self.encode_total_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.encode_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn record_encode_preparation(&self, elapsed: std::time::Duration) {
+        self.encode_prepare_total_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.encode_prepared.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_video_queued(&self, frames: u64, payload_bytes: u64) {
+        self.video_payload_bytes
+            .fetch_add(payload_bytes, Ordering::Relaxed);
+        self.video_frames_queued
+            .fetch_add(frames, Ordering::Relaxed);
+    }
+
     fn to_json(&self) -> String {
-        format!(
+        let mut json = format!(
             concat!(
                 "{{\"connected\":{},\"width\":{},\"height\":{},\"bitrate_bps\":{},",
                 "\"ceiling_bps\":{},\"rtt_ms\":{},\"queue_delay_ms\":{},\"fps\":{},",
@@ -74,7 +132,83 @@ impl SessionStats {
             self.frames_sent.load(Ordering::Relaxed),
             self.adaptive.load(Ordering::Relaxed),
             self.aac.load(Ordering::Relaxed),
-        )
+        );
+        json.pop(); // Append fields while preserving the existing GUI schema.
+        json.push_str(&format!(
+            ",\"keyboard_events\":{}",
+            self.keyboard_events.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"capture_samples\":{}",
+            self.capture_samples.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"capture_content\":{}",
+            self.capture_content.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"capture_idle\":{}",
+            self.capture_idle.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"capture_superseded\":{}",
+            self.capture_superseded.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encode_submitted\":{}",
+            self.encode_submitted.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encode_retained_submitted\":{}",
+            self.encode_retained_submitted.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encode_deferred\":{}",
+            self.encode_deferred.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encode_tcp_backpressure\":{}",
+            self.encode_tcp_backpressure.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encoded_pictures\":{}",
+            self.encoded_pictures.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encode_output_errors\":{}",
+            self.encode_output_errors.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"encode_submit_errors\":{}",
+            self.encode_submit_errors.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"video_ship_errors\":{}",
+            self.video_ship_errors.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"transport_retired\":{}",
+            self.transport_retired.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"diagnostics_version\":1,\"process_id\":{},\"video_active\":{}",
+            std::process::id(),
+            self.connected.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            concat!(",\"uptime_ms\":{},\"video_generation\":{},\"video_frames_queued\":{},",
+                "\"video_payload_bytes\":{},\"encode_completed\":{},\"encode_total_us\":{},",
+                "\"encode_prepared\":{},\"encode_prepare_total_us\":{},",
+                "\"ack_samples\":{},\"ack_sample_uptime_ms\":{},\"ack_rtt_ms\":{},\"ack_queue_ms\":{}"),
+            self.uptime_ms(), self.video_generation.load(Ordering::Relaxed),
+            self.video_frames_queued.load(Ordering::Relaxed), self.video_payload_bytes.load(Ordering::Relaxed),
+            self.encode_completed.load(Ordering::Relaxed), self.encode_total_us.load(Ordering::Relaxed),
+            self.encode_prepared.load(Ordering::Relaxed), self.encode_prepare_total_us.load(Ordering::Relaxed),
+            self.ack_samples.load(Ordering::Relaxed), self.ack_sample_uptime_ms.load(Ordering::Relaxed),
+            self.ack_rtt_ms.load(Ordering::Relaxed), self.ack_queue_ms.load(Ordering::Relaxed),
+        ));
+        json.push('}');
+        json
     }
 }
 
@@ -142,6 +276,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn video_end_hides_activity_and_invalidates_acks_without_resetting_counters() {
+        let s = SessionStats::default();
+        s.connected.store(true, Ordering::Relaxed);
+        s.ack_samples.store(5, Ordering::Relaxed);
+        s.video_frames_queued.store(12, Ordering::Relaxed);
+        assert!(s.to_json().contains("\"video_active\":true"));
+        s.end_video_session();
+        let json = s.to_json();
+        assert!(json.contains("\"video_active\":false"));
+        assert!(json.contains("\"ack_samples\":0"));
+        assert!(json.contains("\"video_frames_queued\":12"));
+    }
+
+    #[test]
     fn json_shape_is_stable_and_parseable() {
         let s = SessionStats::default();
         s.connected.store(true, Ordering::Relaxed);
@@ -149,10 +297,17 @@ mod tests {
         s.height.store(1080, Ordering::Relaxed);
         s.bitrate_bps.store(4_000_000, Ordering::Relaxed);
         s.fps.store(60, Ordering::Relaxed);
+        s.keyboard_events.store(7, Ordering::Relaxed);
+        s.encoded_pictures.store(3, Ordering::Relaxed);
+        s.transport_retired.store(2, Ordering::Relaxed);
         let j = s.to_json();
         // Spot-check a few fields + that it's a single line with the expected keys.
         assert!(j.starts_with('{') && j.ends_with('}'));
         assert!(!j.contains('\n'));
+        assert!(j.contains("\"keyboard_events\":7"));
+        assert!(j.contains("\"encoded_pictures\":3"));
+        assert!(j.contains("\"transport_retired\":2"));
+        assert!(j.contains("\"diagnostics_version\":1"));
         assert!(j.contains("\"connected\":true"));
         assert!(j.contains("\"width\":1920"));
         assert!(j.contains("\"bitrate_bps\":4000000"));
@@ -166,5 +321,29 @@ mod tests {
         let a = enable();
         let b = global().expect("enabled");
         assert!(Arc::ptr_eq(&a, b));
+    }
+
+    #[test]
+    fn performance_counters_measure_logical_frames_and_encode_completion() {
+        let s = SessionStats::default();
+        s.record_video_queued(2, 1_000);
+        s.record_video_queued(1, 500);
+        s.record_encode(std::time::Duration::from_micros(2_500));
+        s.record_encode(std::time::Duration::from_micros(1_000));
+        s.encode_retained_submitted.store(1, Ordering::Relaxed);
+        s.video_generation.store(2, Ordering::Relaxed);
+        let json = s.to_json();
+        for field in [
+            "\"video_frames_queued\":3",
+            "\"video_payload_bytes\":1500",
+            "\"encode_completed\":2",
+            "\"encode_retained_submitted\":1",
+            "\"encode_total_us\":3500",
+            "\"video_generation\":2",
+            "\"ack_samples\":0",
+        ] {
+            assert!(json.contains(field), "missing {field}");
+        }
+        assert!(json.contains("\"uptime_ms\":"));
     }
 }

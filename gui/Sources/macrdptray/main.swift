@@ -1,6 +1,7 @@
 import AppKit
 import ControllerCore
 import Darwin
+import Security
 import UniformTypeIdentifiers
 
 enum ServerAction: Equatable {
@@ -26,6 +27,7 @@ struct ServerActionResult {
     let repaired: Bool
     let needsPermissionAttention: Bool
     let cancelled: Bool
+    let waitingForPassword: Bool
 
     init(
         success: Bool,
@@ -33,7 +35,8 @@ struct ServerActionResult {
         running: Bool,
         repaired: Bool,
         needsPermissionAttention: Bool,
-        cancelled: Bool = false
+        cancelled: Bool = false,
+        waitingForPassword: Bool = false
     ) {
         self.success = success
         self.message = message
@@ -41,6 +44,7 @@ struct ServerActionResult {
         self.repaired = repaired
         self.needsPermissionAttention = needsPermissionAttention
         self.cancelled = cancelled
+        self.waitingForPassword = waitingForPassword
     }
 }
 
@@ -147,7 +151,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// (loaded, pid). loaded=false means the agent isn't bootstrapped at all;
     /// pid=nil while loaded means installed but not currently running.
     func agentState() -> (loaded: Bool, pid: Int?) {
-        let out = run("/bin/launchctl", ["print", service])
+        agentState(for: service)
+    }
+
+    private func agentState(for target: String, timeout: TimeInterval = 4) -> (loaded: Bool, pid: Int?) {
+        let out = run("/bin/launchctl", ["print", target], timeout: timeout)
         guard out.code == 0 else { return (false, nil) }
         if let r = out.stdout.range(of: #"pid = (\d+)"#, options: .regularExpression) {
             let pid = out.stdout[r].split(separator: "=").last
@@ -188,7 +196,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let window: UInt64 = 32 * 1024
         try? h.seek(toOffset: size > window ? size - window : 0)
         let data = (try? h.readToEnd()) ?? Data()
-        return (String(data: data, encoding: .utf8) ?? "")
+        return String(decoding: data, as: UTF8.self)
             .split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
     }
 
@@ -231,7 +239,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let header: String
         if let action = activeServerAction { header = "macrdp Controller — \(action.progressTitle)" }
         else if !st.loaded { header = "macrdp Controller — not installed" }
-        else if let pid = st.pid { header = "macrdp Controller — running (pid \(pid))" }
+        else if let pid = st.pid {
+            header = CredentialStatus.latest(for: pid, in: logTail()) == .waiting
+                ? "macrdp Controller — waiting for account password"
+                : "macrdp Controller — running (pid \(pid))"
+        }
         else { header = "macrdp Controller — stopped" }
         let h = NSMenuItem(title: header, action: nil, keyEquivalent: "")
         h.isEnabled = false
@@ -404,8 +416,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         print("installed: \(plistURL.path) -> \(serverApp.path)")
         print(result.message)
         if !hasKeychainPassword() {
-            print("note: Keychain password not set — store it with:")
-            print("  security add-generic-password -U -s macrdp -a \(NSUserName()) -w '<password>'")
+            print("note: Keychain password not set — open macrdp Controller and choose Set Password…")
         }
         return 0
     }
@@ -495,10 +506,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startServerNow(serverApp: URL, forceRepair: Bool) -> ServerActionResult {
         let logMarker = startupLogMarker()
         ensureConfigExists()
+        let bind = readConfig()["BIND"] ?? "127.0.0.1:3390"
+        let loadedState = agentState()
+        guard let port = RDPListener.port(fromBind: bind) else {
+            return ServerActionResult(
+                success: false, message: "Set a valid RDP port in Connection before starting.",
+                running: loadedState.pid != nil, repaired: false, needsPermissionAttention: false)
+        }
+        let upstreamService = "\(domain)/com.clintcan.macrdp"
+        if service != upstreamService,
+           let upstreamPID = agentState(for: upstreamService, timeout: 2).pid,
+           upstreamPID != loadedState.pid,
+           isListening(pid: upstreamPID, port: port) {
+            return ServerActionResult(
+                success: false,
+                message: "The upstream macrdp server is listening on port \(port). Stop it from macrdpController before starting this fork.",
+                running: loadedState.pid != nil, repaired: false, needsPermissionAttention: false)
+        }
         let spec = launchAgentSpec(serverApp: serverApp)
         let existing = readLaunchAgentPlist()
         let previousProgram = existing.flatMap(LaunchAgentSpec.programPath(in:))
-        let loadedState = agentState()
         let loadedProgram = loadedState.loaded ? registeredAgentProgramPath() : nil
         let requiresRepair = spec.requiresRepair(
             plist: existing,
@@ -546,12 +573,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 running: false, repaired: shouldRepair, needsPermissionAttention: false)
         }
 
-        guard let pid = waitForStableServer() else {
-            let failure = serverStartupFailure(since: logMarker)
+        guard let pid = waitForListeningServer(port: port) else {
+            let currentPID = agentState().pid
+            let waiting = currentPID.map { CredentialStatus.latest(for: $0, in: logTail()) == .waiting } ?? false
+            let failure = waiting
+                ? "The server is waiting for a valid Keychain password. Update it in Connection → Account."
+                : serverStartupFailure(since: logMarker, port: port, processPresent: currentPID != nil)
             return ServerActionResult(
-                success: false, message: failure, running: false,
+                success: false, message: failure, running: currentPID != nil,
                 repaired: shouldRepair,
-                needsPermissionAttention: failure.contains("Screen Recording"))
+                needsPermissionAttention: failure.contains("Screen Recording"),
+                waitingForPassword: waiting)
         }
 
         let permissions = permissionStatus()
@@ -604,16 +636,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return commandFailure("launchd couldn't load the server", result: last)
     }
 
-    /// Require a PID to remain present across two samples. This catches the
-    /// common "kickstart returned success, process immediately crashed" case.
-    private func waitForStableServer() -> Int? {
-        let deadline = Date().addingTimeInterval(12)
-        while Date() < deadline {
-            if let pid = agentState().pid {
-                Thread.sleep(forTimeInterval: 0.6)
-                if agentState().pid != nil { return pid }
+    private func isListening(pid: Int, port: UInt16) -> Bool {
+        let out = run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(pid), "-iTCP:\(port)",
+                                        "-sTCP:LISTEN", "-Fn"], timeout: 1)
+        return out.code == 0 && RDPListener.isOwned(by: pid, port: port, in: out.stdout)
+    }
+
+    /// A launchd PID can exist before the application finishes setup or binds.
+    /// Confirm the port belongs to that PID, not another app or the Brew copy.
+    private func waitForListeningServer(port: UInt16) -> Int? {
+        let deadline = ProcessInfo.processInfo.systemUptime + 12
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if let pid = agentState(for: service, timeout: 1).pid,
+               isListening(pid: pid, port: port),
+               agentState(for: service, timeout: 1).pid == pid {
+                return pid
             }
-            Thread.sleep(forTimeInterval: 0.2)
+            Thread.sleep(forTimeInterval: 0.25)
         }
         return nil
     }
@@ -649,7 +688,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private func serverStartupFailure(since marker: StartupLogMarker) -> String {
+    private func serverStartupFailure(since marker: StartupLogMarker, port: UInt16, processPresent: Bool) -> String {
         let err = textSince(marker.stderr, in: errLogURL)
         if err.contains("NoShareableContent") || err.contains("declined TCC") {
             return "Screen Recording permission isn't granted to macrdp.app. Enable it in "
@@ -660,8 +699,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return "Screen Recording permission isn't granted to macrdp.app. Enable it in "
                 + "System Settings → Privacy & Security, then start the server again."
         }
-        if recent.contains("Address already in use") {
-            return "Port 3390 is already in use by another process."
+        if (recent + err).localizedCaseInsensitiveContains("Address already in use") {
+            return "RDP port \(port) is already in use. Stop the other server or choose a different port in Connection."
+        }
+        if processPresent {
+            return "The server process started, but the Controller couldn't confirm that port \(port) is listening. Check Open Logs before connecting."
         }
         let state = run("/bin/launchctl", ["print", service], timeout: 4).stdout
         if let range = state.range(of: #"last exit code = [^\n]+"#, options: .regularExpression) {
@@ -673,8 +715,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Keychain password onboarding
 
     /// The server (run headless by launchd) reads its account password from the
-    /// Keychain via the `security` CLI, so we write it the same way — keeping the
-    /// item's access context as /usr/bin/security so no read-time prompt appears.
+    /// Keychain via the `security` CLI. Native writes explicitly trust that
+    /// reader so the headless server keeps working without an access prompt.
     func hasKeychainPassword() -> Bool {
         run("/usr/bin/security", ["find-generic-password", "-s", "macrdp", "-a", NSUserName()]).code == 0
     }
@@ -693,15 +735,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.accessoryView = field
         a.window.initialFirstResponder = field
         NSApp.activate(ignoringOtherApps: true)
-        guard a.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return false }
-        let r = run("/usr/bin/security",
-                    ["add-generic-password", "-U", "-s", "macrdp", "-a", NSUserName(),
-                     "-w", field.stringValue])
-        if r.code != 0 {
-            alert(style: .critical, "Couldn't save password", "Keychain returned an error.")
-            return false
+        while true {
+            guard a.runModal() == .alertFirstButtonReturn else {
+                field.stringValue = ""
+                return false
+            }
+            let result = AccountPassword.verifyAndSave(account: NSUserName(), password: field.stringValue)
+            field.stringValue = ""
+            switch result {
+            case .saved:
+                return true
+            case .invalid:
+                a.messageText = "Check your macOS account password"
+                a.informativeText = "The password did not match. Nothing was saved. Try again or click Cancel."
+            case .verificationUnavailable:
+                alert(style: .warning, "Couldn't verify your password",
+                      "macOS couldn't confirm your account password. Nothing was saved. Try again later.")
+                return false
+            case .keychainFailure:
+                alert(style: .critical, "Couldn't save password", "Keychain returned an error.")
+                return false
+            }
         }
-        return true
     }
 
     @objc func setPassword() { promptAndStorePassword() }
@@ -928,25 +983,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return d
     }
 
-    func writeConfig(key: String, value: String) {
-        ensureConfigExists()
-        guard let text = try? String(contentsOf: configURL, encoding: .utf8) else { return }
-        var lines = text.components(separatedBy: "\n")
-        var found = false
-        for (i, raw) in lines.enumerated() {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("#") { continue }
-            guard let eq = line.firstIndex(of: "=") else { continue }
-            let k = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
-            if k == key { lines[i] = "\(key)=\(value)"; found = true; break }
-        }
-        if !found { lines.append("\(key)=\(value)") }
-        // Always end with exactly one trailing newline — a config file with no
-        // final newline makes a downstream append concatenate onto the last
-        // key (which silently corrupted VD_HEIGHT + a new key once).
-        let body = lines.joined(separator: "\n")
-        let out = body.hasSuffix("\n") ? body : body + "\n"
-        try? out.write(to: configURL, atomically: true, encoding: .utf8)
+    func saveConfig(changes: [String: String]) throws {
+        try ConfigurationFile.save(changes: changes, to: configURL)
     }
 
     func ensureConfigExists() {

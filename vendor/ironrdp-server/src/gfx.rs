@@ -124,19 +124,130 @@ impl DvcProcessor for GfxDvcBridge {
 
 impl DvcServerProcessor for GfxDvcBridge {}
 
+/// Retires a batch only when the transport write finishes (or the batch is
+/// abandoned on disconnect/error). Keeping this in the queued event includes
+/// socket backpressure in the producer's outstanding-frame count.
+#[derive(Debug)]
+pub struct EgfxFrameCompletion {
+    completed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    frames: u64,
+    observer: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl EgfxFrameCompletion {
+    pub fn new(completed: std::sync::Arc<std::sync::atomic::AtomicU64>, frames: u64) -> Self {
+        Self {
+            completed,
+            frames,
+            observer: None,
+        }
+    }
+
+    /// Optional process-wide diagnostic counter. Retired includes abandoned
+    /// batches as well as completed writes; it is not a client presentation ACK.
+    pub fn with_observer(mut self, observer: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+}
+
+impl Drop for EgfxFrameCompletion {
+    fn drop(&mut self) {
+        self.completed
+            .fetch_add(self.frames, std::sync::atomic::Ordering::Relaxed);
+        if let Some(observer) = &self.observer {
+            observer.fetch_add(self.frames, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Message for routing EGFX PDUs to the wire via `ServerEvent`.
 #[derive(Debug)]
 pub enum EgfxServerMessage {
     /// Pre-encoded DVC messages from `GraphicsPipelineServer::drain_output()`.
     SendMessages { messages: Vec<SvcMessage> },
+    /// Video batch whose pipeline slot remains occupied until transport dispatch.
+    SendTrackedMessages {
+        messages: Vec<SvcMessage>,
+        completion: EgfxFrameCompletion,
+    },
 }
 
 impl core::fmt::Display for EgfxServerMessage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::SendMessages { messages } => {
+            Self::SendMessages { messages } | Self::SendTrackedMessages { messages, .. } => {
                 write!(f, "SendMessages(count={})", messages.len())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn diagnostic_observer_follows_batch_lifetime_without_releasing_early() {
+        let completed = Arc::new(AtomicU64::new(0));
+        let observed = Arc::new(AtomicU64::new(7));
+        let token = EgfxFrameCompletion::new(completed.clone(), 2).with_observer(observed.clone());
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+        assert_eq!(observed.load(Ordering::Relaxed), 7);
+        drop(token);
+        assert_eq!(completed.load(Ordering::Relaxed), 2);
+        assert_eq!(observed.load(Ordering::Relaxed), 9);
+    }
+
+    #[tokio::test]
+    async fn slow_transport_keeps_video_slots_occupied_until_write_completes() {
+        let completed = Arc::new(AtomicU64::new(0));
+        let event = EgfxServerMessage::SendTrackedMessages {
+            messages: vec![],
+            completion: EgfxFrameCompletion::new(completed.clone(), 2),
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let EgfxServerMessage::SendTrackedMessages { completion, .. } = event else {
+                panic!()
+            };
+            started_tx.send(()).unwrap();
+            writer.write_all(&[1; 16]).await.unwrap();
+            drop(completion);
+        });
+        started_rx.await.unwrap();
+        // The writer cannot finish: sixteen bytes into a one-byte socket.
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+        let mut data = [0; 16];
+        reader.read_exact(&mut data).await.unwrap();
+        task.await.unwrap();
+        assert_eq!(completed.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn queued_batches_are_not_completed_just_by_enqueueing() {
+        let completed = Arc::new(AtomicU64::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..2 {
+            tx.send(EgfxServerMessage::SendTrackedMessages {
+                messages: vec![],
+                completion: EgfxFrameCompletion::new(completed.clone(), 1),
+            })
+            .unwrap();
+        }
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+        let writing = rx.recv().await.unwrap();
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+        drop(writing);
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
+        // Disconnect also retires queued batches instead of leaking slots.
+        drop(rx);
+        assert_eq!(completed.load(Ordering::Relaxed), 2);
     }
 }

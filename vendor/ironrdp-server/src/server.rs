@@ -27,7 +27,7 @@ use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, un
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpSocket, TcpStream};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tokio::task;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, trace, warn};
@@ -223,13 +223,10 @@ impl RdpServerOptions {
     }
 
     fn nscodec_color_loss_level(&self) -> Option<u8> {
-        self.codecs
-            .0
-            .iter()
-            .find_map(|codec| match &codec.property {
-                CodecProperty::NsCodec(ns) => Some(ns.color_loss_level),
-                _ => None,
-            })
+        self.codecs.0.iter().find_map(|codec| match &codec.property {
+            CodecProperty::NsCodec(ns) => Some(ns.color_loss_level),
+            _ => None,
+        })
     }
 }
 
@@ -253,6 +250,13 @@ impl RdpServerSecurity {
 
 struct AInputHandler {
     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    live: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for AInputHandler {
+    fn drop(&mut self) {
+        self.live.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl_as_any!(AInputHandler);
@@ -278,8 +282,12 @@ impl dvc::DvcProcessor for AInputHandler {
         match decode(payload).map_err(|e| decode_err!(e))? {
             ClientPdu::Mouse(pdu) => {
                 let handler = Arc::clone(&self.handler);
+                let live = Arc::clone(&self.live);
                 task::spawn_blocking(move || {
-                    handler.blocking_lock().mouse(pdu.into());
+                    let mut handler = handler.blocking_lock();
+                    if live.load(std::sync::atomic::Ordering::Relaxed) {
+                        handler.mouse(pdu.into());
+                    }
                 });
             }
         }
@@ -291,19 +299,44 @@ impl dvc::DvcProcessor for AInputHandler {
 impl dvc::DvcServerProcessor for AInputHandler {}
 
 struct DisplayControlBackend {
-    display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
+    layouts: watch::Sender<Option<DisplayControlMonitorLayout>>,
+    live: Arc<AtomicBool>,
+    worker: task::JoinHandle<()>,
 }
 
 impl DisplayControlBackend {
     fn new(display: Arc<Mutex<Box<dyn RdpServerDisplay>>>) -> Self {
-        Self { display }
+        let (layouts, mut pending) = watch::channel::<Option<DisplayControlMonitorLayout>>(None);
+        let live = Arc::new(AtomicBool::new(true));
+        let worker_live = Arc::clone(&live);
+        let worker = task::spawn(async move {
+            while pending.changed().await.is_ok() {
+                let mut display = display.lock().await;
+                if !worker_live.load(Ordering::Acquire) {
+                    break;
+                }
+                // Read after acquiring the display. A slow handler must not
+                // build a queue of obsolete intermediate drag sizes.
+                let layout = pending.borrow_and_update().clone();
+                if let Some(layout) = layout {
+                    display.request_layout(layout);
+                }
+            }
+        });
+        Self { layouts, live, worker }
+    }
+}
+
+impl Drop for DisplayControlBackend {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+        self.worker.abort();
     }
 }
 
 impl DisplayControlHandler for DisplayControlBackend {
     fn monitor_layout(&self, layout: DisplayControlMonitorLayout) {
-        let display = Arc::clone(&self.display);
-        task::spawn_blocking(move || display.blocking_lock().request_layout(layout));
+        self.layouts.send_replace(Some(layout));
     }
 }
 
@@ -538,6 +571,7 @@ pub struct RdpServer {
     /// frames during a long minimize and the refocus chew-through locks
     /// up its input dispatch for several seconds.
     display_suppressed: Arc<AtomicBool>,
+    display_suppressed_changed: Option<Arc<Notify>>,
     /// (vendored) Forwarded to each connection's `Acceptor` so it adopts
     /// the desktop size the client requests in its Client Core Data
     /// before Demand Active is sent. See
@@ -827,6 +861,7 @@ fn attach_channels_impl(
     let dvc = dvc::DrdynvcServer::new()
         .with_dynamic_channel(AInputHandler {
             handler: Arc::clone(handler),
+            live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
         .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
 
@@ -1205,6 +1240,7 @@ impl RdpServer {
             recently_evicted: None,
             connection_handler: connection_handler.map(|h| Rc::new(RefCell::new(h))),
             display_suppressed: Arc::new(AtomicBool::new(false)),
+            display_suppressed_changed: None,
             keyboard_layout: None,
             link_rtt_ms: None,
             #[cfg(feature = "multitransport")]
@@ -1275,6 +1311,21 @@ impl RdpServer {
     /// Must be called before any client connects.
     pub fn set_display_suppressed_handle(&mut self, handle: Arc<AtomicBool>) {
         self.display_suppressed = handle;
+    }
+
+    /// Register a wakeup for the display backend when suppression changes.
+    pub fn set_display_suppressed_wakeup(&mut self, wakeup: Arc<Notify>) {
+        self.display_suppressed_changed = Some(wakeup);
+    }
+
+    fn update_display_suppressed(&self, suppressed: bool) -> bool {
+        let changed = self.display_suppressed.swap(suppressed, Ordering::Relaxed) != suppressed;
+        if changed {
+            if let Some(wakeup) = &self.display_suppressed_changed {
+                wakeup.notify_one();
+            }
+        }
+        changed
     }
 
     /// (vendored) Serve each session at the desktop size the client
@@ -2161,7 +2212,12 @@ impl RdpServer {
                     error!(?error, "Connection error");
                 }
 
+                // Invalidate queued Advanced Input jobs before releasing the
+                // old client's buttons. Jobs already holding the input lock
+                // finish first; jobs acquiring it later see the retired DVC.
                 self.static_channels = StaticChannelSet::new();
+                self.display.lock().await.session_ended();
+                self.handler.lock().await.session_ended();
 
                 // (M3c) Reset per-connection UDP-multitransport state that is
                 // otherwise only ever SET, never cleared — so a reconnect to
@@ -2663,53 +2719,57 @@ impl RdpServer {
                     }
                 },
                 #[cfg(feature = "egfx")]
-                ServerEvent::Egfx(msg) => match msg {
-                    EgfxServerMessage::SendMessages { messages } => {
-                        // (M5c) Once EGFX has been migrated onto the UDP tunnel
-                        // (`egfx_on_udp`, only under MACRDP_UDP_MIGRATE_EGFX), route
-                        // its frames over the tunnel instead of the TCP drdynvc
-                        // channel. Default path is unchanged TCP.
-                        #[cfg(feature = "multitransport")]
-                        if self.egfx_on_udp {
-                            // EGFX-over-UDP → TCP watchdog: the H.264 pipeline sets
-                            // `demigrate_request` when it detects the reliable UDP
-                            // tunnel has wedged (acks silent while shipping). Flip
-                            // routing back to the TCP DRDYNVC channel for the rest of
-                            // this session and fall through to the TCP path — mstsc
-                            // renders EGFX on TCP after a Soft-Sync (Spike A). The flip
-                            // also clears the H.264 #89 backpressure gate via the
-                            // shared egfx_on_udp handle. One-way; reset on reconnect.
-                            if self
-                                .demigrate_request
-                                .as_ref()
-                                .is_some_and(|h| h.load(std::sync::atomic::Ordering::Relaxed))
-                            {
-                                self.egfx_on_udp = false;
-                                if let Some(handle) = &self.egfx_on_udp_handle {
-                                    handle.store(false, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                warn!(
-                                    "EGFX-over-UDP reliable tunnel wedged — watchdog de-migrating EGFX to \
-                                     TCP DRDYNVC for the rest of this session"
-                                );
-                                // fall through to the TCP DRDYNVC path below
-                            } else {
-                                self.route_dvc_over_udp(messages)?;
-                                continue;
+                ServerEvent::Egfx(msg) => {
+                    // Retain the completion token across the awaited TCP
+                    // write. Enqueueing the event alone must not free a slot.
+                    let (messages, _completion) = match msg {
+                        EgfxServerMessage::SendMessages { messages } => (messages, None),
+                        EgfxServerMessage::SendTrackedMessages { messages, completion } => (messages, Some(completion)),
+                    };
+                    // (M5c) Once EGFX has been migrated onto the UDP tunnel
+                    // (`egfx_on_udp`, only under MACRDP_UDP_MIGRATE_EGFX), route
+                    // its frames over the tunnel instead of the TCP drdynvc
+                    // channel. Default path is unchanged TCP.
+                    #[cfg(feature = "multitransport")]
+                    if self.egfx_on_udp {
+                        // EGFX-over-UDP → TCP watchdog: the H.264 pipeline sets
+                        // `demigrate_request` when it detects the reliable UDP
+                        // tunnel has wedged (acks silent while shipping). Flip
+                        // routing back to the TCP DRDYNVC channel for the rest of
+                        // this session and fall through to the TCP path — mstsc
+                        // renders EGFX on TCP after a Soft-Sync (Spike A). The flip
+                        // also clears the H.264 #89 backpressure gate via the
+                        // shared egfx_on_udp handle. One-way; reset on reconnect.
+                        if self
+                            .demigrate_request
+                            .as_ref()
+                            .is_some_and(|h| h.load(std::sync::atomic::Ordering::Relaxed))
+                        {
+                            self.egfx_on_udp = false;
+                            if let Some(handle) = &self.egfx_on_udp_handle {
+                                handle.store(false, std::sync::atomic::Ordering::Relaxed);
                             }
+                            warn!(
+                                "EGFX-over-UDP reliable tunnel wedged — watchdog de-migrating EGFX to \
+                                     TCP DRDYNVC for the rest of this session"
+                            );
+                            // fall through to the TCP DRDYNVC path below
+                        } else {
+                            self.route_dvc_over_udp(messages)?;
+                            continue;
                         }
-                        let drdynvc_channel_id = self
-                            .get_channel_id_by_type::<dvc::DrdynvcServer>()
-                            .context("DRDYNVC channel not found")?;
-                        let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
-                        writer.write_all(&data).await?;
-                        // (M5c) Now that EGFX is actively shipping (its DVC channel
-                        // is open) AND the UDP tunnel is bound, fire the Soft-Sync
-                        // request once — the cue to migrate EGFX onto the tunnel.
-                        #[cfg(feature = "multitransport")]
-                        self.maybe_soft_sync_on_egfx(writer, user_channel_id).await?;
                     }
-                },
+                    let drdynvc_channel_id = self
+                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
+                        .context("DRDYNVC channel not found")?;
+                    let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
+                    writer.write_all(&data).await?;
+                    // (M5c) Now that EGFX is actively shipping (its DVC channel
+                    // is open) AND the UDP tunnel is bound, fire the Soft-Sync
+                    // request once — the cue to migrate EGFX onto the tunnel.
+                    #[cfg(feature = "multitransport")]
+                    self.maybe_soft_sync_on_egfx(writer, user_channel_id).await?;
+                }
                 ServerEvent::AutoDetectRttRequest => {
                     if let Some(ref mut ad) = self.autodetect {
                         ad.expire_stale_probes(crate::autodetect::RTT_PROBE_MAX_AGE);
@@ -3729,7 +3789,7 @@ impl RdpServer {
                 // skip frame emission while it's set.
                 rdp::headers::ShareDataPdu::SuppressOutput(pdu) => {
                     let suppress = pdu.desktop_rect.is_none();
-                    self.display_suppressed.store(suppress, Ordering::Relaxed);
+                    self.update_display_suppressed(suppress);
                     debug!(suppress, "client suppress-output state changed");
                 }
 
@@ -3741,7 +3801,7 @@ impl RdpServer {
                 // this; clearing here is belt-and-braces against clients
                 // that send only one of the two.)
                 rdp::headers::ShareDataPdu::RefreshRectangle(_) => {
-                    if self.display_suppressed.swap(false, Ordering::Relaxed) {
+                    if self.update_display_suppressed(false) {
                         debug!("client RefreshRectangle cleared suppress-output state");
                     }
                 }

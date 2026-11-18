@@ -44,17 +44,65 @@ pub struct EncodedFrame {
     pub parameter_sets: Vec<Vec<u8>>,
 }
 
+/// Every accepted picture produces an outcome, including encoder drops.
+#[derive(Debug)]
+pub enum EncodeOutput {
+    Picture(EncodedFrame),
+    Dropped { pts: i64 },
+}
+
+impl EncodeOutput {
+    pub fn pts(&self) -> i64 {
+        match self {
+            Self::Picture(frame) => frame.pts,
+            Self::Dropped { pts } => *pts,
+        }
+    }
+}
+
+struct OutputContext {
+    tx: mpsc::Sender<EncodeOutput>,
+    pending: std::sync::Mutex<std::collections::HashMap<i64, Option<std::time::Instant>>>,
+}
+
+impl OutputContext {
+    fn begin(&self, pts: i64) {
+        self.pending.lock().unwrap().insert(
+            pts,
+            crate::stats::global().map(|_| std::time::Instant::now()),
+        );
+    }
+
+    fn cancel(&self, pts: i64) {
+        self.pending.lock().unwrap().remove(&pts);
+    }
+
+    fn complete(&self, output: EncodeOutput) {
+        // VT can report a synchronous drop as well as call the callback.
+        // Deliver exactly one outcome, whichever arrives first.
+        let started = self.pending.lock().unwrap().remove(&output.pts());
+        if let Some(started) = started {
+            if let (EncodeOutput::Picture(_), Some(started), Some(stats)) =
+                (&output, started, crate::stats::global())
+            {
+                stats.record_encode(started.elapsed());
+            }
+            let _ = self.tx.send(output);
+        }
+    }
+}
+
 pub struct Encoder {
     inner: ffi::SessionGuard,
     /// VideoToolbox output channel. `Option` because the push pipeline
     /// (`h264.rs`) takes the receiver out via `take_receiver` and runs it on a
     /// dedicated ship thread; once taken, `drain`/`flush` are no-ops here. Tests
     /// keep it and use `flush`.
-    rx: Option<mpsc::Receiver<EncodedFrame>>,
+    rx: Option<mpsc::Receiver<EncodeOutput>>,
     /// Heap-allocated sender pointed at by VT's `outputCallbackRefCon`.
     /// Owned here so it outlives the session; freed when the session is
     /// invalidated in `Drop`.
-    _tx_ctx: Box<mpsc::Sender<EncodedFrame>>,
+    _tx_ctx: Box<OutputContext>,
     width: u16,
     height: u16,
     next_pts: i64,
@@ -216,7 +264,15 @@ impl Encoder {
             std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
             Ok("0") | Ok("false") | Ok("FALSE")
         );
-        Self::new_with_range(width, height, fps, bitrate_bps, keyframe_secs, full_range)
+        Self::new_with_range(
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            keyframe_secs,
+            full_range,
+            false,
+        )
     }
 
     fn new_with_range(
@@ -226,13 +282,16 @@ impl Encoder {
         bitrate_bps: u32,
         keyframe_secs: f32,
         full_range: bool,
+        low_latency: bool,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::channel::<EncodedFrame>();
-        // The callback receives the raw `*mut Sender` and clones it per
-        // delivery — see `ffi::output_callback`. Keep the original Box
-        // alive on the Encoder so the pointer stays valid.
-        let tx_box = Box::new(tx);
-        let tx_ptr = Box::as_ref(&tx_box) as *const mpsc::Sender<EncodedFrame> as *mut c_void;
+        let (tx, rx) = mpsc::channel::<EncodeOutput>();
+        // The callback context stays alive until the VT session is invalidated.
+        // It deduplicates callback and synchronous-drop completion reports.
+        let tx_box = Box::new(OutputContext {
+            tx,
+            pending: Default::default(),
+        });
+        let tx_ptr = Box::as_ref(&tx_box) as *const OutputContext as *mut c_void;
 
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
@@ -244,6 +303,7 @@ impl Encoder {
             keyframe_frames,
             tx_ptr,
             full_range,
+            low_latency,
         )?;
         Ok(Self {
             inner: session,
@@ -261,7 +321,7 @@ impl Encoder {
     /// thread (the push pipeline). After this, `drain`/`flush` on this encoder
     /// return nothing; the encoder is submit-only. Returns `None` if already
     /// taken.
-    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodedFrame>> {
+    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodeOutput>> {
         self.rx.take()
     }
 
@@ -379,8 +439,10 @@ impl Encoder {
     pub fn drain(&mut self) -> Vec<EncodedFrame> {
         let mut out = Vec::new();
         if let Some(rx) = self.rx.as_ref() {
-            while let Ok(frame) = rx.try_recv() {
-                out.push(frame);
+            while let Ok(output) = rx.try_recv() {
+                if let EncodeOutput::Picture(frame) = output {
+                    out.push(frame);
+                }
             }
         }
         out
@@ -427,6 +489,7 @@ impl Avc444Encoder {
             bitrate_bps,
             keyframe_secs,
             true,
+            false,
         )?;
         let all_intra_env = std::env::var("MACRDP_AVC444_ALL_INTRA").ok();
         let all_intra = avc444_all_intra_setting(all_intra_env.as_deref());
@@ -444,7 +507,7 @@ impl Avc444Encoder {
         self.all_intra
     }
 
-    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodedFrame>> {
+    pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<EncodeOutput>> {
         self.encoder.take_receiver()
     }
 
@@ -525,11 +588,10 @@ fn avc444_all_intra_setting(value: Option<&str>) -> bool {
 unsafe impl Send for Encoder {}
 
 mod ffi {
-    use super::EncodedFrame;
+    use super::{EncodeOutput, EncodedFrame, OutputContext};
     use anyhow::{anyhow, bail, Result};
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::mpsc;
 
     pub(super) type OSStatus = i32;
     pub(super) type Boolean = u8;
@@ -620,6 +682,8 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
+        pub(super) static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
+        pub(super) static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         // Color-space signaling so the encoded SPS VUI describes its color
@@ -768,6 +832,7 @@ mod ffi {
     /// counterpart to `VTCompressionSessionCreate`'s implicit retain.
     pub(super) struct SessionGuard {
         pub(super) session: VTCompressionSessionRef,
+        pub(super) output_context: *mut c_void,
     }
 
     impl Drop for SessionGuard {
@@ -790,6 +855,7 @@ mod ffi {
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
         full_range: bool,
+        low_latency: bool,
     ) -> Result<SessionGuard> {
         // Supplying explicit source attributes makes VideoToolbox expose a
         // matching CVPixelBufferPool. Allocating frames from that pool lets VT
@@ -859,6 +925,26 @@ mod ffi {
             bail!("CFDictionaryCreate failed for source pixel-buffer attributes");
         }
 
+        let encoder_spec = if low_latency {
+            let spec = unsafe {
+                CFDictionaryCreate(
+                    ptr::null(),
+                    (&raw const kVTVideoEncoderSpecification_EnableLowLatencyRateControl).cast(),
+                    (&raw const kCFBooleanTrue).cast(),
+                    1,
+                    (&raw const kCFTypeDictionaryKeyCallBacks).cast(),
+                    (&raw const kCFTypeDictionaryValueCallBacks).cast(),
+                )
+            };
+            if spec.is_null() {
+                unsafe { CFRelease(source_attributes) };
+                bail!("CFDictionaryCreate failed for low-latency encoder specification");
+            }
+            spec
+        } else {
+            ptr::null()
+        };
+
         let mut session: VTCompressionSessionRef = ptr::null();
         let status = unsafe {
             VTCompressionSessionCreate(
@@ -866,7 +952,7 @@ mod ffi {
                 i32::from(width),
                 i32::from(height),
                 K_CM_VIDEO_CODEC_TYPE_H264,
-                ptr::null(),
+                encoder_spec,
                 source_attributes,
                 ptr::null(),
                 Some(output_callback),
@@ -874,7 +960,12 @@ mod ffi {
                 &mut session,
             )
         };
-        unsafe { CFRelease(source_attributes) };
+        unsafe {
+            CFRelease(source_attributes);
+            if !encoder_spec.is_null() {
+                CFRelease(encoder_spec);
+            }
+        };
         if status != 0 || session.is_null() {
             if !session.is_null() {
                 unsafe {
@@ -884,7 +975,10 @@ mod ffi {
             }
             bail!("VTCompressionSessionCreate failed: OSStatus {status}");
         }
-        let guard = SessionGuard { session };
+        let guard = SessionGuard {
+            session,
+            output_context: tx_ctx,
+        };
 
         // Real-time low-latency profile. Disable frame reordering so
         // every emitted frame is immediately decodable in order — RDP
@@ -905,7 +999,11 @@ mod ffi {
             set_string(
                 session,
                 kVTCompressionPropertyKey_ProfileLevel,
-                kVTProfileLevel_H264_Baseline_AutoLevel,
+                if low_latency {
+                    kVTProfileLevel_H264_High_AutoLevel
+                } else {
+                    kVTProfileLevel_H264_Baseline_AutoLevel
+                },
             )?;
             // Tag the bitstream's color space explicitly (BT.709). Without this
             // VideoToolbox leaves the SPS VUI under-specified and each decoder
@@ -1392,6 +1490,7 @@ mod ffi {
         force_keyframe: bool,
         full_range: bool,
     ) -> Result<()> {
+        let preparation = crate::stats::global().map(|stats| (stats, std::time::Instant::now()));
         // Full-range path feeds VT a `420f` (full-range NV12) buffer we fill
         // ourselves; otherwise hand VT BGRA and let it produce video-range YUV.
         let pixel_format = if full_range {
@@ -1437,7 +1536,7 @@ mod ffi {
             bail!("CVPixelBufferLockBaseAddress failed: {lock_status}");
         }
 
-        let populate_result: Result<()> = unsafe {
+        let populate_result: Result<()> = (|| unsafe {
             if full_range {
                 // Two planes: Y (full size) + interleaved CbCr (half size).
                 let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
@@ -1510,7 +1609,7 @@ mod ffi {
                 }
             }
             Ok(())
-        };
+        })();
         let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pbuf, 0) };
         if let Err(error) = populate_result {
             unsafe { CFRelease(pbuf) };
@@ -1519,6 +1618,10 @@ mod ffi {
         if unlock_status != 0 {
             unsafe { CFRelease(pbuf) };
             bail!("CVPixelBufferUnlockBaseAddress failed: {unlock_status}");
+        }
+
+        if let Some((stats, started)) = preparation {
+            stats.record_encode_preparation(started.elapsed());
         }
 
         let result = unsafe {
@@ -1549,6 +1652,8 @@ mod ffi {
                 ptr::null()
             };
 
+            let context = &*(guard.output_context as *const OutputContext);
+            context.begin(pts);
             let mut info_flags: VTEncodeInfoFlags = 0;
             let encode_status = VTCompressionSessionEncodeFrame(
                 guard.session,
@@ -1556,17 +1661,22 @@ mod ffi {
                 presentation,
                 duration,
                 frame_props,
-                ptr::null_mut(),
+                pts as usize as *mut c_void,
                 &mut info_flags,
             );
             if !frame_props.is_null() {
                 CFRelease(frame_props);
             }
             if encode_status != 0 {
+                context.cancel(pts);
                 Err(anyhow!(
                     "VTCompressionSessionEncodeFrame failed: OSStatus {encode_status}"
                 ))
             } else {
+                if info_flags & 2 != 0 {
+                    // kVTEncodeInfo_FrameDropped
+                    context.complete(EncodeOutput::Dropped { pts });
+                }
                 Ok(())
             }
         };
@@ -1624,7 +1734,7 @@ mod ffi {
             bail!("AVC444 CVPixelBufferLockBaseAddress failed: {lock_status}");
         }
 
-        let populate_result: Result<()> = unsafe {
+        let populate_result: Result<()> = (|| unsafe {
             let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
             let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
             let cbcr_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 1) as *mut u8;
@@ -1653,7 +1763,7 @@ mod ffi {
                 }
             }
             Ok(())
-        };
+        })();
         let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pbuf, 0) };
         if let Err(error) = populate_result {
             unsafe { CFRelease(pbuf) };
@@ -1691,6 +1801,8 @@ mod ffi {
             } else {
                 ptr::null()
             };
+            let context = &*(guard.output_context as *const OutputContext);
+            context.begin(pts);
             let mut info_flags: VTEncodeInfoFlags = 0;
             let encode_status = VTCompressionSessionEncodeFrame(
                 guard.session,
@@ -1698,17 +1810,22 @@ mod ffi {
                 presentation,
                 duration,
                 frame_props,
-                ptr::null_mut(),
+                pts as usize as *mut c_void,
                 &mut info_flags,
             );
             if !frame_props.is_null() {
                 CFRelease(frame_props);
             }
             if encode_status != 0 {
+                context.cancel(pts);
                 Err(anyhow!(
                     "AVC444 VTCompressionSessionEncodeFrame failed: OSStatus {encode_status}"
                 ))
             } else {
+                if info_flags & 2 != 0 {
+                    // kVTEncodeInfo_FrameDropped
+                    context.complete(EncodeOutput::Dropped { pts });
+                }
                 Ok(())
             }
         };
@@ -1734,28 +1851,53 @@ mod ffi {
     }
 
     /// VT output callback. Runs on a VT-internal thread; gets a pointer
-    /// back to the `mpsc::Sender<EncodedFrame>` we stashed in
-    /// `outputCallbackRefCon`. We clone the sender per delivery so its
-    /// lifetime is tied to the Encoder, not the callback.
+    /// back to the `OutputContext` we stashed in
+    /// `outputCallbackRefCon`. The Encoder keeps it alive until session
+    /// invalidation has finished all callbacks.
     unsafe extern "C" fn output_callback(
         output_callback_ref_con: *mut c_void,
-        _source_frame_ref_con: *mut c_void,
+        source_frame_ref_con: *mut c_void,
         status: OSStatus,
-        _info_flags: VTEncodeInfoFlags,
+        info_flags: VTEncodeInfoFlags,
         sample_buffer: CMSampleBufferRef,
     ) {
-        if status != 0 || sample_buffer.is_null() || output_callback_ref_con.is_null() {
-            // TODO(phase-2-step-2): surface this via the channel as an
-            // error variant so the EGFX bridge can react (drop session,
-            // request keyframe, etc.). Silently dropping is fine for the
-            // scaffold only.
+        if output_callback_ref_con.is_null() {
             return;
         }
-        let tx = &*(output_callback_ref_con as *const mpsc::Sender<EncodedFrame>);
-        let Ok(frame) = extract_frame(sample_buffer) else {
-            return;
+        let context = &*(output_callback_ref_con as *const OutputContext);
+        // Opaque integer tag; never dereference sourceFrameRefCon.
+        let pts = source_frame_ref_con as usize as i64;
+        let result = if status != 0 || sample_buffer.is_null() || info_flags & 2 != 0 {
+            Err(anyhow!(
+                "VideoToolbox output unavailable: status={status}, flags={info_flags}"
+            ))
+        } else {
+            extract_frame(sample_buffer)
         };
-        let _ = tx.send(frame);
+        match result {
+            Ok(mut frame) => {
+                frame.pts = pts;
+                if let Some(stats) = crate::stats::global() {
+                    stats
+                        .encoded_pictures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                context.complete(EncodeOutput::Picture(frame));
+            }
+            Err(error) => {
+                if let Some(stats) = crate::stats::global() {
+                    stats
+                        .encode_output_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                tracing::warn!(
+                    ?error,
+                    pts,
+                    "VideoToolbox dropped a picture; retiring submission and requesting IDR"
+                );
+                context.complete(EncodeOutput::Dropped { pts });
+            }
+        }
     }
 
     unsafe fn extract_frame(sbuf: CMSampleBufferRef) -> Result<EncodedFrame> {
@@ -1830,11 +1972,62 @@ mod ffi {
             parameter_sets,
         })
     }
+    #[cfg(test)]
+    mod callback_tests {
+        use super::*;
+
+        #[test]
+        fn error_and_null_sample_callbacks_report_drops_once() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let context = OutputContext {
+                tx,
+                pending: Default::default(),
+            };
+            let callback_context = &context as *const OutputContext as *mut c_void;
+            for (pts, status, flags) in [(0, -1, 0), (1, 0, 2), (2, 0, 0)] {
+                context.begin(pts);
+                unsafe {
+                    output_callback(
+                        callback_context,
+                        pts as usize as *mut c_void,
+                        status,
+                        flags,
+                        ptr::null_mut(),
+                    );
+                }
+            }
+            context.complete(EncodeOutput::Dropped { pts: 0 });
+            let outputs: Vec<_> = rx.try_iter().map(|output| output.pts()).collect();
+            assert_eq!(outputs, [0, 1, 2]);
+            assert!(context.pending.lock().unwrap().is_empty());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_callbacks_and_synchronous_drops_complete_each_picture_once() {
+        let (tx, rx) = mpsc::channel();
+        let context = OutputContext {
+            tx,
+            pending: Default::default(),
+        };
+        for pts in 0..20 {
+            context.begin(pts);
+            context.complete(EncodeOutput::Dropped { pts });
+            context.complete(EncodeOutput::Dropped { pts });
+        }
+        let outcomes: Vec<_> = rx.try_iter().collect();
+        assert_eq!(outcomes.len(), 20);
+        assert!(context.pending.lock().unwrap().is_empty());
+        context.begin(21);
+        context.cancel(21); // rejected submission must not release another slot
+        context.complete(EncodeOutput::Dropped { pts: 21 });
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn avc444_alignment_and_single_stream_pts() {
@@ -2136,6 +2329,82 @@ mod tests {
                 y444_vim_ms / nv12_vim_ms
             );
         }
+    }
+
+    /// Measure the AVC420 encoder at 4K with a bounded submission window.
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_avc420_4k_pipeline_depth() -> Result<()> {
+        use std::time::{Duration, Instant};
+
+        const WIDTH: u16 = 3840;
+        const HEIGHT: u16 = 2160;
+        const STRIDE: usize = WIDTH as usize * 4;
+        const WARMUP: usize = 12;
+        const FRAMES: usize = 120;
+        let frames: Vec<_> = (0..4)
+            .map(|scroll| {
+                let mut bytes = vec![0; STRIDE * usize::from(HEIGHT)];
+                for (index, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let x = index % usize::from(WIDTH);
+                    let y = index / usize::from(WIDTH) + scroll * 13;
+                    pixel.copy_from_slice(&[
+                        (x ^ y) as u8,
+                        (x + y / 4) as u8,
+                        ((x / 16 + y / 12) % 2 * 200) as u8,
+                        255,
+                    ]);
+                }
+                bytes
+            })
+            .collect();
+
+        for (mode, depth, low_latency) in [
+            ("standard", 1, false),
+            ("standard", 2, false),
+            ("low latency", 1, true),
+            ("low latency", 2, true),
+        ] {
+            let mut encoder =
+                Encoder::new_with_range(WIDTH, HEIGHT, 60, 100_000_000, 2.0, true, low_latency)?;
+            let outputs = encoder.take_receiver().expect("encoder output receiver");
+            let mut counts = [0_usize; 2];
+            for (phase, count) in [WARMUP, FRAMES].into_iter().enumerate() {
+                let started = Instant::now();
+                for index in 0..count {
+                    encoder.encode_bgra(
+                        &frames[index % frames.len()],
+                        STRIDE,
+                        phase == 0 && index == 0,
+                    )?;
+                    if index + 1 >= depth
+                        && matches!(
+                            outputs.recv_timeout(Duration::from_secs(3))?,
+                            EncodeOutput::Picture(_)
+                        )
+                    {
+                        counts[phase] += 1;
+                    }
+                }
+                for _ in 1..depth {
+                    if matches!(
+                        outputs.recv_timeout(Duration::from_secs(3))?,
+                        EncodeOutput::Picture(_)
+                    ) {
+                        counts[phase] += 1;
+                    }
+                }
+                if phase == 1 {
+                    let elapsed = started.elapsed().as_secs_f64();
+                    println!(
+                        "4K AVC420, {mode}, depth {depth}: {:.1} pictures/s, {} of {count} completed",
+                        counts[phase] as f64 / elapsed,
+                        counts[phase],
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// AVC444 scoping: does VideoToolbox actually run two concurrent

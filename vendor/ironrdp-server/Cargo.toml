@@ -98,9 +98,6 @@ ironrdp-egfx = { version = "0.3", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[dev-dependencies]
-tokio = { version = "1", features = ["sync"] }
-
 # [lints] workspace = true — inlined as empty since we're not in the workspace.
 [lints]
 

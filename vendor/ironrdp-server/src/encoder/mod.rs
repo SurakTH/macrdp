@@ -104,6 +104,10 @@ impl Default for UpdateEncoderCodecs {
 pub(crate) struct UpdateEncoder {
     desktop_size: DesktopSize,
     framebuffer: Option<Framebuffer>,
+    // Capture may seed a large desktop in full-width strips rather than one
+    // frame. Do not diff against zero-filled, not-yet-sent rows.
+    framebuffer_ready: bool,
+    seeded_rows: Vec<bool>,
     bitmap_updater: Option<BitmapUpdater>,
     /// Negotiated MultifragmentUpdate reassembly buffer size. Used to split
     /// oversized bitmaps into strips that fit within the limit when sent as
@@ -158,6 +162,8 @@ impl UpdateEncoder {
         Ok(Self {
             desktop_size,
             framebuffer: None,
+            framebuffer_ready: false,
+            seeded_rows: Vec::new(),
             bitmap_updater: Some(bitmap_updater),
             max_request_size: usize::try_from(max_request_size).context("max_request_size")?,
         })
@@ -173,6 +179,10 @@ impl UpdateEncoder {
 
     pub(crate) fn set_desktop_size(&mut self, size: DesktopSize) {
         self.desktop_size = size;
+        // A resized/reactivated client surface has no valid old pixels.
+        self.framebuffer = None;
+        self.framebuffer_ready = false;
+        self.seeded_rows.clear();
         self.bitmap_updater
             .as_mut()
             .expect("bitmap updater always Some")
@@ -244,7 +254,10 @@ impl UpdateEncoder {
             width,
             height,
             ..
-        }) = USE_DIFFS.then_some(self.framebuffer.as_ref()).flatten()
+        }) = (USE_DIFFS && self.framebuffer_ready)
+            .then_some(self.framebuffer.as_ref())
+            .flatten()
+            .filter(|fb| fb.format == bitmap.format)
         {
             find_different_rects_sub::<4>(
                 data,
@@ -319,11 +332,39 @@ impl UpdateEncoder {
             && bitmap.height.get() == self.desktop_size.height
         {
             match bitmap.try_into() {
-                Ok(framebuffer) => self.framebuffer = Some(framebuffer),
+                Ok(framebuffer) => {
+                    self.framebuffer = Some(framebuffer);
+                    self.framebuffer_ready = true;
+                    self.seeded_rows.clear();
+                }
                 Err(err) => warn!("Failed to convert bitmap to framebuffer: {}", err),
             }
-        } else if let Some(fb) = self.framebuffer.as_mut() {
-            fb.update_diffs(&bitmap, diffs);
+        } else {
+            if self.framebuffer.as_ref().is_none_or(|fb| fb.format != bitmap.format) {
+                let (Some(width), Some(height)) = (
+                    NonZeroU16::new(self.desktop_size.width),
+                    NonZeroU16::new(self.desktop_size.height),
+                ) else {
+                    return;
+                };
+                self.framebuffer = Some(Framebuffer::new(width, height, bitmap.format));
+                self.framebuffer_ready = false;
+                self.seeded_rows = vec![false; usize::from(height.get())];
+            }
+            if let Some(fb) = self.framebuffer.as_mut() {
+                fb.update_diffs(&bitmap, diffs);
+            }
+            if !self.framebuffer_ready && bitmap.x == 0 && bitmap.width.get() == self.desktop_size.width {
+                let start = usize::from(bitmap.y);
+                let end = start + usize::from(bitmap.height.get());
+                if let Some(rows) = self.seeded_rows.get_mut(start..end) {
+                    rows.fill(true);
+                }
+                self.framebuffer_ready = self.seeded_rows.iter().all(|known| *known);
+                if self.framebuffer_ready {
+                    self.seeded_rows.clear();
+                }
+            }
         }
     }
 
@@ -403,25 +444,33 @@ impl EncoderIter<'_> {
 
                     let x = match u16::try_from(x) {
                         Ok(x) => x,
-                        Err(_) => return Some(Err(anyhow!("invalid `x`: out of range integral conversion"))),
+                        Err(_) => {
+                            return Some(Err(anyhow!("invalid `x`: out of range integral conversion")));
+                        }
                     };
                     let y = match u16::try_from(y) {
                         Ok(y) => y,
-                        Err(_) => return Some(Err(anyhow!("invalid `y`: out of range integral conversion"))),
+                        Err(_) => {
+                            return Some(Err(anyhow!("invalid `y`: out of range integral conversion")));
+                        }
                     };
                     let width = match u16::try_from(width) {
                         Ok(width) => match NonZeroU16::new(width) {
                             Some(width) => width,
                             None => return Some(Err(anyhow!("rectangle width cannot be zero"))),
                         },
-                        Err(_) => return Some(Err(anyhow!("invalid `width`: out of range integral conversion"))),
+                        Err(_) => {
+                            return Some(Err(anyhow!("invalid `width`: out of range integral conversion")));
+                        }
                     };
                     let height = match u16::try_from(height) {
                         Ok(height) => match NonZeroU16::new(height) {
                             Some(height) => height,
                             None => return Some(Err(anyhow!("rectangle height cannot be zero"))),
                         },
-                        Err(_) => return Some(Err(anyhow!("invalid `height`: out of range integral conversion"))),
+                        Err(_) => {
+                            return Some(Err(anyhow!("invalid `height`: out of range integral conversion")));
+                        }
                     };
 
                     let Some(sub) = bitmap.sub(x, y, width, height) else {
@@ -571,10 +620,7 @@ impl BitmapUpdateHandler for RemoteFxHandler {
         // the first size estimate was too small — more likely at max quality.
         let desktop_size = self.desktop_size;
         let len = loop {
-            match self
-                .remotefx
-                .encode(bitmap, self.output.as_mut_slice(), desktop_size)
-            {
+            match self.remotefx.encode(bitmap, self.output.as_mut_slice(), desktop_size) {
                 Err(e) => match e.kind() {
                     ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
                         let new_len = self.output.len().saturating_mul(2);
@@ -758,4 +804,145 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<Updat
     };
     let cmd = SurfaceCommand::SetSurfaceBits(pdu);
     Ok(UpdateFragmenter::new(UpdateCode::SurfaceCommands, encode_vec(&cmd)?))
+}
+
+#[cfg(test)]
+mod bitmap_cache_tests {
+    use super::*;
+    use crate::PixelFormat;
+    use bytes::Bytes;
+    use std::num::NonZeroUsize;
+
+    fn encoder(width: u16, height: u16) -> UpdateEncoder {
+        UpdateEncoder::new(
+            DesktopSize { width, height },
+            CmdFlags::empty(),
+            UpdateEncoderCodecs::new(),
+            16 * 1024 * 1024,
+        )
+        .unwrap()
+    }
+
+    fn bitmap(x: u16, y: u16, width: u16, height: u16, value: u8) -> BitmapUpdate {
+        BitmapUpdate {
+            x,
+            y,
+            width: NonZeroU16::new(width).unwrap(),
+            height: NonZeroU16::new(height).unwrap(),
+            format: PixelFormat::BgrA32,
+            stride: NonZeroUsize::new(usize::from(width) * 4).unwrap(),
+            data: Bytes::from(vec![value; usize::from(width) * usize::from(height) * 4]),
+        }
+    }
+
+    fn delivered(encoder: &mut UpdateEncoder, update: BitmapUpdate) -> usize {
+        let diffs = encoder.bitmap_diffs(&update);
+        let area = diffs.iter().map(|r| r.width * r.height).sum();
+        encoder.bitmap_update_framebuffer(update, &diffs);
+        area
+    }
+
+    #[test]
+    fn full_width_strips_enable_diffing_after_all_rows_are_delivered() {
+        let mut enc = encoder(2560, 1440);
+        for y in [0, 360, 720, 1080] {
+            assert_eq!(delivered(&mut enc, bitmap(0, y, 2560, 360, 7)), 2560 * 360);
+        }
+        assert!(enc.framebuffer_ready);
+        assert_eq!(delivered(&mut enc, bitmap(0, 0, 2560, 1440, 7)), 0);
+    }
+
+    #[test]
+    fn black_unseeded_rows_are_never_mistaken_for_unchanged_pixels() {
+        let mut enc = encoder(128, 128);
+        delivered(&mut enc, bitmap(0, 64, 128, 64, 0));
+        assert!(!enc.framebuffer_ready);
+        assert_eq!(delivered(&mut enc, bitmap(0, 0, 128, 64, 0)), 128 * 64);
+        assert!(enc.framebuffer_ready);
+    }
+
+    #[test]
+    fn single_pixel_change_only_encodes_one_tile_after_strip_seed() {
+        let mut enc = encoder(2560, 1440);
+        for y in [0, 360, 720, 1080] {
+            delivered(&mut enc, bitmap(0, y, 2560, 360, 7));
+        }
+        let mut update = bitmap(0, 0, 2560, 1440, 7);
+        let mut pixels = update.data.to_vec();
+        pixels[(100 * 2560 + 100) * 4] = 8;
+        update.data = Bytes::from(pixels);
+        assert_eq!(delivered(&mut enc, update.clone()), 64 * 64);
+        assert_eq!(delivered(&mut enc, update), 0);
+    }
+
+    #[test]
+    fn partial_width_does_not_mark_an_entire_row_as_known() {
+        let mut enc = encoder(128, 64);
+        delivered(&mut enc, bitmap(0, 0, 64, 64, 0));
+        assert!(!enc.framebuffer_ready);
+        assert_eq!(delivered(&mut enc, bitmap(64, 0, 64, 64, 0)), 64 * 64);
+    }
+
+    #[test]
+    fn pixel_format_change_reseeds_cache() {
+        let mut enc = encoder(128, 128);
+        delivered(&mut enc, bitmap(0, 0, 128, 128, 7));
+        let mut update = bitmap(0, 0, 128, 64, 7);
+        update.format = PixelFormat::RgbA32;
+        assert_eq!(delivered(&mut enc, update), 128 * 64);
+        assert!(!enc.framebuffer_ready);
+    }
+    #[test]
+    fn resize_forces_a_fresh_seed_even_for_identical_black_pixels() {
+        let mut enc = encoder(128, 128);
+        delivered(&mut enc, bitmap(0, 0, 128, 128, 0));
+        enc.set_desktop_size(DesktopSize {
+            width: 256,
+            height: 128,
+        });
+        assert!(!enc.framebuffer_ready);
+        assert_eq!(delivered(&mut enc, bitmap(0, 0, 256, 64, 0)), 256 * 64);
+        assert_eq!(delivered(&mut enc, bitmap(0, 64, 256, 64, 0)), 256 * 64);
+        assert_eq!(delivered(&mut enc, bitmap(0, 0, 256, 128, 0)), 0);
+    }
+
+    #[tokio::test]
+    async fn remotefx_encodes_changed_pixels_and_emits_nothing_for_repeats() {
+        let mut codecs = UpdateEncoderCodecs::new();
+        codecs.set_remotefx(Some((EntropyBits::Rlgr3, 3)));
+        let mut enc = UpdateEncoder::new(
+            DesktopSize {
+                width: 128,
+                height: 128,
+            },
+            CmdFlags::SET_SURFACE_BITS,
+            codecs,
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        for y in [0, 64] {
+            let mut updates = enc.update(DisplayUpdate::Bitmap(bitmap(0, y, 128, 64, 7)));
+            assert!(updates.next().await.unwrap().is_ok());
+            while let Some(update) = updates.next().await {
+                update.unwrap();
+            }
+        }
+        let unchanged = bitmap(0, 0, 128, 128, 7);
+        assert!(
+            enc.update(DisplayUpdate::Bitmap(unchanged.clone()))
+                .next()
+                .await
+                .is_none()
+        );
+        let mut changed = unchanged;
+        let mut pixels = changed.data.to_vec();
+        pixels[4 * (40 * 128 + 40)] = 20;
+        changed.data = Bytes::from(pixels);
+        let mut updates = enc.update(DisplayUpdate::Bitmap(changed.clone()));
+        assert!(updates.next().await.unwrap().is_ok());
+        while let Some(update) = updates.next().await {
+            update.unwrap();
+        }
+        assert!(enc.update(DisplayUpdate::Bitmap(changed)).next().await.is_none());
+    }
 }

@@ -349,11 +349,34 @@ async fn connect_client<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
+    let (result, framed) =
+        connect_client_with_channels(client_io, client_w, client_h, None).await?;
+    Ok((
+        (result.desktop_size.width, result.desktop_size.height),
+        framed,
+    ))
+}
+
+async fn connect_client_with_channels<S>(
+    client_io: S,
+    client_w: u16,
+    client_h: u16,
+    dynamic_channels: Option<ironrdp_dvc::DrdynvcClient>,
+) -> anyhow::Result<(
+    ironrdp_connector::ConnectionResult,
+    TokioFramed<tokio_rustls::client::TlsStream<S>>,
+)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
     // pre-TLS negotiation
     let mut connector = ClientConnector::new(
         client_config(client_w, client_h),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
     );
+    if let Some(channel) = dynamic_channels {
+        connector.attach_static_channel(channel);
+    }
     let mut framed = TokioFramed::new(client_io);
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
     let initial = framed.into_inner_no_leftover();
@@ -384,10 +407,7 @@ where
         None,
     )
     .await?;
-    Ok((
-        (result.desktop_size.width, result.desktop_size.height),
-        tls_framed,
-    ))
+    Ok((result, tls_framed))
 }
 
 /// Run one full client→server connect over an in-memory duplex with the given
@@ -426,6 +446,280 @@ async fn negotiate(
             size
         })
         .await
+}
+
+#[tokio::test]
+async fn client_suppress_and_restore_wake_an_idle_display() -> Result<()> {
+    use ironrdp_core::WriteBuf;
+    use ironrdp_pdu::geometry::InclusiveRectangle;
+    use ironrdp_pdu::rdp::headers::{encode_share_data, ShareDataPdu};
+    use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+    use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
+    use tokio::time::{timeout, Duration};
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut server =
+        build_test_server_full(0, 1024, 768, false, None, crate::bitmap_codecs(), true);
+    let suppressed = server.display_suppressed_handle();
+    let wakeup = Arc::new(tokio::sync::Notify::new());
+    server.set_display_suppressed_wakeup(wakeup.clone());
+    let desktop = InclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: 1023,
+        bottom: 767,
+    };
+    let suppress = || ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect: None });
+    let restore = ShareDataPdu::SuppressOutput(SuppressOutputPdu {
+        desktop_rect: Some(desktop.clone()),
+    });
+    let refresh = ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+        areas_to_refresh: vec![desktop],
+    });
+
+    tokio::task::LocalSet::new()
+        .run_until(timeout(Duration::from_secs(3), async move {
+            let server_task =
+                tokio::task::spawn_local(async move { server.run_connection(server_io).await });
+            let (channels, mut client) =
+                connect_client_with_channels(client_io, 1024, 768, None).await?;
+            for (pdu, expected) in [
+                (suppress(), true),
+                (restore, false),
+                (suppress(), true),
+                (refresh, false),
+            ] {
+                let mut encoded = WriteBuf::new();
+                encode_share_data(
+                    channels.user_channel_id,
+                    channels.io_channel_id,
+                    channels.share_id,
+                    pdu,
+                    &mut encoded,
+                )?;
+                ironrdp_tokio::FramedWrite::write_all(&mut client, encoded.filled()).await?;
+                wakeup.notified().await;
+                assert_eq!(
+                    suppressed.load(std::sync::atomic::Ordering::Relaxed),
+                    expected
+                );
+            }
+            server_task.abort();
+            Ok::<_, anyhow::Error>(())
+        }))
+        .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_monitor_layout_reactivates_existing_connection() -> Result<()> {
+    use ironrdp_connector::{connection_activation::ConnectionActivationState, Sequence};
+    use ironrdp_core::{decode, WriteBuf};
+    use ironrdp_displaycontrol::{client::DisplayControlClient, pdu::DisplayControlMonitorLayout};
+    use ironrdp_dvc::DrdynvcClient;
+    use ironrdp_pdu::input::{InputEvent, InputEventPdu, ScanCodePdu};
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
+    use ironrdp_pdu::rdp::headers::{
+        encode_share_data, ShareControlHeader, ShareControlPdu, ShareDataPdu,
+    };
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_svc::client_encode_svc_messages;
+    use ironrdp_tokio::FramedWrite;
+    use tokio::sync::oneshot;
+    use tokio::time::{timeout, Duration};
+
+    struct ResizeDisplay {
+        request: Option<oneshot::Receiver<ServerDesktopSize>>,
+        resize: Option<oneshot::Sender<ServerDesktopSize>>,
+    }
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for ResizeDisplay {
+        async fn size(&mut self) -> ServerDesktopSize {
+            ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            }
+        }
+        async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+            Ok(Box::new(ResizeUpdates(self.request.take())))
+        }
+        fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+            if let Some(reply) = self.resize.take() {
+                let (width, height) = layout.monitors()[0].dimensions();
+                let _ = reply.send(ServerDesktopSize {
+                    width: u16::try_from(width).unwrap(),
+                    height: u16::try_from(height).unwrap(),
+                });
+            }
+        }
+    }
+
+    struct ResizeUpdates(Option<oneshot::Receiver<ServerDesktopSize>>);
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for ResizeUpdates {
+        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+            if let Some(receiver) = &mut self.0 {
+                let size = receiver.await?;
+                self.0 = None;
+                return Ok(Some(DisplayUpdate::Resize(size)));
+            }
+            std::future::pending().await
+        }
+    }
+
+    struct ResizeInput(Option<oneshot::Sender<()>>);
+    impl RdpServerInputHandler for ResizeInput {
+        fn keyboard(&mut self, event: KeyboardEvent) {
+            if matches!(
+                event,
+                KeyboardEvent::Pressed {
+                    code: 0x1e,
+                    extended: false
+                }
+            ) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        fn mouse(&mut self, _: MouseEvent) {}
+    }
+
+    let (input, received_input) = oneshot::channel();
+    let (resize, request) = oneshot::channel();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 0))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(ResizeInput(Some(input)))
+        .with_display_handler(ResizeDisplay {
+            request: Some(request),
+            resize: Some(resize),
+        })
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .build();
+
+    tokio::task::LocalSet::new()
+        .run_until(timeout(Duration::from_secs(3), async move {
+            let task =
+                tokio::task::spawn_local(async move { server.run_connection(server_io).await });
+            let dvc = DrdynvcClient::new()
+                .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+            let (mut connection, mut client) =
+                connect_client_with_channels(client_io, 1024, 768, Some(dvc)).await?;
+            assert_eq!(connection.desktop_size.width, 1024);
+            assert_eq!(connection.desktop_size.height, 768);
+            let svc_id = connection
+                .static_channels
+                .get_channel_id_by_type::<DrdynvcClient>()
+                .ok_or_else(|| anyhow::anyhow!("DRDYNVC channel not negotiated"))?;
+            let mut layout_sent = false;
+
+            let mut deactivated = false;
+            let demand = loop {
+                let (_, bytes) = client.read_pdu().await?;
+                let Ok(X224(McsMessage::SendDataIndication(data))) = decode(&bytes) else {
+                    continue;
+                };
+                if data.channel_id == svc_id {
+                    let svc = connection
+                        .static_channels
+                        .get_by_channel_id_mut(svc_id)
+                        .unwrap();
+                    let replies = svc.process(&data.user_data)?;
+                    if !replies.is_empty() {
+                        let encoded = client_encode_svc_messages(
+                            replies,
+                            svc_id,
+                            connection.user_channel_id,
+                        )?;
+                        client.write_all(&encoded).await?;
+                    }
+                    let dvc = svc
+                        .channel_processor_downcast_ref::<DrdynvcClient>()
+                        .unwrap();
+                    if let Some(channel) = dvc.get_dvc_by_type_id::<DisplayControlClient>() {
+                        let display = channel
+                            .channel_processor_downcast_ref::<DisplayControlClient>()
+                            .unwrap();
+                        if display.ready() && !layout_sent {
+                            let messages = display.encode_single_primary_monitor(
+                                channel.channel_id().unwrap(),
+                                1600,
+                                900,
+                                None,
+                                None,
+                            )?;
+                            let encoded = client_encode_svc_messages(
+                                messages,
+                                svc_id,
+                                connection.user_channel_id,
+                            )?;
+                            client.write_all(&encoded).await?;
+                            layout_sent = true;
+                        }
+                    }
+                    continue;
+                }
+                let Ok(header) = decode::<ShareControlHeader>(&data.user_data) else {
+                    continue;
+                };
+                match header.share_control_pdu {
+                    ShareControlPdu::ServerDeactivateAll(_) => deactivated = true,
+                    ShareControlPdu::ServerDemandActive(demand) => {
+                        let advertised = demand.pdu.capability_sets.iter().find_map(|cap| {
+                            if let CapabilitySet::Bitmap(bitmap) = cap {
+                                Some((bitmap.desktop_width, bitmap.desktop_height))
+                            } else {
+                                None
+                            }
+                        });
+                        assert!(layout_sent && deactivated);
+                        assert_eq!(advertised, Some((1600, 900)));
+                        break bytes;
+                    }
+                    _ => {}
+                }
+            };
+
+            let mut activation = connection.activation_factory.create();
+            let mut encoded = WriteBuf::new();
+            activation.step(&demand, &mut encoded)?;
+            client.write_all(encoded.filled()).await?;
+            let share_id = loop {
+                if let ConnectionActivationState::Finalized {
+                    desktop_size,
+                    share_id,
+                    ..
+                } = activation.connection_activation_state()
+                {
+                    assert_eq!((desktop_size.width, desktop_size.height), (1600, 900));
+                    break share_id;
+                }
+                ironrdp_tokio::single_sequence_step(&mut client, &mut activation, &mut encoded)
+                    .await?;
+            };
+
+            encoded.clear();
+            encode_share_data(
+                connection.user_channel_id,
+                connection.io_channel_id,
+                share_id,
+                ShareDataPdu::Input(InputEventPdu(vec![InputEvent::ScanCode(ScanCodePdu {
+                    flags: ironrdp_pdu::input::scan_code::KeyboardFlags::empty(),
+                    key_code: 0x1e,
+                })])),
+                &mut encoded,
+            )?;
+            client.write_all(encoded.filled()).await?;
+            received_input.await?;
+            task.abort();
+            Ok::<_, anyhow::Error>(())
+        }))
+        .await??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -539,6 +833,93 @@ async fn no_shared_codec_falls_back_and_connects() -> anyhow::Result<()> {
         "no-shared-codec connect should still complete (raw fallback)"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn real_disconnect_releases_input_before_reconnect() -> Result<()> {
+    struct DisplayEnd(tokio::sync::mpsc::UnboundedSender<()>);
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for DisplayEnd {
+        async fn size(&mut self) -> ServerDesktopSize {
+            ServerDesktopSize {
+                width: 1280,
+                height: 800,
+            }
+        }
+        async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+            Ok(Box::new(TestUpdates))
+        }
+        fn session_ended(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    struct InputEnd(tokio::sync::mpsc::UnboundedSender<()>);
+    impl RdpServerInputHandler for InputEnd {
+        fn keyboard(&mut self, _: KeyboardEvent) {}
+        fn mouse(&mut self, _: MouseEvent) {}
+        fn session_ended(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    let rounds = std::env::var("MACRDP_TCP_SOAK_RECONNECTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|rounds| *rounds >= 2)
+        .unwrap_or(2);
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let (tx, mut ended) = tokio::sync::mpsc::unbounded_channel();
+            let (display_tx, mut display_ended) = tokio::sync::mpsc::unbounded_channel();
+            let mut server = RdpServer::builder()
+                .with_addr(addr)
+                .with_tls(server_tls_acceptor())
+                .with_input_handler(InputEnd(tx))
+                .with_display_handler(DisplayEnd(display_tx))
+                .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+                .build();
+            server.set_honor_client_desktop_size(true);
+            let task = tokio::task::spawn_local(async move { server.run().await });
+            for i in 0..rounds {
+                let (width, height) = if i % 2 == 0 {
+                    (1280, 800)
+                } else {
+                    (1920, 1080)
+                };
+                let stream = connect_with_retry(addr).await?;
+                let (size, client) = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    connect_client(stream, width, height),
+                )
+                .await??;
+                assert_eq!(size, (width, height), "wrong negotiated size on round {i}");
+                assert!(matches!(
+                    ended.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+                drop(client);
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(3), ended.recv()).await?,
+                    Some(()),
+                    "session cleanup did not run on round {i}"
+                );
+                assert_eq!(
+                    display_ended.try_recv(),
+                    Ok(()),
+                    "display cleanup did not run on round {i}"
+                );
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            eprintln!("{rounds} TCP sessions negotiated and cleaned up");
+            Ok(())
+        })
+        .await
 }
 
 /// Layer-4 reconnect lifecycle soak: one long-lived server serves many

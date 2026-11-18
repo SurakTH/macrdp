@@ -17,6 +17,14 @@ final class LaunchAgentSpecTests: XCTestCase {
         XCTAssertTrue(spec.matches(spec.propertyList) { $0 == self.expectedBinary })
     }
 
+    func testLegacyAgentWithoutPasswordParkingRequiresRepair() {
+        var plist = spec.propertyList
+        plist["EnvironmentVariables"] = ["RUST_LOG": "info"]
+        XCTAssertTrue(spec.requiresRepair(
+            plist: plist, loadedProgramPath: expectedBinary, isLoaded: true, fileExists: { _ in true }
+        ))
+    }
+
     func testMovedServerRequiresRepairEvenWhenOldBinaryStillExists() {
         var plist = spec.propertyList
         plist["ProgramArguments"] = [

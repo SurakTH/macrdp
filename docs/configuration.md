@@ -120,10 +120,16 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           to-front, scroll, app launch) and briefly after a click.
                           The periodic interval + flush-burst already cover this,
                           so enable it only if big updates lag. See [video.md](video.md).
---flush-frames N          Trailing frames re-sent after each change to drain
-                          mstsc's presentation buffer (default 4; only with
-                          --enable-h264). Stops the last keystroke before a pause
-                          lagging until the next keyframe. 0 disables. See [video.md](video.md).
+--flush-frames N          Trailing pictures at frame cadence after each change,
+                          and again after the 100 ms quiet-period IDR (default 4;
+                          only with --enable-h264). Helps drain presentation
+                          buffering without waiting for quiet first. 0 disables
+                          both bursts. See [video.md](video.md).
+--flush-interval-ms N     Experimental trailing-picture/retry interval, 8–1000 ms.
+                          Default unset: use the capture frame interval. Does not
+                          change capture FPS, frame budget, or the quiet IDR delay.
+                          Config key: FLUSH_INTERVAL_MS (empty restores stable cadence).
+                          Faster typing may come with transient image artifacts.
 --enable-aac              Compress system audio as AAC-LC over RDPSND
                           (WAVE_FORMAT_AAC_MS) instead of raw PCM — ~11x less
                           audio bandwidth. Clients that don't decode AAC fall
@@ -471,3 +477,121 @@ Both restore the original layout when the last client disconnects, and both auto
 # Use the eager Windows→Mac file paste path (default is lazy / on-demand).
 ./macrdp --no-lazy-paste
 ```
+
+## Controller video controls
+
+The Stable profile uses the Windows-tested 1920×1080 AVC420 settings: 60 FPS,
+25 Mbps adaptive bitrate, TCP, one frame in flight, two trailing pictures, and
+fast flush off. Selecting a profile stages changes; Apply saves and restarts a
+running managed server once. Existing config is preserved until Apply.
+
+Video → Capture resolution controls the physical-screen capture via
+`CAPTURE_SIZE=WIDTHxHEIGHT`. Presets cover 720p through 4K, with a custom field.
+Dimensions must be even and within 200–8192. Empty restores automatic sizing
+and removes old width/height pins from EXTRA_FLAGS. Virtual displays retain
+their independent VD_WIDTH/VD_HEIGHT and ignore CAPTURE_SIZE.
+
+Fast flush is optional. Its interval accepts 8–1000 ms, with quick choices at
+8, 10, 12, and 16 ms; enabling a fresh toggle starts at 10 ms. The tested client
+felt faster at 8 ms but sometimes showed image artifacts. Disabling the toggle
+restores capture cadence. Normal profiles also turn the experiment off.
+
+In **Video → Experimental**, **H.264 encoder queue depth** controls how many
+frames can be in the encode and send pipeline at once. An empty field uses
+the server default of 2. For a 4K/60 comparison, keep resolution, bitrate,
+transport and flush settings fixed, then compare depths 1 and 2 during the
+same scrolling or motion sequence. Check both frame rate and input response.
+
+**Pace TCP video when the client falls behind** is an opt-in H.264 setting
+(`TCP_VIDEO_BACKPRESSURE=1`, or `MACRDP_TCP_VIDEO_BACKPRESSURE=1` for a direct
+CLI launch). When recent frame acknowledgements show a backlog, it temporarily
+paces frame submission before encoding. Compare with the option off using the
+same resolution, queue depth and bitrate. It can reduce motion frame rate
+while the client catches up.
+
+Status distinguishes saved settings from the live session size and the
+configured capture FPS limit. A separate terminal test detected via diagnostics
+is shown as external; Start/Repair will not compete with that server.
+
+### Personal presets and Performance
+
+In **Connection → Personal presets**, enter a name and choose **Save New** to
+save the current draft. **Load** stages the selected preset; review it and use
+**Apply** to save server settings (and restart a running managed server).
+**Manage** can replace, rename or delete a preset. Saving, renaming and deleting
+presets do not restart the server or change config.env.
+
+Presets are stored atomically in `~/Library/Application Support/macrdp/presets.json`
+with private file permissions. They include video, audio and shortcut options;
+network addresses, accounts, arbitrary EXTRA_FLAGS and display takeover settings
+are excluded. Custom virtual-display sizing remains in Display.
+
+**Performance** polls the loopback statistics endpoint every two seconds while
+visible. Enable **Advanced → Live statistics endpoint**, then Apply if needed.
+Use a matching statistics port for a terminal-started server. The page shows:
+
+- Logical H.264 frames queued per second, including trailing flush pictures.
+- Compressed video payload Mbps, separate from the encoder target bitrate.
+- Average submission-to-callback encoder time for the sampled interval.
+- Encoder submissions that reused a captured image for flush, repaint or retry,
+  when the server provides this counter.
+- Fresh frame-ACK round-trip and queue-delay measurements, plus deferred
+  captures, encoder errors and server CPU/memory.
+
+Graphs keep at most 30 samples / 60 seconds in memory. Missing telemetry,
+server restart, reconnect, resize or a long polling gap resets rate calculations.
+An idle screen can report zero queued FPS. Old servers remain readable, but new
+rate/encode measurements require the updated server. These metrics do not
+measure client presentation or end-to-end key-to-screen latency. Payload rates
+exclude network headers, retransmits and other channels. The ACK graph has
+a gap when no new timed acknowledgement arrives during a poll interval.
+Monitoring does not alter video settings.
+
+The Video tab's **Bitrate ceiling (Mbps)** field accepts typed whole-number
+values above the former 50 Mbps UI limit (for example 75, 100 or 200). Empty
+uses the server default of 6 Mbps. The highest representable whole-number Mbps
+value is 2147 because VideoToolbox receives a signed 32-bit bits-per-second
+value; Apply blocks larger values instead of overflowing that conversion.
+This remains a target ceiling, not an unlimited-bandwidth mode. Apply saves the
+change and restarts a running managed server; existing saved values are retained.
+
+**Video → Responsive capture** (`RESPONSIVE_CAPTURE=1`, or
+`MACRDP_RESPONSIVE_CAPTURE=1` for a direct CLI launch) is an opt-in H.264
+experiment. It queues up to two ScreenCaptureKit samples instead of four and
+lets one ready content sample take priority over a duplicate flush picture.
+An idle callback does not postpone the flush. It does not alter the FPS limit,
+bitrate or flush interval. It can skip intermediate motion when the server is
+busy; compare it with the option off using the same settings. Keep Fast flush
+off for that comparison so only one variable changes.
+
+If an H.264 session's picture stops updating, press **Ctrl+Alt+Shift+R**
+inside the Windows RDP window. macrdp wakes the capture loop and requests a
+full repaint from its latest retained frame, even on a static desktop. It
+also requests the existing audio resync. If the client still shows a black
+screen after reconnect, fully close and reopen the Windows RDP window.
+
+Performance distinguishes a stopped managed server, disabled statistics, a
+statistics endpoint that could not be read, and an available endpoint waiting
+for H.264. A matching current server clears the graph when its video session
+ends. With an older server, the Controller can still display legacy telemetry,
+but may not be able to tell whether those values are from an ended session.
+
+
+### Recovering from a changed Mac password
+
+The Controller and packaged launchd installers enable
+`MACRDP_PARK_ON_AUTH_FAILURE=1` for their managed jobs. If the Keychain entry is
+missing or rejected, macrdp waits before setting up the capture or listener.
+It rereads Keychain every 30 seconds without checking a rejected password again
+unless the value has changed. **Status → Update Account Password…** is shown
+while the managed server waits. You can also use **Connection → Account**. Terminal
+launches still exit on credential failure unless this environment option is set.
+
+
+### Windows connection shortcut
+
+In Controller, open **Status → Export .rdp…** and save the shortcut. Open it in
+Windows Remote Desktop and sign in as usual. The file contains only the current
+Mac address and RDP port; it does not change the server or include credentials.
+Export is unavailable when the displayed address is a wildcard, loopback, or
+has not been resolved. Export a new file if the Mac address or port changes.

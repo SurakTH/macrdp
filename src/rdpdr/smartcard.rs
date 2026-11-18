@@ -3,7 +3,7 @@
 //! The connecting RDP client redirects its physical smart-card reader as an
 //! RDPDR `Smartcard` device; this bridge makes that reader usable by **macOS**
 //! apps. macrdp's own PC/SC IFD handler (the `ifd-macrdp.bundle` cdylib loaded by
-//! `com.apple.ifdreader.slotd`) dials this bridge over loopback TCP and speaks a
+//! `com.apple.ifdreader.slotd`) dials this bridge over a Unix socket and speaks a
 //! tiny request/reply protocol; the bridge translates each request into an
 //! MS-RDPESC call to the client's reader via [`RdpdrHandle`]'s `scard_*` methods
 //! and hands the result back.
@@ -25,16 +25,17 @@ use anyhow::{anyhow, Result};
 use ironrdp_rdpdr::pdu::esc::{
     CardProtocol, CardStateFlags, ScardContext, ScardHandle as ScardCardHandle,
 };
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::time::{Duration, Instant};
 
 use ironrdp_server::{RdpdrHandle, SCARD_LEAVE_CARD, SCARD_SHARE_SHARED};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
-/// Default loopback port the IFD handler dials (overridable, in lockstep with the
+/// Socket namespace shared with the IFD handler (overridable, in lockstep with the
 /// handler, via `MACRDP_SCARD_PORT`).
 const DEFAULT_PORT: u16 = 40242;
 
@@ -45,8 +46,7 @@ const CMD_TRANSMIT: u8 = 3;
 const CMD_PRESENCE: u8 = 4;
 
 /// Upper bound on a `CMD_TRANSMIT` command-APDU length. The bridge listens on
-/// loopback with no authentication (see the unauthenticated-loopback-IPC note in
-/// `docs/macos-gotchas.md`), so an untrusted local process could send an
+/// a kernel-authenticated Unix socket; still cap any supplied
 /// arbitrary 32-bit `send_len`; cap it before allocating so a bogus length can't
 /// force a multi-gigabyte allocation. No real APDU exceeds the ISO 7816
 /// extended-APDU maximum (4-byte header + 3-byte Lc + 65535 data + 2-byte Le).
@@ -67,7 +67,7 @@ pub struct SmartcardBridge {
 }
 
 impl SmartcardBridge {
-    /// Bind the loopback listener and start serving the IFD handler. `device_id`
+    /// Bind the Unix-socket listener and start serving the IFD handler. `device_id`
     /// is the announced `Smartcard` device the calls are routed to.
     pub fn start(handle: RdpdrHandle, device_id: u32) -> Self {
         let listen_port = port();
@@ -87,19 +87,29 @@ impl Drop for SmartcardBridge {
 }
 
 async fn serve(handle: RdpdrHandle, device_id: u32, listen_port: u16) -> Result<()> {
-    // SO_REUSEADDR so a quick client reconnect can rebind the fixed port even if
-    // the previous bridge's listener is still winding down (or in TIME_WAIT).
-    let socket = TcpSocket::new_v4().map_err(|e| anyhow!("socket: {e}"))?;
-    socket
-        .set_reuseaddr(true)
-        .map_err(|e| anyhow!("set_reuseaddr: {e}"))?;
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, listen_port));
-    socket.bind(addr).map_err(|e| anyhow!("bind {addr}: {e}"))?;
-    let listener = socket.listen(16).map_err(|e| anyhow!("listen: {e}"))?;
-    info!(
-        port = listen_port,
-        device_id, "smart card: IFD bridge listening"
-    );
+    let path = crate::scard_ipc::socket_path(listen_port);
+    crate::scard_ipc::prepare_directory(path.parent().unwrap())?;
+    // Never unlink another live listener or an unexpected filesystem object.
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.file_type().is_socket() || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(anyhow!("unsafe existing smart-card socket"));
+        }
+        match UnixStream::connect(&path).await {
+            Ok(_) => return Err(anyhow!("smart-card socket already in use")),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(&path)?
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let listener = UnixListener::bind(&path)?;
+    let guard = SocketGuard::new(path.clone())?;
+    // System slotd may run as root or _ctkd. Kernel peer credentials, rather
+    // than file readability, authorize commands before a session is created.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
+    let daemon_uid = crate::scard_ipc::reader_daemon_uid();
+    info!(socket = %path.display(), device_id, "smart card: authenticated IFD bridge listening");
+    let _guard = guard;
 
     // Sessions live in a JoinSet so aborting this task (bridge Drop) cancels them.
     let mut sessions: JoinSet<()> = JoinSet::new();
@@ -107,6 +117,11 @@ async fn serve(handle: RdpdrHandle, device_id: u32, listen_port: u16) -> Result<
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.map_err(|e| anyhow!("accept: {e}"))?;
+                let uid = crate::scard_ipc::peer_uid(stream.as_raw_fd())?;
+                if !crate::scard_ipc::authorized_reader(uid, daemon_uid) || sessions.len() >= MAX_SESSIONS {
+                    debug!(uid, "smart card: rejected unauthorized or excess local connection");
+                    continue;
+                }
                 debug!("smart card: IFD handler connected");
                 let handle = handle.clone();
                 sessions.spawn(async move {
@@ -114,7 +129,7 @@ async fn serve(handle: RdpdrHandle, device_id: u32, listen_port: u16) -> Result<
                     if let Err(e) = session.run(stream).await {
                         debug!(error = %e, "smart card: session ended with error");
                     }
-                    session.teardown().await;
+                    let _ = tokio::time::timeout(COMMAND_TIMEOUT, session.teardown()).await;
                 });
             }
             // Reap finished sessions so the set doesn't grow unbounded.
@@ -123,9 +138,32 @@ async fn serve(handle: RdpdrHandle, device_id: u32, listen_port: u16) -> Result<
     }
 }
 
+const MAX_SESSIONS: usize = 8;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Remove only the inode this listener created (a successor may already exist).
+struct SocketGuard {
+    path: std::path::PathBuf,
+    inode: u64,
+}
+impl SocketGuard {
+    fn new(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let inode = std::fs::symlink_metadata(&path)?.ino();
+        Ok(Self { path, inode })
+    }
+}
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.ino() == self.inode) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// How long a presence result is cached. macOS CryptoTokenKit/slotd polls
 /// `IFDHICCPresence` extremely fast (tens of times per second) — with a hardware
-/// reader the I/O latency throttles that, but our loopback bridge answers
+/// reader the I/O latency throttles that, but our local bridge answers
 /// instantly, so without a cache every poll becomes a `GetStatusChange`
 /// round-trip to the client over RDP, flooding the shared channel and competing
 /// with EGFX video / RDPSND audio. Card insert/remove is a human-timescale event,
@@ -156,14 +194,15 @@ impl Session {
         }
     }
 
-    async fn run(&mut self, mut stream: TcpStream) -> Result<()> {
+    async fn run(&mut self, mut stream: UnixStream) -> Result<()> {
         loop {
             // A read error here is the handler closing the connection (EOF) — a
             // clean end, not a failure.
-            let cmd = match stream.read_u8().await {
-                Ok(c) => c,
-                Err(_) => return Ok(()),
+            let cmd = match tokio::time::timeout(IDLE_TIMEOUT, stream.read_u8()).await {
+                Ok(Ok(c)) => c,
+                _ => return Ok(()),
             };
+            tokio::time::timeout(COMMAND_TIMEOUT, async {
             match cmd {
                 CMD_PRESENCE => {
                     let present = match self.presence().await {
@@ -190,14 +229,14 @@ impl Session {
                 CMD_TRANSMIT => {
                     let send_len = stream.read_u32().await? as usize;
                     // Bound the wire-supplied length before allocating — an
-                    // unauthenticated local process could otherwise request a
+                    // faulty reader could otherwise request a
                     // huge allocation. Anything over a real APDU is bogus.
                     if send_len > MAX_APDU_LEN {
                         warn!(
                             send_len,
                             "smart card: TRANSMIT length exceeds the APDU cap; closing"
                         );
-                        return Ok(());
+                        return Err(anyhow!("APDU exceeds cap"));
                     }
                     let mut apdu = vec![0u8; send_len];
                     stream.read_exact(&mut apdu).await?;
@@ -221,9 +260,11 @@ impl Session {
                 }
                 other => {
                     warn!(opcode = other, "smart card: unknown bridge opcode; closing");
-                    return Ok(());
+                    return Err(anyhow!("unknown smart-card opcode"));
                 }
             }
+            Ok::<(), anyhow::Error>(())
+            }).await.map_err(|_| anyhow!("smart-card command timed out"))??;
         }
     }
 

@@ -28,7 +28,7 @@ public struct LaunchAgentSpec {
             "RunAtLoad": true,
             "KeepAlive": true,
             "StandardErrorPath": stderrPath,
-            "EnvironmentVariables": ["RUST_LOG": "info"],
+            "EnvironmentVariables": ["RUST_LOG": "info", "MACRDP_PARK_ON_AUTH_FAILURE": "1"],
         ]
     }
 
@@ -43,6 +43,7 @@ public struct LaunchAgentSpec {
               plist["StandardErrorPath"] as? String == stderrPath,
               let environment = plist["EnvironmentVariables"] as? [String: String],
               environment["RUST_LOG"] == "info",
+              environment["MACRDP_PARK_ON_AUTH_FAILURE"] == "1",
               fileExists(serverBinaryPath) else {
             return false
         }
