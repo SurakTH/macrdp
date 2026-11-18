@@ -64,6 +64,14 @@ impl MacInputHandler {
 }
 
 impl RdpServerInputHandler for MacInputHandler {
+    fn session_ended(&mut self) {
+        if let Some(stats) = crate::stats::global() {
+            stats.end_video_session();
+        }
+        #[cfg(target_os = "macos")]
+        self.inner.release_session_input();
+    }
+
     fn keyboard(&mut self, event: KeyboardEvent) {
         if let Some(stats) = crate::stats::global() {
             stats
@@ -237,6 +245,25 @@ fn ctrl_arrow_system_events_keycode(action: CtrlArrowAction) -> u16 {
     }
 }
 
+/// Convert one wheel event while retaining only a sub-line remainder.
+/// Drop old-direction remainder on reversal and discard excess whole lines
+/// rather than letting a large gesture leave an invisible backlog.
+/// Adapted from upstream clintcan/macrdp#210.
+#[cfg(any(target_os = "macos", test))]
+fn scroll_lines(remainder: i32, delta: i32) -> (i32, i32) {
+    const UNITS_PER_LINE: i64 = 60;
+    let remainder = if delta != 0 && remainder.signum() != delta.signum() {
+        0
+    } else {
+        remainder
+    };
+    let total = i64::from(remainder) + i64::from(delta);
+    (
+        (total / UNITS_PER_LINE).clamp(-5, 5) as i32,
+        (total % UNITS_PER_LINE) as i32,
+    )
+}
+
 #[cfg(test)]
 mod coord_tests {
     use super::{
@@ -246,6 +273,24 @@ mod coord_tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.5
+    }
+
+    #[test]
+    fn wheel_fragments_accumulate_without_delaying_a_reversal() {
+        use super::scroll_lines;
+        assert_eq!(scroll_lines(0, 30), (0, 30));
+        assert_eq!(scroll_lines(30, 0), (0, 30));
+        assert_eq!(scroll_lines(30, 30), (1, 0));
+        let (lines, remainder) = scroll_lines(0, -1236);
+        assert_eq!((lines, remainder), (-5, -36));
+        assert_eq!(scroll_lines(remainder, 120), (2, 0));
+        assert_eq!(scroll_lines(remainder, -24), (-1, 0));
+        assert_eq!(scroll_lines(0, 600), (5, 0));
+        for delta in [i32::MIN, i32::MAX] {
+            let (lines, remainder) = scroll_lines(delta.signum() * 59, delta);
+            assert_eq!(lines, delta.signum() * 5);
+            assert!(remainder.abs() < 60);
+        }
     }
 
     #[test]
@@ -630,6 +675,25 @@ mod macos {
             CGEventFlags::from_bits_retain(bits)
         }
 
+        fn command_instead_of_control(&self) -> CGEventFlags {
+            let mut bits = self.cg_flags().bits();
+            bits &=
+                !(CGEventFlags::CGEventFlagControl.bits() | NX_DEVICE_L_CTRL | NX_DEVICE_R_CTRL);
+            bits |= CGEventFlags::CGEventFlagCommand.bits() | NX_DEVICE_L_CMD;
+            CGEventFlags::from_bits_retain(bits)
+        }
+
+        fn should_map_left_click(&self, enabled: bool) -> bool {
+            enabled && self.has_ctrl() && !self.has_cmd() && !self.has_alt() && !self.has_shift()
+        }
+
+        fn pointer_flags(&self, command_click: bool) -> CGEventFlags {
+            if command_click {
+                self.command_instead_of_control()
+            } else {
+                self.cg_flags()
+            }
+        }
         fn has_shift(&self) -> bool {
             self.l_shift || self.r_shift
         }
@@ -701,6 +765,7 @@ mod macos {
         last_x: f64,
         last_y: f64,
         left_down: bool,
+        left_click_as_command: bool,
         right_down: bool,
         middle_down: bool,
         mods: ModifierState,
@@ -740,6 +805,8 @@ mod macos {
         // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
         // Cmd swap + restores the real (Ctrl) modifier state.
         remapped_keys: HashSet<u16>,
+        // Ordinary virtual keycodes for which we actually posted a key-down.
+        posted_keys: HashSet<u16>,
         // Optional non-US keyboard layout. When set, ordinary typing keys are
         // translated to characters against this layout and posted as Unicode
         // strings instead of positional keycodes. `None` → keycode path only.
@@ -810,6 +877,7 @@ mod macos {
                 last_x: 0.0,
                 last_y: 0.0,
                 left_down: false,
+                left_click_as_command: false,
                 right_down: false,
                 middle_down: false,
                 mods: ModifierState::default(),
@@ -823,6 +891,7 @@ mod macos {
                 scroll_h_accum: 0,
                 consumed_keys: HashSet::new(),
                 remapped_keys: HashSet::new(),
+                posted_keys: HashSet::new(),
                 layout,
                 klid_handle,
                 last_klid: 0,
@@ -925,6 +994,51 @@ mod macos {
             } else {
                 None
             };
+        }
+
+        pub(super) fn release_session_input(&mut self) {
+            for (button, held) in [
+                (CGMouseButton::Left, self.left_down),
+                (CGMouseButton::Right, self.right_down),
+                (CGMouseButton::Center, self.middle_down),
+            ] {
+                if held {
+                    self.button(button, false);
+                }
+            }
+
+            for vk in std::mem::take(&mut self.remapped_keys) {
+                self.post_ctrl_as_cmd(vk, false);
+            }
+            for vk in std::mem::take(&mut self.posted_keys) {
+                if let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), vk, false) {
+                    event.set_flags(self.mods.cg_flags());
+                    event.post(CGEventTapLocation::HID);
+                }
+            }
+            for vk in [
+                VK_LSHIFT, VK_RSHIFT, VK_LCTRL, VK_RCTRL, VK_LALT, VK_RALT, VK_LCMD, VK_RCMD,
+            ] {
+                if self.mods.apply(vk, false) {
+                    self.post_flags_changed(vk);
+                }
+            }
+            self.consumed_keys.clear();
+            self.click_left = None;
+            self.click_right = None;
+            self.click_middle = None;
+            self.scroll_v_accum = 0;
+            self.scroll_h_accum = 0;
+            if let Some(layout) = self.layout.as_mut() {
+                layout.reset_composition();
+            }
+            let cycle = CYCLE_SESSION.lock().unwrap().take();
+            if cycle.is_some() {
+                CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if super::APP_SWITCHER_HUD.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::switcher_hud::hide();
+                }
+            }
         }
 
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
@@ -1044,7 +1158,8 @@ mod macos {
             // active these keys are fully owned here — the matching key-up is
             // swallowed too (Unicode string events have no release side, like
             // the RDP Unicode-keyboard path).
-            if self.layout.is_some()
+            if (down || !self.posted_keys.contains(&vk))
+                && self.layout.is_some()
                 && !self.mods.has_cmd()
                 && !self.mods.has_ctrl()
                 && crate::keyboard_layout::is_translatable_keycode(vk)
@@ -1087,6 +1202,11 @@ mod macos {
             }
             ev.set_flags(flags);
             ev.post(CGEventTapLocation::HID);
+            if down {
+                self.posted_keys.insert(vk);
+            } else {
+                self.posted_keys.remove(&vk);
+            }
         }
 
         /// Emit a FlagsChanged event for `vk` from both sources. We send
@@ -1129,12 +1249,7 @@ mod macos {
         fn post_ctrl_as_cmd(&self, vk: u16, down: bool) {
             // Swap Control→Command in both the public CGEventFlag bits and the
             // device-dependent NX bits, leaving every other modifier intact.
-            let mut bits = self.mods.cg_flags().bits();
-            bits &= !CGEventFlags::CGEventFlagControl.bits();
-            bits &= !(NX_DEVICE_L_CTRL | NX_DEVICE_R_CTRL);
-            bits |= CGEventFlags::CGEventFlagCommand.bits();
-            bits |= NX_DEVICE_L_CMD;
-            let swapped = CGEventFlags::from_bits_retain(bits);
+            let swapped = self.mods.command_instead_of_control();
 
             if down {
                 for source in [&self.source, &self.source_hid] {
@@ -1218,10 +1333,10 @@ mod macos {
             // (a brief gap lets the client's audio backlog drain, the same
             // principle as a minimize→unminimize resync). From a Windows client
             // this is Ctrl+Alt+Shift+R — Win-key-free so mstsc forwards it, and
-            // not a system shortcut on either OS. Cheap atomic stores, so no
-            // off-thread hop needed; the consumers act on their next poll.
+            // not a system shortcut on either OS. Wake video even while the
+            // desktop is static; audio handles its flag on the next poll.
             if ctrl && opt && shift && !cmd && vk == VK_R {
-                crate::RESYNC_VIDEO.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::RESYNC_VIDEO.notify_one();
                 crate::RESYNC_AUDIO.store(true, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(
                     "on-demand A/V resync hotkey (Ctrl+Option+Shift+R) — refreshing video (IDR) + rebuilding audio"
@@ -1391,27 +1506,26 @@ mod macos {
             self.last_x = sx;
             self.last_y = sy;
 
-            let etype = if self.left_down {
-                CGEventType::LeftMouseDragged
+            let (etype, button, command_click) = if self.left_down {
+                (
+                    CGEventType::LeftMouseDragged,
+                    CGMouseButton::Left,
+                    self.left_click_as_command,
+                )
             } else if self.right_down {
-                CGEventType::RightMouseDragged
+                (CGEventType::RightMouseDragged, CGMouseButton::Right, false)
             } else if self.middle_down {
-                CGEventType::OtherMouseDragged
+                (CGEventType::OtherMouseDragged, CGMouseButton::Center, false)
             } else {
-                CGEventType::MouseMoved
-            };
-            let button = if self.middle_down {
-                CGMouseButton::Center
-            } else if self.right_down {
-                CGMouseButton::Right
-            } else {
-                CGMouseButton::Left
+                (CGEventType::MouseMoved, CGMouseButton::Left, false)
             };
             let Ok(ev) =
                 CGEvent::new_mouse_event(self.source.clone(), etype, CGPoint::new(sx, sy), button)
             else {
                 return;
             };
+            ev.set_flags(self.mods.pointer_flags(command_click));
+            ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button as i64);
             ev.post(CGEventTapLocation::HID);
         }
 
@@ -1423,6 +1537,22 @@ mod macos {
                 (CGMouseButton::Right, false) => CGEventType::RightMouseUp,
                 (CGMouseButton::Center, true) => CGEventType::OtherMouseDown,
                 (CGMouseButton::Center, false) => CGEventType::OtherMouseUp,
+            };
+            // Decide at the initial left-down so modifier release mid-drag
+            // cannot turn the paired up event into a different gesture.
+            let command_click = if matches!(button, CGMouseButton::Left) {
+                if down && !self.left_down {
+                    self.left_click_as_command = self.mods.should_map_left_click(
+                        super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                }
+                let mapped = self.left_click_as_command;
+                if !down {
+                    self.left_click_as_command = false;
+                }
+                mapped
+            } else {
+                false
             };
             match button {
                 CGMouseButton::Left => self.left_down = down,
@@ -1471,6 +1601,8 @@ mod macos {
                 warn!("CGEvent mouse button create failed");
                 return;
             };
+            ev.set_flags(self.mods.pointer_flags(command_click));
+            ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button as i64);
             ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_count);
             ev.post(CGEventTapLocation::HID);
 
@@ -1485,21 +1617,12 @@ mod macos {
         }
 
         fn scroll(&mut self, vertical: i32, horizontal: i32) {
-            // RDP wheel rotation units are 120 per "tick", but this client
-            // slices a single gesture into many small legacy MOUSE PDU
-            // events (observed raw magnitude ~2-40 per event, not one
-            // 120-per-notch value). A flat `delta / SCALE` per event
-            // truncates almost every one of those to zero — scroll never
-            // moves at all. Accumulate the raw delta across calls instead,
-            // and only emit whole lines once the running total crosses
-            // SCALE, carrying the remainder forward so no motion is lost.
-            const SCALE: i32 = 60;
-            self.scroll_v_accum += vertical;
-            self.scroll_h_accum += horizontal;
-            let v = (self.scroll_v_accum / SCALE).clamp(-5, 5);
-            let h = (self.scroll_h_accum / SCALE).clamp(-5, 5);
-            self.scroll_v_accum -= v * SCALE;
-            self.scroll_h_accum -= h * SCALE;
+            // Keep high-resolution wheel fragments on each axis without
+            // carrying a burst's excess lines into a later gesture.
+            let (v, v_remainder) = super::scroll_lines(self.scroll_v_accum, vertical);
+            let (h, h_remainder) = super::scroll_lines(self.scroll_h_accum, horizontal);
+            self.scroll_v_accum = v_remainder;
+            self.scroll_h_accum = h_remainder;
             if v == 0 && h == 0 {
                 return;
             }
@@ -1508,6 +1631,7 @@ mod macos {
             else {
                 return;
             };
+            ev.set_flags(self.mods.cg_flags());
             ev.post(CGEventTapLocation::HID);
         }
     }
@@ -3557,6 +3681,34 @@ mod macos {
             tm.tm_min,
             tm.tm_sec
         )
+    }
+    #[cfg(test)]
+    mod pointer_modifier_tests {
+        use super::*;
+
+        #[test]
+        fn only_plain_control_maps_and_latched_click_preserves_command_on_release() {
+            let mut mods = ModifierState::default();
+            mods.apply(VK_RCTRL, true);
+            assert!(!mods.should_map_left_click(false));
+            assert!(mods.should_map_left_click(true));
+            let raw = mods.pointer_flags(false);
+            assert!(raw.contains(CGEventFlags::CGEventFlagControl));
+            assert_ne!(raw.bits() & NX_DEVICE_R_CTRL, 0);
+            let mapped = mods.pointer_flags(true);
+            assert!(mapped.contains(CGEventFlags::CGEventFlagCommand));
+            assert!(!mapped.contains(CGEventFlags::CGEventFlagControl));
+            assert_eq!(mapped.bits() & NX_DEVICE_R_CTRL, 0);
+            mods.apply(VK_LSHIFT, true);
+            assert!(!mods.should_map_left_click(true));
+            mods.apply(VK_RCTRL, false);
+            assert!(mods
+                .pointer_flags(true)
+                .contains(CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift));
+            assert!(!mods
+                .pointer_flags(false)
+                .contains(CGEventFlags::CGEventFlagCommand));
+        }
     }
 }
 

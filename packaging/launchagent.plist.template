@@ -42,6 +42,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>MACRDP_PARK_ON_AUTH_FAILURE</key>
+        <string>1</string>
         <key>RUST_LOG</key>
         <string>info</string>
     </dict>

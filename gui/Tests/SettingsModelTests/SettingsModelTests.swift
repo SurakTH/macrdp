@@ -1,10 +1,112 @@
 import XCTest
+import ControllerCore
 @testable import macrdptray
 
 final class SettingsModelTests: XCTestCase {
     private var controller: AppController!
     override func setUp() { controller = AppController() }
     override func tearDown() { controller = nil }
+
+    func testPersonalPresetSaveLoadRenameDeleteAndDraftIsolation() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = PersonalPresetStore(url: folder.appendingPathComponent("presets.json"))
+        var initial = PerformanceProfile.stable.settings
+        initial.merge(["BIND": "0.0.0.0:4400", "ALLOW_IP": "192.168.1.2", "VIRTUAL_DISPLAY": "1", "VD_WIDTH": "2560"]) { _, v in v }
+        var saves = 0
+        var actions = 0
+        let model = SettingsModel(controller: controller, initialConfig: initial,
+            saveSettings: { _ in saves += 1 }, performAction: { _, _ in actions += 1 }, presetStore: store)
+        model.setFastFlushInterval("10")
+        model.personalPresetName = "My setup"
+        model.savePersonalPreset()
+        let id = try XCTUnwrap(model.personalPresetID)
+        XCTAssertEqual(try store.load().count, 1)
+        XCTAssertEqual(saves, 0)
+        XCTAssertEqual(actions, 0)
+        model.applyProfile(.native)
+        model.loadPersonalPreset()
+        XCTAssertEqual(model.fastFlushInterval, "10")
+        XCTAssertEqual(model.draft["ENABLE_H264"], "1")
+        XCTAssertEqual(model.draft["CAPTURE_SIZE"], "1920x1080")
+        XCTAssertEqual(model.draft["BIND"], "0.0.0.0:4400")
+        XCTAssertEqual(model.draft["VIRTUAL_DISPLAY"], "1")
+        XCTAssertEqual(model.draft["VD_WIDTH"], "2560")
+        model.revert()
+        XCTAssertEqual(model.draft, initial)
+        model.personalPresetName = "Renamed"
+        model.renamePersonalPreset()
+        XCTAssertEqual(try store.load().first?.name, "Renamed")
+        XCTAssertEqual(model.personalPresetID, id)
+        model.deletePersonalPreset()
+        XCTAssertTrue(try store.load().isEmpty)
+        XCTAssertEqual(model.draft, initial)
+        XCTAssertEqual(saves, 0)
+        XCTAssertEqual(actions, 0)
+    }
+
+    func testPresetFailureDoesNotLoseStoredListOrOverwriteCorruptStorage() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent("presets.json")
+        try Data("broken".utf8).write(to: url)
+        let model = SettingsModel(controller: controller, initialConfig: PerformanceProfile.stable.settings,
+                                  presetStore: PersonalPresetStore(url: url))
+        model.personalPresetName = "New"
+        model.savePersonalPreset()
+        XCTAssertNotNil(model.presetError)
+        XCTAssertTrue(model.personalPresets.isEmpty)
+        XCTAssertEqual(try String(contentsOf: url), "broken")
+    }
+
+    func testTypedBitrateAboveOldLimitPersistsAndRejectsEncoderOverflow() {
+        var writes: [[String: String]] = []
+        var actions = 0
+        let model = SettingsModel(controller: controller,
+            initialConfig: ["ENABLE_H264": "1", "BITRATE": "50", "EXTRA_FLAGS": "--bitrate=25 --fps 60"],
+            saveSettings: { writes.append($0) }, performAction: { _, _ in actions += 1 })
+        model.setBitrate(" 150 ")
+        XCTAssertEqual(model.bitrateInput, "150")
+        XCTAssertEqual(model.bitrateMbps, "150")
+        XCTAssertEqual(model.draft["EXTRA_FLAGS"], "--fps 60")
+        XCTAssertNil(model.validationError)
+        model.apply()
+        XCTAssertEqual(writes.last?["BITRATE"], "150")
+        XCTAssertEqual(actions, 0)
+        for invalid in ["0", "-1", "1.5", "2148", "4294967295", "invalid"] {
+            model.setBitrate(invalid)
+            XCTAssertNotNil(model.validationError)
+            model.apply()
+        }
+        XCTAssertEqual(writes.count, 1)
+        model.setBitrate("2147")
+        XCTAssertNil(model.validationError)
+        model.setBitrate("")
+        XCTAssertEqual(model.bitrateInput, "")
+        XCTAssertEqual(model.bitrateMbps, "6")
+        XCTAssertNil(model.validationError)
+        model.apply()
+        XCTAssertEqual(writes.last?["BITRATE"], "")
+        XCTAssertEqual(actions, 0)
+    }
+
+    func testEncoderQueueDepthEditsLegacyFlagAndPersists() {
+        var saved: [String: String] = [:]
+        let model = SettingsModel(controller: controller,
+            initialConfig: ["ENABLE_H264": "1", "EXTRA_FLAGS": "--h264-frames-in-flight=1 --stretch"],
+            saveSettings: { saved = $0 })
+        XCTAssertEqual(model.encoderQueueDepth, "1")
+        model.setEncoderQueueDepth("0")
+        XCTAssertNotNil(model.validationError)
+        model.setEncoderQueueDepth("2")
+        XCTAssertNil(model.validationError)
+        XCTAssertEqual(model.draft["EXTRA_FLAGS"], "--stretch")
+        model.apply()
+        XCTAssertEqual(saved["H264_FRAMES_IN_FLIGHT"], "2")
+        model.setEncoderQueueDepth("")
+        XCTAssertNil(model.validationError)
+    }
 
     private func result(_ success: Bool, running: Bool) -> ServerActionResult {
         ServerActionResult(success: success, message: success ? "Running" : "Start failed",

@@ -404,6 +404,8 @@ impl CliprdrBackendFactory for MacCliprdr {
             #[cfg(target_os = "macos")]
             lazy_paste: self.lazy_paste,
             initial_advertise_pending: true,
+            initial_advertise_task: None,
+            advertise: advertise_pasteboard,
         })
     }
 }
@@ -465,6 +467,8 @@ struct MacCliprdrBackend {
     // silently drop Mac->client sync for that case; caught in review on
     // #173).
     initial_advertise_pending: bool,
+    initial_advertise_task: Option<tokio::task::JoinHandle<()>>,
+    advertise: fn(&Sender, &Paths) -> bool,
 }
 
 /// Drop runs when the RDP connection ends and ironrdp_server releases
@@ -481,6 +485,9 @@ struct MacCliprdrBackend {
 /// and we don't want to stall the disconnect path.
 impl Drop for MacCliprdrBackend {
     fn drop(&mut self) {
+        if let Some(task) = self.initial_advertise_task.take() {
+            task.abort();
+        }
         // Re-park the pasteboard poller if this was the last connected
         // clipboard channel (balances build_cliprdr_backend's increment).
         self.active_backends
@@ -579,6 +586,10 @@ impl MacCliprdrBackend {
 /// FileContentsRequests instead of short-circuiting them with
 /// CB_RESPONSE_FAIL.
 fn advertise_pasteboard(sender: &Sender, paths: &Paths) -> bool {
+    if pb::is_remote_clipboard() {
+        debug!("not advertising Universal Clipboard data from another Apple device");
+        return true;
+    }
     if pb::has_files() {
         let entries = pb::read_files();
         if !entries.is_empty() {
@@ -701,17 +712,18 @@ impl CliprdrBackend for MacCliprdrBackend {
             );
             let sender = self.sender.clone();
             let file_paths = self.file_paths.clone();
-            tokio::spawn(async move {
+            let advertise = self.advertise;
+            self.initial_advertise_task = Some(tokio::spawn(async move {
                 tokio::time::sleep(CONNECT_ADVERTISE_DELAY).await;
-                advertise_pasteboard(&sender, &file_paths);
-            });
+                advertise(&sender, &file_paths);
+            }));
             return;
         }
-        advertise_pasteboard(&self.sender, &self.file_paths);
+        (self.advertise)(&self.sender, &self.file_paths);
     }
 
     fn on_request_format_list(&mut self) {
-        advertise_pasteboard(&self.sender, &self.file_paths);
+        (self.advertise)(&self.sender, &self.file_paths);
     }
 
     fn on_format_list_response(&mut self, ok: bool) {
@@ -1022,6 +1034,30 @@ mod pb {
         }
     }
 
+    const HANDOFF_TYPE: &str = "com.apple.is-remote-clipboard";
+
+    /// Only inspect type metadata: reading a promised payload can block the
+    /// RDP loop while macOS fetches it from the other device. Upstream #198.
+    pub fn is_remote_clipboard() -> bool {
+        let _pb_guard = super::pasteboard_guard();
+        autoreleasepool(|_| unsafe { has_remote_marker(&NSPasteboard::generalPasteboard()) })
+    }
+
+    fn has_remote_marker(pb: &NSPasteboard) -> bool {
+        let marker = NSString::from_str(HANDOFF_TYPE);
+        unsafe {
+            pb.types().is_some_and(|types| {
+                (0..types.count()).any(|i| types.objectAtIndex(i).isEqualToString(&marker))
+            })
+        }
+    }
+
+    // Recheck just before data access. Windows can request a previously
+    // advertised format after the Mac clipboard has changed to a promise.
+    fn local_data<T>(pb: &NSPasteboard, read: impl FnOnce(&NSPasteboard) -> T) -> Option<T> {
+        (!has_remote_marker(pb)).then(|| read(pb))
+    }
+
     pub fn has_string() -> bool {
         unsafe { has_type(NSPasteboardTypeString) }
     }
@@ -1066,7 +1102,7 @@ mod pb {
         let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
-            let Some(items) = pb.pasteboardItems() else {
+            let Some(items) = local_data(&pb, |pb| pb.pasteboardItems()).flatten() else {
                 return Vec::new();
             };
             let mut out: Vec<FileEntry> = Vec::new();
@@ -1213,8 +1249,11 @@ mod pb {
         let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
-            pb.stringForType(NSPasteboardTypeString)
-                .map(|s| s.to_string())
+            local_data(&pb, |pb| {
+                pb.stringForType(NSPasteboardTypeString)
+                    .map(|s| s.to_string())
+            })
+            .flatten()
         })
     }
 
@@ -1235,13 +1274,16 @@ mod pb {
         let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
             let pb = NSPasteboard::generalPasteboard();
-            if let Some(d) = pb.dataForType(NSPasteboardTypePNG) {
-                return Some((ImageEncoding::Png, nsdata_to_vec(&d)));
-            }
-            if let Some(d) = pb.dataForType(NSPasteboardTypeTIFF) {
-                return Some((ImageEncoding::Tiff, nsdata_to_vec(&d)));
-            }
-            None
+            local_data(&pb, |pb| {
+                if let Some(d) = pb.dataForType(NSPasteboardTypePNG) {
+                    return Some((ImageEncoding::Png, nsdata_to_vec(&d)));
+                }
+                if let Some(d) = pb.dataForType(NSPasteboardTypeTIFF) {
+                    return Some((ImageEncoding::Tiff, nsdata_to_vec(&d)));
+                }
+                None
+            })
+            .flatten()
         })
     }
 
@@ -1267,6 +1309,38 @@ mod pb {
         Png,
         Tiff,
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn clipboard_marker_prevents_payload_reads_without_touching_general_clipboard() {
+            autoreleasepool(|_| unsafe {
+                let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+                let text = NSString::from_str("local clipboard");
+                pasteboard.clearContents();
+                assert!(pasteboard.setString_forType(&text, NSPasteboardTypeString));
+                assert_eq!(
+                    local_data(&pasteboard, |pb| {
+                        pb.stringForType(NSPasteboardTypeString)
+                            .map(|s| s.to_string())
+                    })
+                    .flatten()
+                    .as_deref(),
+                    Some("local clipboard")
+                );
+
+                let marker = NSString::from_str(HANDOFF_TYPE);
+                assert!(pasteboard.setString_forType(&text, &marker));
+                assert_eq!(
+                    local_data::<()>(&pasteboard, |_| panic!("would fetch Handoff data")),
+                    None
+                );
+                pasteboard.clearContents();
+            });
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1284,6 +1358,9 @@ mod pb {
     }
     pub fn change_count() -> i64 {
         0
+    }
+    pub fn is_remote_clipboard() -> bool {
+        false
     }
     pub fn has_string() -> bool {
         false
@@ -1400,8 +1477,30 @@ mod tests {
             advertise_state: Arc::new(AdvertiseState::default()),
             lazy_paste: true,
             initial_advertise_pending: true,
+            initial_advertise_task: None,
+            advertise: |sender, _| {
+                send(
+                    sender,
+                    ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(vec![
+                        ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+                    ])),
+                )
+            },
         };
         (backend, rx)
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn disconnect_cancels_the_pending_initial_advertisement() {
+        let (mut backend, mut rx) = test_backend();
+        backend.on_ready();
+        drop(backend);
+
+        assert!(tokio::time::timeout(CONNECT_ADVERTISE_DELAY / 2, rx.recv())
+            .await
+            .expect("the pending task must release its sender on disconnect")
+            .is_none());
     }
 
     /// The connect-time fix under test: the client's own initial FormatList
@@ -1433,11 +1532,9 @@ mod tests {
         );
         assert!(!backend.initial_advertise_pending);
 
-        pb::write_string("on_ready_deferred_probe");
-        tokio::time::sleep(CONNECT_ADVERTISE_DELAY + Duration::from_millis(100)).await;
-
-        match rx
-            .try_recv()
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the deferred advertise timed out")
             .expect("the deferred advertise must eventually fire")
         {
             ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)) => {
@@ -1460,7 +1557,6 @@ mod tests {
         let (mut backend, mut rx) = test_backend();
         backend.initial_advertise_pending = false;
 
-        pb::write_string("on_ready_settled_probe");
         backend.on_ready();
         match rx
             .try_recv()

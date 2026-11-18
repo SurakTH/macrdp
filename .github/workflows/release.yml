@@ -320,11 +320,11 @@ jobs:
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          # v0.96.1 publication was explicitly requested; other tags stay drafts.
-          draft: ${{ (inputs.tag || github.ref_name) != 'v0.96.1' }}
-          prerelease: ${{ (inputs.tag || github.ref_name) == 'v0.96.1' || contains(inputs.tag || github.ref_name, '-') }}
-          name: ${{ (inputs.tag || github.ref_name) == 'v0.96.1' && 'macrdp Surak v0.96.1' || (inputs.tag || github.ref_name) }}
-          body_path: ${{ (inputs.tag || github.ref_name) == 'v0.96.1' && 'docs/releases/v0.96.1.md' || '' }}
+          # Explicitly requested Surak fork releases publish after all builds pass.
+          draft: ${{ !contains(fromJSON('["v0.96.1","v0.9.6.2"]'), inputs.tag || github.ref_name) }}
+          prerelease: ${{ contains(fromJSON('["v0.96.1","v0.9.6.2"]'), inputs.tag || github.ref_name) || contains(inputs.tag || github.ref_name, '-') }}
+          name: ${{ contains(fromJSON('["v0.96.1","v0.9.6.2"]'), inputs.tag || github.ref_name) && format('macrdp Surak {0}', inputs.tag || github.ref_name) || (inputs.tag || github.ref_name) }}
+          body_path: ${{ contains(fromJSON('["v0.96.1","v0.9.6.2"]'), inputs.tag || github.ref_name) && format('docs/releases/{0}.md', inputs.tag || github.ref_name) || '' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

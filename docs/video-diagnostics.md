@@ -34,7 +34,8 @@ values sampled at slightly different times.
 - `keyboard_events`: received keyboard events, including releases. No key values.
 - `capture_samples`: all samples consumed from ScreenCaptureKit.
 - `capture_idle`: non-content samples (includes blank/suspended states).
-- `capture_content`: content samples with a usable image buffer.
+- `capture_content`: content samples with a usable image buffer selected for processing.
+- `capture_superseded`: callbacks replaced by a newer ready image in Responsive capture.
 - `encode_submitted`: logical H.264 capture submissions accepted by the encoder,
   including refresh pictures.
 - `encode_deferred`: submission attempts postponed by throttles or unavailable

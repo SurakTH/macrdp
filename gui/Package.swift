@@ -23,7 +23,7 @@ let package = Package(
     platforms: [.macOS(.v13)],
     targets: [
         .target(name: "ControllerCore", path: "Sources/ControllerCore",
-                linkerSettings: [.linkedFramework("Security")]),
+                linkerSettings: [.linkedFramework("Security"), .linkedFramework("OpenDirectory")]),
         .executableTarget(
             name: "macrdptray",
             dependencies: ["ControllerCore"],

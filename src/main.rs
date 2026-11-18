@@ -43,21 +43,18 @@ mod runloop_thread;
 #[cfg(target_os = "macos")]
 mod scard_ipc;
 mod shield;
+mod startup_password;
 mod stats;
 mod switcher_hud;
 mod usb_redirect;
 mod videotoolbox;
 mod virtual_display;
 
-/// Manual A/V resync hotkey (Ctrl+Alt+Shift+R — handled in `input.rs`). Set true
-/// by the input handler on the chord; consumed independently by the video path
-/// (`capture.rs` → a bare core reactivation + forced IDR, reusing the
-/// blank-recovery machinery) and the audio path (`audio.rs` → an SCK stream
-/// rebuild). Two flags so each consumer swaps its own back to false. Lets a user
-/// recover a session gone stale after a long idle — a blanked mstsc surface
-/// and/or drifted audio — on demand, without disconnecting.
-pub(crate) static RESYNC_VIDEO: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Wake capture even when ScreenCaptureKit is idle. Notifications coalesce.
+#[cfg(target_os = "macos")]
+pub(crate) static RESYNC_VIDEO: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Manual A/V resync hotkey also requests an independent audio stream rebuild.
 pub(crate) static RESYNC_AUDIO: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1777,12 +1774,10 @@ fn args_from_config(path: &Path) -> Result<Args> {
         configured_switch_flags.extend(["--no-client-resolution", "--hidpi"]);
     }
 
-    for (cfg_key, cli_flag) in [("KEYFRAME_ON_CHANGE", "--keyframe-on-change")] {
-        if cfg.contains_key(cfg_key) {
-            configured_switch_flags.push(cli_flag);
-            if on(cfg_key, false) {
-                argv.push(cli_flag.into());
-            }
+    if cfg.contains_key("KEYFRAME_ON_CHANGE") {
+        configured_switch_flags.push("--keyframe-on-change");
+        if on("KEYFRAME_ON_CHANGE", false) {
+            argv.push("--keyframe-on-change".into());
         }
     }
     // Env-only tunables (auth guard, health-check watchdog, blank recovery,
@@ -1894,6 +1889,8 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // getenv() in stats::default_port(); bridged like the USB/camera knobs
         // above so STATS_PORT can be set from config.env.
         ("STATS_PORT", "MACRDP_STATS_PORT"),
+        ("RESPONSIVE_CAPTURE", "MACRDP_RESPONSIVE_CAPTURE"),
+        ("TCP_VIDEO_BACKPRESSURE", "MACRDP_TCP_VIDEO_BACKPRESSURE"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {
@@ -1993,6 +1990,45 @@ async fn async_main() -> Result<()> {
         }
     });
     logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
+
+    // Validate credentials before bringing up capture, displays, or helpers.
+    let username = args
+        .username
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
+    if args.skip_auth && !args.bind.ip().is_loopback() {
+        return Err(anyhow!(
+            "--skip-auth refused on non-loopback bind {} — remove --skip-auth or rebind to 127.0.0.1",
+            args.bind,
+        ));
+    }
+    let mut cli_password = args.password.take();
+    let password = startup_password::read_and_verify(
+        args.keychain && multitransport::env_truthy("MACRDP_PARK_ON_AUTH_FAILURE"),
+        || {
+            if args.keychain {
+                read_password_from_keychain(&username)
+            } else if let Some(password) = cli_password.take() {
+                warn!("--password is visible in process arguments; prefer --keychain or the terminal prompt");
+                Ok(Zeroizing::new(password))
+            } else {
+                rpassword::prompt_password(format!("Password for {username}: "))
+                    .map(Zeroizing::new)
+                    .context("read password from terminal")
+            }
+        },
+        |password| {
+            if args.skip_auth {
+                warn!("--skip-auth set; using the given password without PAM (loopback only)");
+            } else {
+                auth::authenticate(&username, password)
+                    .with_context(|| format!("PAM auth failed for {username}"))?;
+                info!(user = %username, "PAM auth ok");
+            }
+            Ok(())
+        },
+    ).await?;
 
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste
@@ -2302,44 +2338,6 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    let username = args
-        .username
-        .clone()
-        .or_else(|| std::env::var("USER").ok())
-        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
-    let password: Zeroizing<String> = if args.keychain {
-        read_password_from_keychain(&username)?
-    } else if let Some(p) = args.password.take() {
-        warn!(
-            "--password is visible to any local user via `ps` and may be saved in \
-             shell history; prefer --keychain (headless) or the interactive prompt. \
-             Kept only for compatibility / scripted tests."
-        );
-        Zeroizing::new(p)
-    } else {
-        Zeroizing::new(
-            rpassword::prompt_password(format!("Password for {username}: "))
-                .context("read password from terminal")?,
-        )
-    };
-    if !args.skip_auth {
-        auth::authenticate(&username, password.as_str())
-            .with_context(|| format!("PAM auth failed for {username}"))?;
-        info!(user = %username, "PAM auth ok");
-    } else {
-        // --skip-auth is a dev-only escape hatch. Refuse it whenever the
-        // listener is reachable beyond loopback so a fat-fingered config
-        // can't accidentally expose an unauth'd RDP server to the LAN.
-        if !args.bind.ip().is_loopback() {
-            return Err(anyhow!(
-                "--skip-auth refused on non-loopback bind {} — \
-                 remove --skip-auth or rebind to 127.0.0.1",
-                args.bind,
-            ));
-        }
-        warn!("--skip-auth set; using --password verbatim without PAM check (loopback only)");
-    }
-
     let cert_dir = match args.cert_dir.clone() {
         Some(p) => p,
         None => default_cert_dir()?,
@@ -2596,6 +2594,8 @@ async fn async_main() -> Result<()> {
     // `vendor/ironrdp-server` `display_suppressed` plumbing.
     let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let display_suppressed_changed = Arc::new(tokio::sync::Notify::new());
+
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
         auto_size,
@@ -2619,6 +2619,7 @@ async fn async_main() -> Result<()> {
         flush_frames: args.flush_frames,
         flush_interval: args.flush_interval_ms.map(std::time::Duration::from_millis),
         display_suppressed: Some(display_suppressed.clone()),
+        display_suppressed_changed: display_suppressed_changed.clone(),
         // Live in-session resize (client drags its window, sending an
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the
         // connect-time auto-adopt above. See `CaptureDisplay::request_layout`.
@@ -2748,6 +2749,7 @@ async fn async_main() -> Result<()> {
     // reads from. Without this, the server uses an internally-created
     // flag the display never sees.
     server.set_display_suppressed_handle(display_suppressed);
+    server.set_display_suppressed_wakeup(display_suppressed_changed);
 
     // The acceptor records the client's announced keyboard-layout id (KLID) in
     // its Client Core Data; the server publishes it here so the input handler

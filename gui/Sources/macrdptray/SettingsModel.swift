@@ -1,4 +1,5 @@
 import AppKit
+import ControllerCore
 import Network
 import SwiftUI
 
@@ -49,6 +50,8 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             "H264_FRAMES_IN_FLIGHT": "2",
             "FLUSH_FRAMES": "4",
             "FLUSH_INTERVAL_MS": "",
+            "RESPONSIVE_CAPTURE": "0",
+            "TCP_VIDEO_BACKPRESSURE": "0",
             "STATS_ENDPOINT": "1",
         ]
         switch self {
@@ -99,7 +102,13 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
     }
 
     func matches(_ config: [String: String]) -> Bool {
-        settings.allSatisfy { config[$0.key, default: ""] == $0.value }
+        settings.allSatisfy { key, value in
+            config[key, default: Self.settingFallback(key)] == value
+        }
+    }
+
+    static func settingFallback(_ key: String) -> String {
+        ["RESPONSIVE_CAPTURE", "TCP_VIDEO_BACKPRESSURE"].contains(key) ? "0" : ""
     }
 }
 
@@ -143,12 +152,22 @@ final class SettingsModel: ObservableObject {
     @Published var section: SettingsSection = .status
     @Published private var customCaptureSelected = false
     @Published private var fastFlushSelected = false
+    @Published private(set) var personalPresets: [PersonalPreset] = []
+    @Published var personalPresetID: UUID?
+    @Published var personalPresetName = ""
+    @Published private(set) var presetMessage: String?
+    @Published private(set) var presetError: String?
+    private let presetStore: PersonalPresetStore
+    private var presetLoadFailed = false
 
     init(controller: AppController,
          initialConfig: [String: String]? = nil,
          saveSettings: (([String: String]) throws -> Void)? = nil,
-         performAction: ((ServerAction, @escaping (ServerActionResult) -> Void) -> Void)? = nil) {
+         performAction: ((ServerAction, @escaping (ServerActionResult) -> Void) -> Void)? = nil,
+         presetStore: PersonalPresetStore? = nil) {
         self.controller = controller
+        self.presetStore = presetStore ?? PersonalPresetStore(
+            url: controller.configURL.deletingLastPathComponent().appendingPathComponent("presets.json"))
         self.saveSettings = saveSettings ?? { [unowned controller] in try controller.saveConfig(changes: $0) }
         self.performAction = performAction ?? { [unowned controller] in controller.performServerAction($0, completion: $1) }
         if initialConfig == nil { controller.ensureConfigExists() }
@@ -157,6 +176,8 @@ final class SettingsModel: ObservableObject {
         self.draft = cfg
         self.serverRunning = controller.cachedServerRunning
         self.serverStatusKnown = initialConfig != nil
+        do { personalPresets = try self.presetStore.load() }
+        catch { presetLoadFailed = true; presetError = "Could not load presets: \(error.localizedDescription)" }
         if initialConfig == nil {
             // Resolve even if the user leaves Status before its first refresh.
             DispatchQueue.global(qos: .utility).async { [weak self, controller] in
@@ -187,11 +208,15 @@ final class SettingsModel: ObservableObject {
             IPv4Address($0) == nil && IPv6Address($0) == nil
         }
         if !invalid.isEmpty { return "Invalid IP address: \(invalid.joined(separator: ", "))" }
-        for (key, label) in [("FPS", "Frame rate"), ("BITRATE", "Bitrate")] {
+        for (key, label) in [("FPS", "Frame rate"), ("H264_FRAMES_IN_FLIGHT", "Encoder queue depth")] {
             let value = draft[key] ?? ""
             if !value.isEmpty, UInt32(value).map({ $0 > 0 }) != true {
                 return "\(label) must be a positive whole number."
             }
+        }
+        if !bitrateInput.isEmpty,
+           UInt32(bitrateInput).map({ (1...2147).contains($0) }) != true {
+            return "Bitrate must be whole-number Mbps from 1 to 2147 (VideoToolbox's numeric range), or empty for 6 Mbps."
         }
         if fastFlushEnabled && fastFlushInterval.isEmpty {
             return "Enter a fast-flush interval from 8 to 1000 ms, or turn Fast flush off."
@@ -395,12 +420,84 @@ final class SettingsModel: ObservableObject {
         setString("ALLOW_IP", value)
     }
 
+    // MARK: - Personal presets
+
+    var selectedPersonalPreset: PersonalPreset? {
+        personalPresets.first { $0.id == personalPresetID }
+    }
+
+    func selectPersonalPreset(_ id: UUID?) {
+        personalPresetID = id
+        personalPresetName = selectedPersonalPreset?.name ?? ""
+        presetMessage = nil
+        presetError = nil
+    }
+
+    func savePersonalPreset(replace: Bool = false) {
+        guard validationError == nil else { presetError = validationError; return }
+        if replace && selectedPersonalPreset == nil { return }
+        var values = Dictionary(uniqueKeysWithValues: PersonalPreset.allowedKeys.map { ($0, draft[$0] ?? PerformanceProfile.settingFallback($0)) })
+        // Materialize legacy flags so a preset does not depend on EXTRA_FLAGS.
+        values["FPS"] = frameRate
+        values["BITRATE"] = bitrateMbps
+        values["H264_FRAMES_IN_FLIGHT"] = encoderQueueDepth
+        values["FLUSH_INTERVAL_MS"] = fastFlushInterval
+        let id = replace ? personalPresetID! : UUID()
+        let preset = PersonalPreset(id: id,
+            name: personalPresetName.trimmingCharacters(in: .whitespacesAndNewlines), settings: values)
+        var updated = personalPresets.filter { $0.id != id }
+        updated.append(preset)
+        persistPresets(updated, selected: id, message: "Preset saved. Server settings are unchanged until Apply.")
+    }
+
+    func renamePersonalPreset() {
+        guard var preset = selectedPersonalPreset else { return }
+        preset.name = personalPresetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let updated = personalPresets.map { $0.id == preset.id ? preset : $0 }
+        persistPresets(updated, selected: preset.id, message: "Preset renamed.")
+    }
+
+    func deletePersonalPreset() {
+        guard let id = personalPresetID else { return }
+        persistPresets(personalPresets.filter { $0.id != id }, selected: nil, message: "Preset deleted. Current settings are unchanged.")
+    }
+
+    private func persistPresets(_ values: [PersonalPreset], selected: UUID?, message: String) {
+        guard !presetLoadFailed else {
+            presetError = "Preset storage could not be read. Fix presets.json and reopen Settings before saving."
+            return
+        }
+        do {
+            try presetStore.save(values)
+            personalPresets = values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            personalPresetID = selected
+            personalPresetName = selectedPersonalPreset?.name ?? ""
+            presetError = nil
+            presetMessage = message
+        } catch { presetError = error.localizedDescription; presetMessage = nil }
+    }
+
+    func loadPersonalPreset() {
+        guard let preset = selectedPersonalPreset else { return }
+        customCaptureSelected = false
+        fastFlushSelected = false
+        for key in PersonalPreset.allowedKeys { draft[key] = preset.settings[key] ?? PerformanceProfile.settingFallback(key) }
+        setFrameRate(preset.settings["FPS"] ?? "")
+        setBitrate(preset.settings["BITRATE"] ?? "")
+        setEncoderQueueDepth(preset.settings["H264_FRAMES_IN_FLIGHT"] ?? "")
+        cleanExtraFlags(["--flush-interval-ms", "--width", "--height", "--hidpi", "--no-client-resolution"])
+        normalize()
+        presetError = nil
+        presetMessage = "Preset loaded into draft. Review settings, then Apply."
+    }
+
     // MARK: - Performance profiles
 
     func applyProfile(_ profile: PerformanceProfile) {
         customCaptureSelected = false
         fastFlushSelected = false
         for (key, value) in profile.settings { draft[key] = value }
+        if let depth = profile.settings["H264_FRAMES_IN_FLIGHT"] { setEncoderQueueDepth(depth) }
         if let fps = profile.settings["FPS"] { setFrameRate(fps) }
         if let bitrate = profile.settings["BITRATE"], !bitrate.isEmpty {
             setBitrate(bitrate)
@@ -523,6 +620,17 @@ final class SettingsModel: ObservableObject {
         normalize()
     }
 
+    var encoderQueueDepth: String {
+        draft["H264_FRAMES_IN_FLIGHT"]
+            ?? Self.extraFlagValue("--h264-frames-in-flight", in: string("EXTRA_FLAGS"))
+            ?? ""
+    }
+
+    func setEncoderQueueDepth(_ depth: String) {
+        draft["H264_FRAMES_IN_FLIGHT"] = depth.trimmingCharacters(in: .whitespaces)
+        cleanExtraFlags(["--h264-frames-in-flight"])
+    }
+
     // MARK: - H.264 bitrate ceiling (Mbit/s)
 
     /// Effective ceiling: the BITRATE key if set, else a `--bitrate N` left in
@@ -533,10 +641,17 @@ final class SettingsModel: ObservableObject {
         return "6"
     }
 
+    /// Keep an explicitly cleared editor empty while the effective ceiling
+    /// falls back to the server's default. Legacy flags remain editable.
+    var bitrateInput: String {
+        if let value = draft["BITRATE"] { return value }
+        return Self.extraFlagValue("--bitrate", in: string("EXTRA_FLAGS")) ?? ""
+    }
+
     /// Set the ceiling via BITRATE and strip any `--bitrate N` from EXTRA_FLAGS so
     /// the two can never disagree (the server would otherwise take the last one).
     func setBitrate(_ mbps: String) {
-        draft["BITRATE"] = mbps
+        draft["BITRATE"] = mbps.trimmingCharacters(in: .whitespaces)
         let extra = string("EXTRA_FLAGS")
         let cleaned = Self.strippingFlag("--bitrate", from: extra)
         if cleaned != extra { draft["EXTRA_FLAGS"] = cleaned }

@@ -7,10 +7,12 @@ pub(crate) struct FrameFlush {
     next: Option<Instant>,
     refresh_at: Option<Instant>,
     trailing_after_refresh: u32,
+    explicit_repaint: bool,
 }
 
 impl FrameFlush {
     pub(crate) fn arm(&mut self, count: u32, submitted: bool, now: Instant, interval: Duration) {
+        self.explicit_repaint = false;
         // Start ordinary trailing pictures at frame cadence. Waiting for the
         // quiet-period IDR first leaves sparse typing in the client's
         // presentation buffer for at least 100 ms.
@@ -26,8 +28,22 @@ impl FrameFlush {
         self.next = (self.remaining > 0).then_some(now + interval);
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn repaint_now(&mut self, count: u32, now: Instant) {
+        self.explicit_repaint = true;
+        self.remaining = 0;
+        self.next = Some(now);
+        self.refresh_at = Some(now);
+        self.trailing_after_refresh = count;
+    }
+
     pub(crate) fn force_keyframe(&self) -> bool {
         self.refresh_at.is_some() && self.remaining == 0
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn explicit_repaint_pending(&self) -> bool {
+        self.explicit_repaint
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -39,6 +55,7 @@ impl FrameFlush {
             if self.remaining > 0 {
                 self.remaining -= 1;
             } else if self.refresh_at.take().is_some() {
+                self.explicit_repaint = false;
                 self.remaining = self.trailing_after_refresh;
             }
         }
@@ -65,6 +82,30 @@ mod tests {
     use super::*;
     const INTERVAL: Duration = Duration::from_millis(16);
     const QUIET: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn manual_repaint_is_immediate_retries_and_sends_trailing_frames() {
+        let now = Instant::now();
+        let mut flush = FrameFlush::default();
+        flush.repaint_now(2, now);
+        assert!(flush.explicit_repaint_pending());
+        assert_eq!(flush.deadline(), Some(now));
+        assert!(flush.force_keyframe());
+        flush.attempted(false, now, INTERVAL);
+        assert_eq!(flush.deadline(), Some(now + INTERVAL));
+        assert!(flush.force_keyframe());
+        assert!(flush.explicit_repaint_pending());
+        for n in 1..=3 {
+            flush.attempted(true, now + INTERVAL * n, INTERVAL);
+            assert!(!flush.force_keyframe());
+            assert!(!flush.explicit_repaint_pending());
+        }
+        assert_eq!(flush.deadline(), None);
+        flush.repaint_now(0, now);
+        assert!(flush.force_keyframe());
+        flush.attempted(true, now, INTERVAL);
+        assert_eq!(flush.deadline(), None);
+    }
 
     #[test]
     fn sparse_typing_gets_immediate_trailing_pictures_before_quiet_refresh() {
@@ -189,5 +230,20 @@ mod tests {
         flush.attempted(false, Instant::now(), INTERVAL);
         assert!(flush.deadline().is_none());
         assert!(!flush.force_keyframe());
+    }
+
+    #[test]
+    fn resize_discards_a_deferred_explicit_repaint() {
+        let now = Instant::now();
+        let mut flush = FrameFlush::default();
+        flush.repaint_now(4, now);
+        flush.attempted(false, now, INTERVAL);
+
+        flush.clear();
+        flush.arm(4, true, now + INTERVAL, INTERVAL);
+
+        assert!(!flush.explicit_repaint_pending());
+        assert!(!flush.force_keyframe());
+        assert_eq!(flush.deadline(), Some(now + INTERVAL * 2));
     }
 }

@@ -17,16 +17,15 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-**Fork release: v0.96.1**, based on upstream **v0.9.6**. This fork uses its
-own version sequence; 0.96.1 does not imply that upstream v0.9.7–v0.9.11
-changes have been merged. Upstream retains its independent release line.
+**Fork pre-release: v0.9.6.2**, based on upstream **v0.9.6**. Cargo and the
+macOS app bundles report the internal version **0.96.2**. The upstream project
+maintains its independent release line.
 
-This pre-release includes server video scheduling and encoder recovery fixes,
-Controller resolution and flush controls, safer Keychain handling, and drive /
-smart-card hardening. Start with **Connection → Stable** for the tested 1080p
-AVC420 settings. Fast flush is optional and can increase image artifacts;
-AVC444 remains a diagnostics mode. See the
-[v0.96.1 release notes](docs/releases/v0.96.1.md) for validation and upgrade details.
+Start with **Connection → Stable** for the tested 1080p AVC420 settings.
+The Controller now supports personal presets and live video diagnostics.
+4K/60, Fast flush, TCP video pacing and AVC444 diagnostics remain experimental.
+See the [v0.9.6.2 release notes](docs/releases/v0.9.6.2.md) for upgrade details
+and Windows validation.
 
 Full per-release notes (what shipped, what was verified live, and the war stories): **[docs/release-history.md](docs/release-history.md)**.
 

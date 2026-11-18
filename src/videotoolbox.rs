@@ -62,12 +62,15 @@ impl EncodeOutput {
 
 struct OutputContext {
     tx: mpsc::Sender<EncodeOutput>,
-    pending: std::sync::Mutex<std::collections::HashSet<i64>>,
+    pending: std::sync::Mutex<std::collections::HashMap<i64, Option<std::time::Instant>>>,
 }
 
 impl OutputContext {
     fn begin(&self, pts: i64) {
-        self.pending.lock().unwrap().insert(pts);
+        self.pending.lock().unwrap().insert(
+            pts,
+            crate::stats::global().map(|_| std::time::Instant::now()),
+        );
     }
 
     fn cancel(&self, pts: i64) {
@@ -77,7 +80,13 @@ impl OutputContext {
     fn complete(&self, output: EncodeOutput) {
         // VT can report a synchronous drop as well as call the callback.
         // Deliver exactly one outcome, whichever arrives first.
-        if self.pending.lock().unwrap().remove(&output.pts()) {
+        let started = self.pending.lock().unwrap().remove(&output.pts());
+        if let Some(started) = started {
+            if let (EncodeOutput::Picture(_), Some(started), Some(stats)) =
+                (&output, started, crate::stats::global())
+            {
+                stats.record_encode(started.elapsed());
+            }
             let _ = self.tx.send(output);
         }
     }
@@ -255,7 +264,15 @@ impl Encoder {
             std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
             Ok("0") | Ok("false") | Ok("FALSE")
         );
-        Self::new_with_range(width, height, fps, bitrate_bps, keyframe_secs, full_range)
+        Self::new_with_range(
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            keyframe_secs,
+            full_range,
+            false,
+        )
     }
 
     fn new_with_range(
@@ -265,6 +282,7 @@ impl Encoder {
         bitrate_bps: u32,
         keyframe_secs: f32,
         full_range: bool,
+        low_latency: bool,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<EncodeOutput>();
         // The callback context stays alive until the VT session is invalidated.
@@ -285,6 +303,7 @@ impl Encoder {
             keyframe_frames,
             tx_ptr,
             full_range,
+            low_latency,
         )?;
         Ok(Self {
             inner: session,
@@ -470,6 +489,7 @@ impl Avc444Encoder {
             bitrate_bps,
             keyframe_secs,
             true,
+            false,
         )?;
         let all_intra_env = std::env::var("MACRDP_AVC444_ALL_INTRA").ok();
         let all_intra = avc444_all_intra_setting(all_intra_env.as_deref());
@@ -662,6 +682,8 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
+        pub(super) static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
+        pub(super) static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         // Color-space signaling so the encoded SPS VUI describes its color
@@ -833,6 +855,7 @@ mod ffi {
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
         full_range: bool,
+        low_latency: bool,
     ) -> Result<SessionGuard> {
         // Supplying explicit source attributes makes VideoToolbox expose a
         // matching CVPixelBufferPool. Allocating frames from that pool lets VT
@@ -902,6 +925,26 @@ mod ffi {
             bail!("CFDictionaryCreate failed for source pixel-buffer attributes");
         }
 
+        let encoder_spec = if low_latency {
+            let spec = unsafe {
+                CFDictionaryCreate(
+                    ptr::null(),
+                    (&raw const kVTVideoEncoderSpecification_EnableLowLatencyRateControl).cast(),
+                    (&raw const kCFBooleanTrue).cast(),
+                    1,
+                    (&raw const kCFTypeDictionaryKeyCallBacks).cast(),
+                    (&raw const kCFTypeDictionaryValueCallBacks).cast(),
+                )
+            };
+            if spec.is_null() {
+                unsafe { CFRelease(source_attributes) };
+                bail!("CFDictionaryCreate failed for low-latency encoder specification");
+            }
+            spec
+        } else {
+            ptr::null()
+        };
+
         let mut session: VTCompressionSessionRef = ptr::null();
         let status = unsafe {
             VTCompressionSessionCreate(
@@ -909,7 +952,7 @@ mod ffi {
                 i32::from(width),
                 i32::from(height),
                 K_CM_VIDEO_CODEC_TYPE_H264,
-                ptr::null(),
+                encoder_spec,
                 source_attributes,
                 ptr::null(),
                 Some(output_callback),
@@ -917,7 +960,12 @@ mod ffi {
                 &mut session,
             )
         };
-        unsafe { CFRelease(source_attributes) };
+        unsafe {
+            CFRelease(source_attributes);
+            if !encoder_spec.is_null() {
+                CFRelease(encoder_spec);
+            }
+        };
         if status != 0 || session.is_null() {
             if !session.is_null() {
                 unsafe {
@@ -951,7 +999,11 @@ mod ffi {
             set_string(
                 session,
                 kVTCompressionPropertyKey_ProfileLevel,
-                kVTProfileLevel_H264_Baseline_AutoLevel,
+                if low_latency {
+                    kVTProfileLevel_H264_High_AutoLevel
+                } else {
+                    kVTProfileLevel_H264_Baseline_AutoLevel
+                },
             )?;
             // Tag the bitstream's color space explicitly (BT.709). Without this
             // VideoToolbox leaves the SPS VUI under-specified and each decoder
@@ -1438,6 +1490,7 @@ mod ffi {
         force_keyframe: bool,
         full_range: bool,
     ) -> Result<()> {
+        let preparation = crate::stats::global().map(|stats| (stats, std::time::Instant::now()));
         // Full-range path feeds VT a `420f` (full-range NV12) buffer we fill
         // ourselves; otherwise hand VT BGRA and let it produce video-range YUV.
         let pixel_format = if full_range {
@@ -1483,7 +1536,7 @@ mod ffi {
             bail!("CVPixelBufferLockBaseAddress failed: {lock_status}");
         }
 
-        let populate_result: Result<()> = unsafe {
+        let populate_result: Result<()> = (|| unsafe {
             if full_range {
                 // Two planes: Y (full size) + interleaved CbCr (half size).
                 let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
@@ -1556,7 +1609,7 @@ mod ffi {
                 }
             }
             Ok(())
-        };
+        })();
         let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pbuf, 0) };
         if let Err(error) = populate_result {
             unsafe { CFRelease(pbuf) };
@@ -1565,6 +1618,10 @@ mod ffi {
         if unlock_status != 0 {
             unsafe { CFRelease(pbuf) };
             bail!("CVPixelBufferUnlockBaseAddress failed: {unlock_status}");
+        }
+
+        if let Some((stats, started)) = preparation {
+            stats.record_encode_preparation(started.elapsed());
         }
 
         let result = unsafe {
@@ -1677,7 +1734,7 @@ mod ffi {
             bail!("AVC444 CVPixelBufferLockBaseAddress failed: {lock_status}");
         }
 
-        let populate_result: Result<()> = unsafe {
+        let populate_result: Result<()> = (|| unsafe {
             let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
             let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
             let cbcr_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 1) as *mut u8;
@@ -1706,7 +1763,7 @@ mod ffi {
                 }
             }
             Ok(())
-        };
+        })();
         let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pbuf, 0) };
         if let Err(error) = populate_result {
             unsafe { CFRelease(pbuf) };
@@ -2272,6 +2329,82 @@ mod tests {
                 y444_vim_ms / nv12_vim_ms
             );
         }
+    }
+
+    /// Measure the AVC420 encoder at 4K with a bounded submission window.
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_avc420_4k_pipeline_depth() -> Result<()> {
+        use std::time::{Duration, Instant};
+
+        const WIDTH: u16 = 3840;
+        const HEIGHT: u16 = 2160;
+        const STRIDE: usize = WIDTH as usize * 4;
+        const WARMUP: usize = 12;
+        const FRAMES: usize = 120;
+        let frames: Vec<_> = (0..4)
+            .map(|scroll| {
+                let mut bytes = vec![0; STRIDE * usize::from(HEIGHT)];
+                for (index, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let x = index % usize::from(WIDTH);
+                    let y = index / usize::from(WIDTH) + scroll * 13;
+                    pixel.copy_from_slice(&[
+                        (x ^ y) as u8,
+                        (x + y / 4) as u8,
+                        ((x / 16 + y / 12) % 2 * 200) as u8,
+                        255,
+                    ]);
+                }
+                bytes
+            })
+            .collect();
+
+        for (mode, depth, low_latency) in [
+            ("standard", 1, false),
+            ("standard", 2, false),
+            ("low latency", 1, true),
+            ("low latency", 2, true),
+        ] {
+            let mut encoder =
+                Encoder::new_with_range(WIDTH, HEIGHT, 60, 100_000_000, 2.0, true, low_latency)?;
+            let outputs = encoder.take_receiver().expect("encoder output receiver");
+            let mut counts = [0_usize; 2];
+            for (phase, count) in [WARMUP, FRAMES].into_iter().enumerate() {
+                let started = Instant::now();
+                for index in 0..count {
+                    encoder.encode_bgra(
+                        &frames[index % frames.len()],
+                        STRIDE,
+                        phase == 0 && index == 0,
+                    )?;
+                    if index + 1 >= depth
+                        && matches!(
+                            outputs.recv_timeout(Duration::from_secs(3))?,
+                            EncodeOutput::Picture(_)
+                        )
+                    {
+                        counts[phase] += 1;
+                    }
+                }
+                for _ in 1..depth {
+                    if matches!(
+                        outputs.recv_timeout(Duration::from_secs(3))?,
+                        EncodeOutput::Picture(_)
+                    ) {
+                        counts[phase] += 1;
+                    }
+                }
+                if phase == 1 {
+                    let elapsed = started.elapsed().as_secs_f64();
+                    println!(
+                        "4K AVC420, {mode}, depth {depth}: {:.1} pictures/s, {} of {count} completed",
+                        counts[phase] as f64 / elapsed,
+                        counts[phase],
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// AVC444 scoping: does VideoToolbox actually run two concurrent

@@ -1,4 +1,6 @@
 import AppKit
+import UniformTypeIdentifiers
+import ControllerCore
 import SwiftUI
 import Network
 
@@ -134,12 +136,13 @@ extension AppController {
 /// The settings categories — shown all-at-once in the sidebar AND as a "Section"
 /// menu in the main menu bar (each drives `SettingsModel.section`).
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case status, connection, video, audio, display, input, redirection, advanced, permissions
+    case status, connection, performance, video, audio, display, input, redirection, advanced, permissions
     var id: String { rawValue }
     var title: String {
         switch self {
         case .status: return "Status"
         case .connection: return "Connection"
+        case .performance: return "Performance"
         case .video: return "Video"
         case .audio: return "Audio"
         case .display: return "Display"
@@ -153,6 +156,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .status: return "gauge.medium"
         case .connection: return "network"
+        case .performance: return "chart.xyaxis.line"
         case .video: return "video"
         case .audio: return "speaker.wave.2"
         case .display: return "display"
@@ -206,6 +210,7 @@ struct SettingsView: View {
         switch model.section {
         case .status: StatusView(model: model)
         case .connection: ConnectionTab(model: model)
+        case .performance: PerformanceTab(model: model)
         case .video: VideoTab(model: model)
         case .audio: AudioTab(model: model)
         case .display: DisplayTab(model: model)
@@ -271,6 +276,46 @@ private struct ConnectionTab: View {
                     ?? "Custom settings. Choose a profile to stage its live-verified values, then Apply.")
                     .font(.caption).foregroundColor(.secondary)
                 Text("Profiles change video, audio and shortcut settings only. Network access stays a separate choice below.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Personal presets") {
+                Picker("Saved preset", selection: Binding(
+                    get: { model.personalPresetID },
+                    set: { model.selectPersonalPreset($0) })) {
+                    Text("Choose a preset…").tag(Optional<UUID>.none)
+                    ForEach(model.personalPresets) { preset in
+                        Text(preset.name).tag(Optional(preset.id))
+                    }
+                }
+                TextField("Preset name", text: $model.personalPresetName,
+                          prompt: Text("e.g. 1440p · flush 10 ms"))
+                HStack {
+                    Button("Load") { model.loadPersonalPreset() }
+                        .disabled(model.selectedPersonalPreset == nil || model.serverBusy)
+                    Button("Save New") { model.savePersonalPreset() }
+                        .disabled(model.personalPresetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  || model.validationError != nil)
+                    Menu("Manage") {
+                        Button("Replace with Current Draft") { model.savePersonalPreset(replace: true) }
+                            .disabled(model.validationError != nil)
+                        Button("Rename") { model.renamePersonalPreset() }
+                        Button("Delete…") {
+                            let alert = NSAlert()
+                            alert.messageText = "Delete this preset?"
+                            alert.informativeText = "\(model.selectedPersonalPreset?.name ?? "") will be removed. Current server settings stay unchanged."
+                            alert.addButton(withTitle: "Delete")
+                            alert.addButton(withTitle: "Cancel")
+                            if alert.runModal() == .alertFirstButtonReturn { model.deletePersonalPreset() }
+                        }
+                    }
+                    .disabled(model.selectedPersonalPreset == nil || model.personalPresetName.isEmpty)
+                }
+                if let error = model.presetError {
+                    Label(error, systemImage: "exclamationmark.triangle").foregroundColor(.red).font(.caption)
+                } else if let message = model.presetMessage {
+                    Text(message).font(.caption).foregroundColor(.secondary)
+                }
+                Text("Save captures your draft's video, audio and shortcut settings. Load stages them for review; Apply is required to change the server. Network, accounts and display takeover are retained.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Network") {
@@ -351,15 +396,15 @@ private struct VideoTab: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Bitrate") {
-                Stepper(value: Binding(
-                    get: { Int(model.bitrateMbps) ?? 6 },
-                    set: { model.setBitrate(String($0)) }), in: 1...50) {
-                    Text("Ceiling: \(model.bitrateMbps) Mbps")
-                }
+                TextField("Bitrate ceiling (Mbps)", text: Binding(
+                    get: { model.bitrateInput },
+                    set: { model.setBitrate($0) }), prompt: Text("6"))
                 .disabled(!model.bool("ENABLE_H264"))
                 Toggle("Adaptive bitrate (lower under congestion)", isOn: model.boolBinding("ADAPTIVE_BITRATE"))
                     .disabled(!model.bool("ENABLE_H264"))
-                Text("The ceiling is the maximum. With Adaptive on, the server drops below it "
+                Text("Enter whole-number Mbps, e.g. 75, 100 or 200. The 50 Mbps limit is removed. "
+                    + "Leave empty for the default 6 Mbps. VideoToolbox's numeric range supports up to 2147 Mbps. "
+                    + "The ceiling is the maximum target. With Adaptive on, the server drops below it "
                     + "under congestion (thin/lossy link) and climbs back when it clears; on a "
                     + "clean link it stays at the ceiling. H.264 only.")
                     .font(.caption).foregroundColor(.secondary)
@@ -388,6 +433,20 @@ private struct VideoTab: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Experimental") {
+                TextField("H.264 encoder queue depth", text: Binding(
+                    get: { model.encoderQueueDepth },
+                    set: { model.setEncoderQueueDepth($0) }), prompt: Text("2"))
+                    .disabled(!model.bool("ENABLE_H264"))
+                Text("Leave empty for 2. A depth of 2 lets 4K capture submit another frame while the encoder is busy. A depth of 1 keeps the queue shorter.")
+                    .font(.caption).foregroundColor(.secondary)
+                Toggle("Responsive capture", isOn: model.boolBinding("RESPONSIVE_CAPTURE"))
+                    .disabled(!model.bool("ENABLE_H264"))
+                Text("Gives fresh desktop updates priority over duplicate frames and keeps less video queued. May skip intermediate motion under load. Try with Fast flush off first.")
+                    .font(.caption).foregroundColor(.secondary)
+                Toggle("Pace TCP video when the client falls behind", isOn: model.boolBinding("TCP_VIDEO_BACKPRESSURE"))
+                    .disabled(!model.bool("ENABLE_H264"))
+                Text("Temporarily sends fewer frames if the client is slow to acknowledge video. Try for 4K stutter during motion.")
+                    .font(.caption).foregroundColor(.secondary)
                 Toggle("Fast flush (optional)", isOn: Binding(
                     get: { model.fastFlushEnabled },
                     set: { model.setFastFlushEnabled($0) }))
@@ -601,13 +660,26 @@ private struct PermissionsTab: View {
     var body: some View {
         Form {
             Text("macrdp needs these grants (owned by the server binary, not this controller). "
-                + "Status is read from the server log.")
+                + "Status reflects the server’s last permission check.")
                 .font(.caption).foregroundColor(.secondary)
+            if let server = model.controller.locateServerApp() {
+                Section("Server to authorize") {
+                    Text(server.path).textSelection(.enabled)
+                        .font(.caption).foregroundColor(.secondary)
+                    Button("Show macrdp.app in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([server])
+                    }
+                    Text("If more than one macrdp app is installed, add this exact app in System Settings. Restart the server after granting permissions.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
             Section("Screen Recording") {
                 permRow(granted: screen) { model.controller.openScreenRecording() }
             }
             Section("Accessibility") {
                 permRow(granted: accessibility) { model.controller.openAccessibility() }
+                Text("If Windows can see the Mac but cannot control it, grant Accessibility to the server app above.")
+                    .font(.caption).foregroundColor(.secondary)
             }
             Button("Refresh status") { refresh() }
         }
@@ -661,22 +733,14 @@ struct ConnectionInfo {
 }
 
 /// Live H.264 telemetry from the server's opt-in loopback stats endpoint.
-struct LiveStats {
-    let processId: Int
-    let width: Int
-    let height: Int
-    let bitrateBps: Int
-    let ceilingBps: Int
-    let rttMs: Int
-    let queueMs: Int
-    let fps: Int
-    let frames: Int
-    let adaptive: Bool
-}
 
 private struct StatusView: View {
     @ObservedObject var model: SettingsModel
     @State private var stats: ServerStats = .stopped
+    @State private var credentialStatus: CredentialStatus?
+    @State private var refreshing = false
+    @State private var screenPermission: Bool?
+    @State private var inputPermission: Bool?
     @State private var conn: ConnectionInfo = .none
     @State private var live: LiveStats?
     private var externalServer: Bool { !stats.running && (live?.processId ?? 0) > 0 }
@@ -690,7 +754,8 @@ private struct StatusView: View {
             Section("Server") {
                 row("Status", model.serverAction?.progressTitle
                     ?? (!model.serverStatusKnown ? "Checking…" : model.serverRunning
-                        ? (stats.running ? "Running (pid \(stats.pid))" : "Running")
+                        ? (credentialStatus == .waiting ? "Waiting for account password"
+                            : stats.running ? "Running (pid \(stats.pid))" : "Running")
                         : "Stopped"))
                 row("Profile", model.appliedProfile?.title ?? "Custom")
                 row("Saved capture", model.savedCaptureSummary)
@@ -712,6 +777,12 @@ private struct StatusView: View {
                     .controlSize(.small)
                     .disabled(connectTarget == "—" || connectTarget.contains("<"))
                     .help("Copy the address to enter in your RDP client")
+                    Button("Export .rdp…") {
+                        exportConnectionFile()
+                    }
+                    .controlSize(.small)
+                    .disabled(RDPConnectionFile.data(for: connectTarget) == nil)
+                    .help("Save a shortcut for Windows Remote Desktop. Requires a reachable Mac address.")
                 }
                 row("Allowed clients", model.appliedAllowedIPDisplay)
                 if stats.running {
@@ -737,7 +808,8 @@ private struct StatusView: View {
                 }
                 if model.serverBusy {
                     ProgressView().controlSize(.small)
-                } else if let result = model.serverActionResult, !result.cancelled {
+                } else if let result = model.serverActionResult, !result.cancelled,
+                          !result.waitingForPassword {
                     VStack(alignment: .leading, spacing: 6) {
                         Label(result.message,
                               systemImage: result.success
@@ -745,17 +817,34 @@ private struct StatusView: View {
                             .font(.caption)
                             .foregroundColor(result.success ? .secondary : .red)
                             .fixedSize(horizontal: false, vertical: true)
-                        if result.needsPermissionAttention {
-                            Button("Open Privacy Settings…") {
-                                model.controller.openScreenRecording()
-                            }
-                            .controlSize(.small)
+                        if result.needsPermissionAttention && !result.running {
+                            Button("Open Screen Recording…") { model.controller.openScreenRecording() }
+                                .controlSize(.small)
                         }
                     }
                 }
             }
+            if stats.running && credentialStatus != .waiting,
+               screenPermission == false || inputPermission == false {
+                Section("Privacy permissions") {
+                    if screenPermission == false {
+                        Text("Screen Recording is off for macrdp.app.")
+                        Button("Open Screen Recording…") { model.controller.openScreenRecording() }
+                    }
+                    if inputPermission == false {
+                        Text("Accessibility is off. Windows can see the Mac but cannot control it.")
+                        Button("Open Accessibility…") { model.controller.openAccessibility() }
+                    }
+                    Button("Show Server App for Permissions") { model.section = .permissions }
+                }
+            }
             Section("Connection") {
-                if conn.connected {
+                if credentialStatus == .waiting {
+                    Text("Update your saved Mac password. The server will check for the change within 30 seconds.")
+                        .font(.caption).foregroundColor(.secondary)
+                    Button("Update Account Password…") { model.controller.setPassword() }
+                        .disabled(model.serverBusy)
+                } else if conn.connected {
                     row("Client", conn.name ?? "connected")
                     if let ip = conn.ip { row("Address", ip) }
                     if let b = conn.build { row("Windows build", b) }
@@ -799,13 +888,21 @@ private struct StatusView: View {
         // Gather off the main thread — serverStats/currentConnection/liveStats each
         // shell out (launchctl/ps/lsof/nc); doing that on the main thread every 2 s
         // would jank the UI. Publish the results back on main.
+        guard !refreshing else { return }
+        refreshing = true
         let controller = model.controller
         DispatchQueue.global(qos: .utility).async {
             let s = controller.serverStats()
             let c = controller.currentConnection()
             let l = (c.connected || !s.running) ? controller.liveStats() : nil
             let target = controller.connectionTarget()
+            let credential = s.running ? CredentialStatus.latest(for: s.pid, in: controller.logTail()) : nil
+            let permissions = s.running ? controller.permissionStatus() : (screen: nil, accessibility: nil)
             DispatchQueue.main.async {
+                refreshing = false
+                credentialStatus = credential
+                screenPermission = permissions.screen
+                inputPermission = permissions.accessibility
                 stats = s
                 conn = c
                 live = l
@@ -813,6 +910,20 @@ private struct StatusView: View {
                 connectTarget = target
                 model.updateServerRunning(s.running)
             }
+        }
+    }
+
+    private func exportConnectionFile() {
+        guard let data = RDPConnectionFile.data(for: connectTarget) else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "macrdp.rdp"
+        panel.allowedContentTypes = [UTType(filenameExtension: "rdp") ?? .data]
+        panel.message = "Open this file in Windows Remote Desktop. It contains only the Mac address and port."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            model.controller.alert(style: .warning, "Couldn't save the RDP shortcut", error.localizedDescription)
         }
     }
 
@@ -879,8 +990,8 @@ extension AppController {
     }
 
     /// Live RSS / CPU / uptime of the server process (via `ps`).
-    func serverStats() -> ServerStats {
-        guard let pid = agentState().pid else { return .stopped }
+    func serverStats(processID: Int? = nil) -> ServerStats {
+        guard let pid = processID ?? agentState().pid, pid > 0 else { return .stopped }
         let out = run("/bin/ps", ["-o", "rss=,%cpu=,etime=,%mem=", "-p", String(pid)])
         let f = out.stdout.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).map(String.init)
         guard f.count >= 4 else {
@@ -895,19 +1006,13 @@ extension AppController {
     /// `lsof`, with client name/build best-effort from the server log).
     func currentConnection() -> ConnectionInfo {
         guard let pid = agentState().pid else { return .none }
-        let port = (readConfig()["BIND"] ?? "127.0.0.1:3390").split(separator: ":").last.map(String.init) ?? "3390"
-        let out = run("/usr/sbin/lsof", ["-nP", "-p", String(pid), "-iTCP", "-sTCP:ESTABLISHED"])
-        var ip: String?
-        for raw in out.stdout.split(separator: "\n") {
-            let line = String(raw)
-            guard let arrow = line.range(of: "->") else { continue }
-            // The RDP client connection is the one whose LOCAL endpoint is the RDP
-            // port (loopback helper channels have other local ports).
-            guard line[..<arrow.lowerBound].hasSuffix(":\(port)") else { continue }
-            let host = line[arrow.upperBound...].split(separator: ":").first.map(String.init)
-            if let h = host, h != "127.0.0.1", h != "::1", !h.isEmpty { ip = h; break }
+        let rawPort = (readConfig()["BIND"] ?? "127.0.0.1:3390").split(separator: ":").last
+        guard let rawPort, let port = UInt16(rawPort), port != 0 else { return .none }
+        // lsof ORs selection filters by default. Combine PID and TCP state.
+        let out = run("/usr/sbin/lsof", ["-nP", "-a", "-p", String(pid), "-iTCP", "-sTCP:ESTABLISHED", "-Fn"])
+        guard out.code == 0, let clientIP = establishedRDPHost(in: out.stdout, localPort: port) else {
+            return .none
         }
-        guard let clientIP = ip else { return .none }
         var name: String?
         var build: String?
         for line in logTail() where line.contains("client fingerprint client_name=") {
@@ -928,15 +1033,8 @@ extension AppController {
         let raw = readConfig()["STATS_PORT"].flatMap { $0.isEmpty ? nil : $0 } ?? "40245"
         let port = UInt16(raw).flatMap { $0 == 0 ? nil : String($0) } ?? "40245"
         let out = run("/bin/bash", ["-c", "/usr/bin/nc -w 1 127.0.0.1 \(port) </dev/null 2>/dev/null"])
-        guard let data = out.stdout.data(using: .utf8),
-              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        func int(_ k: String) -> Int { (o[k] as? NSNumber)?.intValue ?? 0 }
-        func bool(_ k: String) -> Bool { (o[k] as? NSNumber)?.boolValue ?? false }
-        return LiveStats(
-            processId: int("process_id"), width: int("width"), height: int("height"),
-            bitrateBps: int("bitrate_bps"), ceilingBps: int("ceiling_bps"),
-            rttMs: int("rtt_ms"), queueMs: int("queue_delay_ms"),
-            fps: int("fps"), frames: int("frames_sent"), adaptive: bool("adaptive"))
+        guard out.code == 0, let data = out.stdout.data(using: .utf8) else { return nil }
+        return LiveStats.decode(data)
     }
 
     /// The standard macOS About panel, populated with the app version + a short

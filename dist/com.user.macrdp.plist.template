@@ -14,6 +14,12 @@
         <string>--keychain</string>
     </array>
 
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MACRDP_PARK_ON_AUTH_FAILURE</key>
+        <string>1</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

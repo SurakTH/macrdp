@@ -96,6 +96,10 @@ mod macos {
     }
 
     impl KeyboardLayout {
+        pub(crate) fn reset_composition(&mut self) {
+            self.dead_key_state = 0;
+        }
+
         /// Resolve a user-supplied spec — a macOS input-source id
         /// (`com.apple.keylayout.French`), a short name (`french`, `de`,
         /// `azerty`), or a Windows KLID (`0x040C`, `040c`) — into a layout.

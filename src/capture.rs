@@ -114,78 +114,79 @@ pub const RESIZE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// monitor-layout PDU the client sends; the capture loop calls
 /// [`PendingResize::take_settled`] each iteration and only acts once
 /// [`RESIZE_DEBOUNCE`] has passed since the *last* PDU, so a multi-tick drag
-/// produces one resize, not one per tick. Same epoch+millis pattern as
-/// [`ClickSignal`] — one `Arc`, lock-free.
+/// produces one resize, not one per tick, even on an idle desktop.
 #[derive(Clone)]
 pub struct PendingResize {
     inner: Arc<PendingResizeInner>,
 }
 
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+struct ResizeRequest {
+    size: (u16, u16),
+    requested_at: Instant,
+}
+
 struct PendingResizeInner {
-    epoch: Instant,
-    /// Packed size of the most recently requested resize. Meaningless while
-    /// `last_update_ms == 0`.
-    size: AtomicU32,
-    /// Milliseconds since `epoch` of the last `request()` call; 0 = no
-    /// pending request (never requested, or already consumed).
-    last_update_ms: AtomicU64,
+    request: std::sync::Mutex<Option<ResizeRequest>>,
+    changed: Notify,
 }
 
 impl PendingResize {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PendingResizeInner {
-                epoch: Instant::now(),
-                size: AtomicU32::new(0),
-                last_update_ms: AtomicU64::new(0),
+                request: std::sync::Mutex::new(None),
+                changed: Notify::new(),
             }),
         }
     }
 
-    fn now_ms(&self) -> u64 {
-        self.inner.epoch.elapsed().as_millis() as u64
-    }
-
-    /// Record a resize request "now", superseding any not-yet-settled
-    /// request — only the most recent size in a drag matters.
+    /// Replace the size and its timestamp together, then wake idle capture.
     pub fn request(&self, width: u16, height: u16) {
-        self.inner
-            .size
-            .store(pack_size(width, height), Ordering::Relaxed);
-        // max(1) so a request at t≈0 isn't mistaken for "none pending".
-        self.inner
-            .last_update_ms
-            .store(self.now_ms().max(1), Ordering::Relaxed);
+        *self.inner.request.lock().unwrap() = Some(ResizeRequest {
+            size: (width, height),
+            requested_at: Instant::now(),
+        });
+        self.inner.changed.notify_one();
     }
 
-    /// True if a request is outstanding (settled or not yet). The capture
-    /// loop uses this to decide whether to poll on a bounded timeout instead
-    /// of blocking indefinitely on the next camera sample.
+    fn clear(&self) {
+        *self.inner.request.lock().unwrap() = None;
+    }
+
+    #[cfg(any(target_os = "macos", test))]
     pub fn has_pending(&self) -> bool {
-        self.inner.last_update_ms.load(Ordering::Relaxed) != 0
+        self.inner.request.lock().unwrap().is_some()
     }
 
-    /// If a request has been outstanding for at least `debounce` with no
-    /// newer request superseding it, consume and return it. Returns `None`
-    /// if nothing is pending or it hasn't settled yet.
+    #[cfg(any(target_os = "macos", test))]
+    fn deadline(&self, debounce: Duration) -> Option<Instant> {
+        self.inner
+            .request
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|request| request.requested_at + debounce)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    async fn changed(&self) {
+        self.inner.changed.notified().await;
+    }
+
+    /// Consume the latest request only after the drag settles.
+    #[cfg(any(target_os = "macos", test))]
     pub fn take_settled(&self, debounce: Duration) -> Option<(u16, u16)> {
-        let last_ms = self.inner.last_update_ms.load(Ordering::Relaxed);
-        if last_ms == 0 {
+        let mut request = self.inner.request.lock().unwrap();
+        if request.as_ref()?.requested_at.elapsed() < debounce {
             return None;
         }
-        if self.now_ms().saturating_sub(last_ms) < debounce.as_millis() as u64 {
-            return None;
-        }
-        // Only consume if nothing newer raced in since we read `last_ms`.
-        if self
-            .inner
-            .last_update_ms
-            .compare_exchange(last_ms, 0, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return None;
-        }
-        Some(unpack_size(self.inner.size.load(Ordering::Relaxed)))
+        request.take().map(|request| request.size)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn take_settled_change(&self, debounce: Duration, current: (u16, u16)) -> Option<(u16, u16)> {
+        self.take_settled(debounce).filter(|&size| size != current)
     }
 }
 
@@ -384,6 +385,7 @@ pub struct CaptureDisplay {
     /// where the server doesn't expose the handle — e.g., the non-macOS
     /// stub).
     pub display_suppressed: Option<Arc<AtomicBool>>,
+    pub display_suppressed_changed: Arc<Notify>,
     /// Client-driven live-resize request in flight (MS-RDPEDISP monitor
     /// layout — the client resized its window mid-session). `request_layout`
     /// writes to it; the capture loop polls + debounces it into an actual
@@ -482,13 +484,16 @@ fn adopt_client_size(
 ) -> Option<DesktopSize> {
     if auto_size
         && (client.width, client.height) != current
-        && (200..=8192).contains(&client.width)
-        && (200..=8192).contains(&client.height)
+        && valid_client_size(client.width, client.height)
     {
         Some(client)
     } else {
         None
     }
+}
+
+fn valid_client_size(width: u16, height: u16) -> bool {
+    (200..=8192).contains(&width) && (200..=8192).contains(&height)
 }
 
 #[async_trait::async_trait]
@@ -599,21 +604,16 @@ impl RdpServerDisplay for CaptureDisplay {
             height = height.min(max.height);
         }
 
-        let (cur_w, cur_h) = self.desktop_size.get();
-        let Some(adopted) =
-            adopt_client_size(resizable, (cur_w, cur_h), DesktopSize { width, height })
-        else {
-            return; // no-op: unchanged, or outside the protocol-legal band
-        };
+        if valid_client_size(width, height) {
+            // A drag can return to the current size before the earlier
+            // request settles. Queue the final layout and compare at apply.
+            self.pending_resize.request(width, height);
+        }
+    }
 
-        tracing::info!(
-            client_w = adopted.width,
-            client_h = adopted.height,
-            prev_w = cur_w,
-            prev_h = cur_h,
-            "client resized its window — resizing the session (debounced)"
-        );
-        self.pending_resize.request(adopted.width, adopted.height);
+    fn session_ended(&mut self) {
+        self.pending_resize.clear();
+        self.suppress_next_adopt.store(false, Ordering::Relaxed);
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -826,6 +826,7 @@ impl CaptureDisplay {
                 self.flush_frames,
                 self.flush_interval,
                 self.display_suppressed.clone(),
+                self.display_suppressed_changed.clone(),
                 self.auto_size,
                 self.stretch,
                 self.desktop_size.clone(),
@@ -882,6 +883,14 @@ fn capture_scaling_mode(
     (force_full_frame, letterbox)
 }
 
+/// Avoid an extra ScreenCaptureKit pacing slot if the display itself is
+/// already slow enough. Keep the requested limit for unknown or faster modes.
+/// Adopted from clintcan/macrdp#220 (0.5 Hz tolerance for nominal rates).
+#[cfg(any(target_os = "macos", test))]
+fn sck_needs_frame_cap(fps: u32, display_hz: f64) -> bool {
+    !(display_hz > 0.0 && display_hz <= f64::from(fps) + 0.5)
+}
+
 /// Split a rect into horizontal strips each ≤ [`MAX_BITMAP_UPDATE_PIXELS`].
 /// Returns the rect unchanged when it already fits.
 fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
@@ -911,7 +920,8 @@ mod macos {
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
     use screencapturekit::prelude::{
-        PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration, SCStreamOutputType,
+        CMTime, PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration,
+        SCStreamOutputType,
     };
 
     /// How long the shared SuppressOutput flag must remain `true` before
@@ -959,8 +969,8 @@ mod macos {
         /// consulted when `keyframe_on_change.enabled`.
         click_signal: Option<ClickSignal>,
         /// Interval between trailing pictures and deferred-submit retries.
-        frame_interval: Duration,
         flush_interval: Duration,
+        responsive_capture: bool,
         /// Number of trailing pictures before and after the quiet IDR refresh.
         /// Zero disables the refresh burst, but not retries of deferred input.
         flush_frames: u32,
@@ -974,6 +984,7 @@ mod macos {
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
         display_suppressed: Option<Arc<AtomicBool>>,
+        display_suppressed_changed: Arc<Notify>,
         /// Last observed value of `display_suppressed`, used to detect the
         /// false→true→false transition. On the un-suppress edge we force an
         /// IDR keyframe so the client resumes from a fresh reference frame
@@ -991,19 +1002,6 @@ mod macos {
         /// (cargo build) and the audio mute thrashes — both audible as
         /// stutter even though no real minimize happened.
         suppressed_since: Option<Instant>,
-        /// True once the EGFX/H.264 encoder has accepted at least one
-        /// frame for this session (i.e., `gfx.submit_bgra` returned
-        /// `Submitted` or `Deferred`). The suppress gate is a no-op until this is set —
-        /// mstsc's normal connect handshake includes a
-        /// `SuppressOutput { None }` *before* its display surface is
-        /// fully initialized, and stopping the first EGFX frame from
-        /// going through leaves mstsc with nothing to display + a
-        /// half-initialized surface that doesn't recover when we
-        /// un-suppress. FreeRDP doesn't do this. Tracking
-        /// "we've delivered the first frame" gives us a clean
-        /// "client is fully wired up" signal that's stricter than just
-        /// "connected" but cheap to maintain.
-        first_egfx_frame_sent: bool,
         /// When capturing a virtual display, the RDP session drives the cursor
         /// into that display's slot of the global coordinate space (to the
         /// right of / beyond the physical panels). On disconnect the cursor is
@@ -1050,6 +1048,7 @@ mod macos {
             flush_frames: u32,
             flush_interval: Option<Duration>,
             display_suppressed: Option<Arc<AtomicBool>>,
+            display_suppressed_changed: Arc<Notify>,
             auto_size: bool,
             stretch: bool,
             desktop_size: SharedDesktopSize,
@@ -1094,18 +1093,16 @@ mod macos {
             // framebuffer. Only a size matching neither (explicit
             // --width/--height that asks SCK to scale) forces full frames,
             // because then dirty-rects arrive in source coords and misalign.
-            let (backing_w, backing_h) = {
-                use core_graphics::display::CGDisplay;
-                CGDisplay::new(display.display_id())
-                    .display_mode()
-                    .and_then(|m| {
-                        Some((
-                            u16::try_from(m.pixel_width()).ok()?,
-                            u16::try_from(m.pixel_height()).ok()?,
-                        ))
-                    })
-                    .unwrap_or((native_w, native_h))
-            };
+            let mode = core_graphics::display::CGDisplay::new(display.display_id()).display_mode();
+            let (backing_w, backing_h) = mode
+                .as_ref()
+                .and_then(|m| {
+                    Some((
+                        u16::try_from(m.pixel_width()).ok()?,
+                        u16::try_from(m.pixel_height()).ok()?,
+                    ))
+                })
+                .unwrap_or((native_w, native_h));
             // See `capture_scaling_mode`: full frames when SCK scales (configured
             // size matches neither native points nor backing pixels), and
             // letterbox vs stretch on the auto-size path.
@@ -1142,35 +1139,49 @@ mod macos {
             // slow full-screen repaint drops intermediate motion instead of
             // turning into visible input lag. H.264 keeps a slightly deeper
             // queue because its hardware encoder is independently bounded.
-            let sample_buffer_capacity = if gfx.is_some() { 4 } else { 1 };
+            let responsive_capture =
+                gfx.is_some() && crate::multitransport::env_truthy("MACRDP_RESPONSIVE_CAPTURE");
+            // Leave space for a content sample followed by an idle callback,
+            // while limiting how far behind the consumer can fall.
+            let sample_buffer_capacity = match (gfx.is_some(), responsive_capture) {
+                (true, true) => 2,
+                (true, false) => 4,
+                (false, _) => 1,
+            };
 
-            let config = SCStreamConfiguration::new()
-                .with_width(u32::from(width))
-                .with_height(u32::from(height))
-                .with_pixel_format(SckPixelFormat::BGRA)
-                .with_fps(fps)
-                // Hide the macOS cursor in the captured framebuffer; we forward
-                // it separately as RGBAPointer so the client renders its own
-                // (real-shape) cursor without doubling up.
-                .with_shows_cursor(false)
-                // Aspect handling on a scaling (non-native) capture:
-                //   * letterbox=false (default for explicit --width/--height, or
-                //     auto-size + --stretch): stretch the source to fill the
-                //     output exactly — no black bars, but distorts on aspect
-                //     mismatch.
-                //   * letterbox=true (auto-size default): preserve the Mac's
-                //     aspect ratio, padding with black bars. input.rs maps mouse
-                //     coords into the centered content sub-rect to keep clicks
-                //     aligned (the stretch path needs no such correction, which
-                //     is why fill used to be the only mode).
-                //
-                // Apple replaced `scalesToFit` with `preservesAspectRatio`
-                // (inverse semantics) in macOS 14; on 14+ the newer property is
-                // what takes effect. `scales_to_fit(true)` stays set so the
-                // source scales to the output either way; `preserves_aspect_ratio`
-                // is the knob that picks letterbox vs stretch.
-                .with_scales_to_fit(true)
-                .with_preserves_aspect_ratio(letterbox);
+            let display_hz = mode.as_ref().map_or(0.0, |mode| mode.refresh_rate());
+            let frame_cap = sck_needs_frame_cap(fps, display_hz);
+            tracing::debug!(display_hz, fps, frame_cap, "ScreenCaptureKit frame pacing");
+            let config = if frame_cap {
+                SCStreamConfiguration::new().with_fps(fps)
+            } else {
+                SCStreamConfiguration::new().with_minimum_frame_interval(&CMTime::new(0, 1))
+            }
+            .with_width(u32::from(width))
+            .with_height(u32::from(height))
+            .with_pixel_format(SckPixelFormat::BGRA)
+            // Hide the macOS cursor in the captured framebuffer; we forward
+            // it separately as RGBAPointer so the client renders its own
+            // (real-shape) cursor without doubling up.
+            .with_shows_cursor(false)
+            // Aspect handling on a scaling (non-native) capture:
+            //   * letterbox=false (default for explicit --width/--height, or
+            //     auto-size + --stretch): stretch the source to fill the
+            //     output exactly — no black bars, but distorts on aspect
+            //     mismatch.
+            //   * letterbox=true (auto-size default): preserve the Mac's
+            //     aspect ratio, padding with black bars. input.rs maps mouse
+            //     coords into the centered content sub-rect to keep clicks
+            //     aligned (the stretch path needs no such correction, which
+            //     is why fill used to be the only mode).
+            //
+            // Apple replaced `scalesToFit` with `preservesAspectRatio`
+            // (inverse semantics) in macOS 14; on 14+ the newer property is
+            // what takes effect. `scales_to_fit(true)` stays set so the
+            // source scales to the output either way; `preserves_aspect_ratio`
+            // is the knob that picks letterbox vs stretch.
+            .with_scales_to_fit(true)
+            .with_preserves_aspect_ratio(letterbox);
 
             let stream = AsyncSCStream::new(
                 &filter,
@@ -1232,15 +1243,15 @@ mod macos {
                 keyframe_on_change,
                 kf_armed: true,
                 click_signal,
-                frame_interval,
                 flush_interval: flush_interval.unwrap_or(frame_interval),
+                responsive_capture,
                 flush_frames,
                 flush_burst: crate::frame_flush::FrameFlush::default(),
                 last_frame: None,
                 display_suppressed,
+                display_suppressed_changed,
                 was_suppressed: false,
                 suppressed_since: None,
-                first_egfx_frame_sent: false,
                 warp_cursor_home,
                 pending_resize,
                 desktop_size,
@@ -1329,16 +1340,6 @@ mod macos {
                 // — the one untested lever for the mstsc reconnect-blank. A
                 // forced IDR was already armed on the ctx.
                 if let Some(gfx) = self.gfx.as_ref() {
-                    // Manual A/V resync hotkey (Ctrl+Alt+Shift+R, set in
-                    // input.rs via crate::RESYNC_VIDEO): force a clean IDR
-                    // keyframe to repaint a stale/idle-blanked mstsc presentation.
-                    // Deliberately lighter than the full core reactivation
-                    // (gfx.request_reactivation), which on the headless
-                    // virtual-display path cascades into a visible session
-                    // re-cycle — see Gfx::force_keyframe.
-                    if crate::RESYNC_VIDEO.swap(false, Ordering::Relaxed) {
-                        gfx.force_keyframe();
-                    }
                     if let Some((w, h)) = gfx.take_reactivate_request() {
                         // See `CaptureDisplay::suppress_next_adopt`: without
                         // this, the reactivation's `request_initial_size`
@@ -1385,7 +1386,10 @@ mod macos {
                 // Active, and not the size it just told us via the
                 // MonitorLayout PDU) — silently snapping the resize back
                 // before the next frame ships.
-                if let Some((w, h)) = self.pending_resize.take_settled(RESIZE_DEBOUNCE) {
+                if let Some((w, h)) = self
+                    .pending_resize
+                    .take_settled_change(RESIZE_DEBOUNCE, self.desktop_size.get())
+                {
                     // Never submit a retained old-size buffer into the fresh
                     // surface/encoder that the resize is about to create.
                     self.flush_burst.clear();
@@ -1444,7 +1448,7 @@ mod macos {
                 // ready; blocking the first frame leaves it with a half-init'd
                 // surface that doesn't recover when we un-suppress (mstsc
                 // freezes on the connection). For EGFX that milestone is
-                // `first_egfx_frame_sent`; for bitmap it is a fully drained
+                // the first queued EGFX frame; for bitmap it is a fully drained
                 // initial seed (`seeded`, with `pending` already empty here).
                 //
                 // **Debounce so transient flaps don't oscillate the pipeline.**
@@ -1457,122 +1461,191 @@ mod macos {
                 // engage the gate once the flag has been steady-`true` for
                 // `SUPPRESS_DEBOUNCE`. Real multi-second minimizes still trip
                 // normally.
-                let display_pipeline_ready = if self.gfx.is_some() {
-                    self.first_egfx_frame_sent
-                } else {
-                    self.seeded
-                };
-                if display_pipeline_ready {
-                    if let Some(flag) = self.display_suppressed.as_ref() {
-                        if flag.load(Ordering::Relaxed) {
+                if let Some(flag) = self.display_suppressed.as_ref() {
+                    if flag.load(Ordering::Relaxed) {
+                        let ready = if let Some(gfx) = self.gfx.as_ref() {
+                            gfx.has_queued_video()
+                        } else {
+                            self.seeded
+                        };
+                        if ready {
                             let started = *self.suppressed_since.get_or_insert_with(Instant::now);
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
                                 self.was_suppressed = true;
                                 self.flush_burst.clear();
-                                // Release the retained SCK surface while the
-                                // client is minimized; resume starts from a
-                                // fresh frame + forced IDR.
-                                self.last_frame = None;
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                tokio::select! {
+                                    _ = self.display_suppressed_changed.notified() => {}
+                                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                                }
                                 continue;
                             }
-                        } else {
-                            self.suppressed_since = None;
-                            if self.was_suppressed && self.gfx.is_none() {
-                                // Bitmap codecs have no predictive reference
-                                // frame to reset, but the client may have
-                                // discarded its surface while minimized. Force
-                                // one complete repaint before returning to
-                                // cheap dirty-region updates.
-                                self.was_suppressed = false;
+                        }
+                    } else {
+                        self.suppressed_since = None;
+                        if self.was_suppressed {
+                            self.was_suppressed = false;
+                            if let Some(gfx) = self.gfx.as_ref() {
+                                gfx.demigrate_on_resume();
+                                if self.last_frame.is_some() {
+                                    // A static desktop may produce only idle
+                                    // callbacks after restore. Repaint from
+                                    // the last retained surface immediately.
+                                    self.flush_burst
+                                        .repaint_now(self.flush_frames, Instant::now());
+                                }
+                            } else {
+                                // The bitmap client may have discarded its
+                                // surface while minimized.
                                 self.seeded = false;
                                 self.pending.clear();
-                                tracing::debug!(
-                                    "client un-suppress edge — forcing full bitmap repaint"
-                                );
                             }
                         }
                     }
                 }
 
-                // While a flush burst OR a debounced resize is pending, don't
-                // block indefinitely on SCK: it stops delivering frames on a
-                // static screen, so wait at most one frame interval before
-                // looping back to the top (where the flush burst re-submits the
-                // last frame, and a settled resize gets picked up promptly
-                // instead of stalling until the next real desktop change).
-                // (Neither pending — the common idle case — blocks normally.)
-                let sample = if self.flush_burst.deadline().is_some()
-                    || self.pending_resize.has_pending()
-                {
-                    let deadline = self
+                // Reevaluate display state even if capture is completely idle.
+                // A suppression edge wakes us; the deadline completes debounce.
+                let resize_deadline = self.pending_resize.deadline(RESIZE_DEBOUNCE);
+                let suppress_deadline =
+                    self.suppressed_since.map(|since| since + SUPPRESS_DEBOUNCE);
+                let deadline = [
+                    self.flush_burst.deadline(),
+                    resize_deadline,
+                    suppress_deadline,
+                ]
+                .into_iter()
+                .flatten()
+                .min();
+                let next = tokio::select! {
+                    biased;
+                    _ = self.pending_resize.changed() => continue,
+                    _ = self.display_suppressed_changed.notified() => continue,
+                    _ = crate::RESYNC_VIDEO.notified(), if self.gfx.is_some() => {
+                        if let Some(gfx) = self.gfx.as_ref() {
+                            gfx.force_keyframe();
+                        }
+                        if self.last_frame.is_some() && !self.was_suppressed {
+                            self.flush_burst.repaint_now(self.flush_frames, Instant::now());
+                        }
+                        continue;
+                    }
+                    _ = async {
+                        if let Some(deadline) = deadline {
+                            tokio::time::sleep_until(deadline.into()).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => Err(()),
+                    sample = self.stream.next() => Ok(sample),
+                };
+                if next.is_err() && resize_deadline.is_some_and(|due| due <= Instant::now()) {
+                    // Apply the new layout at the loop head before sending any
+                    // additional frames from the old surface.
+                    continue;
+                }
+                // With responsive capture, look at one extra callback. A
+                // ready content sample can replace an older captured image
+                // or take priority over a duplicate flush. Idle callbacks
+                // cannot displace an image or postpone a flush.
+                let mut coalesced = false;
+                let flush_due = next.is_err()
+                    && self
                         .flush_burst
                         .deadline()
-                        .unwrap_or_else(|| Instant::now() + self.frame_interval);
-                    // Poll the deadline first: an always-ready stream of Idle
-                    // samples must not starve the final presentation frames.
-                    let next = tokio::select! {
-                        biased;
-                        _ = tokio::time::sleep_until(deadline.into()) => Err(()),
-                        sample = self.stream.next() => Ok(sample),
-                    };
-                    match next {
-                        Ok(Some(sample)) => sample,
-                        Ok(None) => return Ok(None),
-                        Err(_) => {
-                            if self.flush_burst.deadline().is_some() {
-                                let mut submitted = false;
-                                if let Some(gfx) = self.gfx.as_ref() {
-                                    if let Some(pixel_buffer) = self.last_frame.as_ref() {
-                                        match pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) {
-                                            Ok(guard) => {
-                                                let src = guard.as_slice();
-                                                if !src.is_empty() {
-                                                    match gfx.submit_bgra(
-                                                        src,
-                                                        guard.bytes_per_row(),
-                                                        self.flush_burst.force_keyframe(),
-                                                    ) {
-                                                        Ok(
-                                                            crate::h264::FrameSubmission::Submitted,
-                                                        ) => submitted = true,
-                                                        Ok(
-                                                            crate::h264::FrameSubmission::Inactive,
-                                                        ) => self.flush_burst.clear(),
-                                                        Ok(
-                                                            crate::h264::FrameSubmission::Deferred,
-                                                        ) => {}
-                                                        Err(e) => {
-                                                            tracing::warn!(error = ?e, "EGFX flush submit_bgra failed")
+                        .is_some_and(|due| due <= Instant::now());
+                let capture_queued = matches!(&next, Ok(Some(_))) && self.last_frame.is_some();
+                let next = if self.responsive_capture
+                    && (flush_due || capture_queued)
+                    && !self.pending_resize.has_pending()
+                {
+                    if let Some(sample) = self.stream.try_next() {
+                        let renderable = sample
+                            .frame_status()
+                            .is_none_or(|status| status.has_content());
+                        if renderable && sample.image_buffer().is_some() {
+                            if let Ok(Some(previous)) = &next {
+                                coalesced = true;
+                                if let Some(stats) = crate::stats::global() {
+                                    stats.capture_samples.fetch_add(1, Ordering::Relaxed);
+                                    stats.capture_superseded.fetch_add(1, Ordering::Relaxed);
+                                    if previous
+                                        .frame_status()
+                                        .is_some_and(|status| !status.has_content())
+                                    {
+                                        stats.capture_idle.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            Ok(Some(sample))
+                        } else {
+                            if let Some(stats) = crate::stats::global() {
+                                stats.capture_samples.fetch_add(1, Ordering::Relaxed);
+                                if !renderable {
+                                    stats.capture_idle.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            next
+                        }
+                    } else {
+                        next
+                    }
+                } else {
+                    next
+                };
+                let sample = match next {
+                    Ok(Some(sample)) => sample,
+                    Ok(None) => return Ok(None),
+                    Err(_) => {
+                        if self
+                            .flush_burst
+                            .deadline()
+                            .is_some_and(|due| due <= Instant::now())
+                        {
+                            let mut submitted = false;
+                            if let Some(gfx) = self.gfx.as_ref() {
+                                if let Some(pixel_buffer) = self.last_frame.as_ref() {
+                                    match pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) {
+                                        Ok(guard) => {
+                                            let src = guard.as_slice();
+                                            if !src.is_empty() {
+                                                match gfx.submit_bgra(
+                                                    src,
+                                                    guard.bytes_per_row(),
+                                                    self.flush_burst.force_keyframe(),
+                                                ) {
+                                                    Ok(crate::h264::FrameSubmission::Submitted) => {
+                                                        submitted = true;
+                                                        if let Some(stats) = crate::stats::global()
+                                                        {
+                                                            stats
+                                                                .encode_retained_submitted
+                                                                .fetch_add(1, Ordering::Relaxed);
                                                         }
+                                                    }
+                                                    Ok(crate::h264::FrameSubmission::Inactive) => {
+                                                        self.flush_burst.clear()
+                                                    }
+                                                    Ok(crate::h264::FrameSubmission::Deferred) => {}
+                                                    Err(e) => {
+                                                        tracing::warn!(error = ?e, "EGFX flush submit_bgra failed")
                                                     }
                                                 }
                                             }
-                                            Err(e) => tracing::warn!(
-                                                os_status = e,
-                                                "EGFX flush could not lock retained pixel buffer"
-                                            ),
                                         }
+                                        Err(e) => tracing::warn!(
+                                            os_status = e,
+                                            "EGFX flush could not lock retained pixel buffer"
+                                        ),
                                     }
                                 }
-                                self.flush_burst.attempted(
-                                    submitted,
-                                    Instant::now(),
-                                    self.flush_interval,
-                                );
-                                if self.flush_burst.deadline().is_none() {
-                                    // Return the retained surface to SCK's pool
-                                    // immediately after the final flush frame.
-                                    self.last_frame = None;
-                                }
                             }
-                            continue;
+                            self.flush_burst.attempted(
+                                submitted,
+                                Instant::now(),
+                                self.flush_interval,
+                            );
                         }
-                    }
-                } else {
-                    match self.stream.next().await {
-                        Some(sample) => sample,
-                        None => return Ok(None),
+                        continue;
                     }
                 };
 
@@ -1686,56 +1759,37 @@ mod macos {
                     } else {
                         false
                     };
-                    // Force an IDR on the first frame after un-suppress: the
-                    // P-frames we would have sent during the minimize depend
-                    // on a reference frame mstsc may no longer hold (or its
-                    // decoder state may have been torn down). Without a fresh
-                    // keyframe the resume frame would decode against missing
-                    // state and render garbled.
-                    let resume_keyframe = if self.was_suppressed {
-                        self.was_suppressed = false;
-                        tracing::debug!("client un-suppress edge — forcing IDR on next encode");
-                        // If EGFX is on the reliable UDP tunnel, mstsc's surface
-                        // won't survive the minimize/restore — switch back to TCP
-                        // BEFORE shipping the restore frame into the now-stale
-                        // tunnel (no-op on TCP/lossy/default; see
-                        // `Gfx::demigrate_on_resume`).
-                        gfx.demigrate_on_resume();
-                        true
-                    } else {
-                        false
-                    };
-                    match gfx.submit_bgra(src, stride_bytes, big_change || resume_keyframe) {
+                    // A fresh capture may supersede the retained repaint.
+                    // Preserve the keyframe requirement when that happens.
+                    let repaint = self.flush_burst.explicit_repaint_pending();
+                    match gfx.submit_bgra(src, stride_bytes, big_change || repaint) {
                         Ok(
                             outcome @ (crate::h264::FrameSubmission::Submitted
                             | crate::h264::FrameSubmission::Deferred),
                         ) => {
                             self.seeded = true;
-                            // First-EGFX-frame milestone: arms the suppress
-                            // gate (see `first_egfx_frame_sent` in the struct).
-                            if !self.first_egfx_frame_sent {
-                                self.first_egfx_frame_sent = true;
-                                tracing::debug!(
-                                    "first EGFX frame shipped — suppress gate now armed"
-                                );
-                            }
                             // Keep the CoreVideo surface itself for the bounded
                             // flush burst. `image_buffer()` returned an owned
                             // retained reference, so moving it here prevents
                             // SCK from recycling its backing store until we are
                             // done, without copying the full BGRA frame.
                             drop(guard);
-                            self.flush_burst.arm(
-                                self.flush_frames,
-                                outcome == crate::h264::FrameSubmission::Submitted,
-                                Instant::now(),
-                                self.flush_interval,
-                            );
-                            self.last_frame = self
-                                .flush_burst
-                                .deadline()
-                                .is_some()
-                                .then_some(pixel_buffer);
+                            let submitted = outcome == crate::h264::FrameSubmission::Submitted;
+                            let now = Instant::now();
+                            if repaint {
+                                self.flush_burst
+                                    .attempted(submitted, now, self.flush_interval);
+                            } else {
+                                self.flush_burst.arm(
+                                    self.flush_frames,
+                                    submitted,
+                                    now,
+                                    self.flush_interval,
+                                );
+                            }
+                            // Keep just the most recent surface for an explicit
+                            // repaint even after the ordinary flush has drained.
+                            self.last_frame = Some(pixel_buffer);
                             continue;
                         }
                         Ok(crate::h264::FrameSubmission::Inactive) => {}
@@ -1748,7 +1802,7 @@ mod macos {
                 // After that, SCK's dirty_rects tells us what changed; if the
                 // attachment is missing (older macOS, no key), fall back to
                 // the full frame.
-                let dirty = if !self.seeded || self.force_full_frame {
+                let dirty = if !self.seeded || self.force_full_frame || coalesced {
                     None
                 } else {
                     sample.dirty_rects()
@@ -1888,6 +1942,35 @@ mod tests {
     }
 
     #[test]
+    fn sck_cap_only_paces_faster_or_unknown_displays() {
+        for display_hz in [30.0, 59.94, 60.0, 60.5] {
+            assert!(!sck_needs_frame_cap(60, display_hz), "rate {display_hz}");
+        }
+        for display_hz in [0.0, f64::NAN, 60.51, 120.0] {
+            assert!(sck_needs_frame_cap(60, display_hz), "rate {display_hz}");
+        }
+        assert!(sck_needs_frame_cap(30, 60.0));
+    }
+
+    #[tokio::test]
+    async fn resize_wakes_idle_capture_and_replaces_the_deadline() {
+        let pending = PendingResize::new();
+        let request = pending.clone();
+        let debounce = Duration::from_secs(1);
+        let writer = tokio::spawn(async move { request.request(1280, 720) });
+        tokio::time::timeout(Duration::from_secs(1), pending.changed())
+            .await
+            .expect("resize must wake capture without an SCK sample");
+        writer.await.unwrap();
+        let first = pending.deadline(debounce).unwrap();
+        pending.request(1920, 1080);
+        assert!(pending.deadline(debounce).unwrap() >= first);
+        assert_eq!(pending.take_settled(debounce), None);
+        assert_eq!(pending.take_settled(Duration::ZERO), Some((1920, 1080)));
+        assert_eq!(pending.deadline(debounce), None);
+    }
+
+    #[test]
     fn pending_resize_starts_empty() {
         let pr = PendingResize::new();
         assert!(!pr.has_pending());
@@ -1916,6 +1999,18 @@ mod tests {
         pr.request(1024, 768);
         pr.request(1920, 1080);
         assert_eq!(pr.take_settled(Duration::ZERO), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn resize_drag_back_to_current_size_cancels_the_earlier_change() {
+        let pending = PendingResize::new();
+        pending.request(1280, 720);
+        pending.request(1920, 1080);
+        assert_eq!(
+            pending.take_settled_change(Duration::ZERO, (1920, 1080)),
+            None
+        );
+        assert!(!pending.has_pending());
     }
 
     #[test]
