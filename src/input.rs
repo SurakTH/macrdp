@@ -824,7 +824,7 @@ pub fn init_focus_observer() {
 #[cfg(not(target_os = "macos"))]
 pub fn init_focus_observer() {}
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 mod scancodes;
 
 // Re-export the gather-windows sweep so the capture path can trigger it
