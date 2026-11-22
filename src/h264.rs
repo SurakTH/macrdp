@@ -238,6 +238,7 @@ struct ConnectionContext {
     /// ERROR_NOT_SUPPORTED and a dead graphics channel).
     client_supports_avc: bool,
     client_supports_avc444: bool,
+    hevc420: bool,
     /// The client advertised an EGFX capability set newer than Windows App for
     /// macOS does, so its zero decode+render time doesn't mean "not presenting"
     /// and blank recovery stays off for this connection ([`advertises_egfx_beyond_mac_client`]).
@@ -3121,7 +3122,7 @@ impl Gfx {
             // ceiling: equal to the ceiling unless the RTT seed lowered it
             // (slow link) or the controller already adjusted it (encoder
             // rebuild mid-connection).
-            let use_avc444 = self.avc444_enabled && ctx.client_supports_avc444;
+            let use_avc444 = !ctx.hevc420 && self.avc444_enabled && ctx.client_supports_avc444;
             let mut encoder = if use_avc444 {
                 let encoder = Avc444Encoder::new(
                     width,
@@ -3136,12 +3137,17 @@ impl Gfx {
                 );
                 VideoEncoder::Avc444(Box::new(encoder))
             } else {
-                VideoEncoder::Avc420(Encoder::new(
+                VideoEncoder::Avc420(Encoder::new_with_codec(
                     width,
                     height,
                     self.fps,
                     ctx.adaptive_target_bps,
                     self.keyframe_secs,
+                    if ctx.hevc420 {
+                        crate::videotoolbox::PictureCodec::Hevc420
+                    } else {
+                        crate::videotoolbox::PictureCodec::Avc420
+                    },
                 )?)
             };
             // Hand VT's output channel to a dedicated ship thread (push model),
@@ -3509,6 +3515,13 @@ impl Gfx {
                         self.frame_payload_avc444(f),
                         Some(self.frame_payload_avc444(aux)),
                     ),
+                    None if matches!(
+                        server.negotiated_capabilities(),
+                        Some(CapabilitySet::Hevc420V112)
+                    ) =>
+                    {
+                        (hevc_v112_payload(f)?, None)
+                    }
                     None => (self.frame_payload(f), None),
                 };
                 let ts_ms =
@@ -3532,6 +3545,13 @@ impl Gfx {
                         Some(&regions),
                         ts_ms,
                     ),
+                    None if matches!(
+                        server.negotiated_capabilities(),
+                        Some(CapabilitySet::Hevc420V112)
+                    ) =>
+                    {
+                        server.send_hevc420_frame(surface_id, &payload, &regions, ts_ms)
+                    }
                     None => server.send_avc420_frame(surface_id, &payload, &regions, ts_ms),
                 };
                 // Record the newest shipped frame id for the UDP frame-ack-lag
@@ -3817,6 +3837,7 @@ impl GfxServerFactory for Gfx {
             need_keyframe: true,
             client_supports_avc: false,
             client_supports_avc444: false,
+            hevc420: false,
             newer_egfx_client: false,
             egfx_declined: egfx_declined.clone(),
             submitted: Arc::new(AtomicU64::new(0)),
@@ -3893,7 +3914,7 @@ fn caps_indicate_avc(caps: &[CapabilitySet]) -> bool {
         | CapabilitySet::V10_6Err { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
         CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
         // Bare V8 / V10_1 carry no AVC flag — no positive AVC signal.
-        CapabilitySet::V8 { .. } | CapabilitySet::V10_1 => false,
+        CapabilitySet::Hevc420V112 | CapabilitySet::V8 { .. } | CapabilitySet::V10_1 => false,
     })
 }
 
@@ -3926,7 +3947,10 @@ fn caps_indicate_avc444(caps: &[CapabilitySet]) -> bool {
         | CapabilitySet::V10_6 { flags }
         | CapabilitySet::V10_6Err { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
         CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-        CapabilitySet::V8 { .. } | CapabilitySet::V8_1 { .. } | CapabilitySet::V10_1 => false,
+        CapabilitySet::Hevc420V112
+        | CapabilitySet::V8 { .. }
+        | CapabilitySet::V8_1 { .. }
+        | CapabilitySet::V10_1 => false,
     })
 }
 
@@ -3937,6 +3961,10 @@ struct GfxHandler {
 }
 
 impl GraphicsPipelineHandler for GfxHandler {
+    fn enable_hevc420(&self) -> bool {
+        std::env::var("MACRDP_EXPERIMENTAL_HEVC").as_deref() == Ok("1")
+    }
+
     /// Effectively unlimited, so the vendored `send_avc420_frame` NEVER drops an
     /// encoded frame on its ack-based backpressure. Dropping an encoded H.264
     /// frame — a P-frame, or worse a keyframe — breaks the decode reference
@@ -3999,7 +4027,14 @@ impl GraphicsPipelineHandler for GfxHandler {
             // Ok(false) → capture.rs uses legacy BitmapUpdate. Shipping AVC420
             // to a non-AVC client gets it rejected (ERROR_NOT_SUPPORTED) and
             // kills the graphics channel.
-            if ctx.client_supports_avc {
+            let hevc420 = matches!(negotiated, CapabilitySet::Hevc420V112);
+            if ctx.hevc420 != hevc420 && ctx.encoder.is_some() {
+                ctx.encoder = None;
+                ctx.surface_id = None;
+                ctx.shipped = Arc::new(AtomicU64::new(0));
+            }
+            ctx.hevc420 = hevc420;
+            if ctx.client_supports_avc || ctx.hevc420 {
                 // Only on the first ready: a mid-session capabilities
                 // re-advertise must not push detection back by an arm delay.
                 if !ctx.is_ready {
@@ -4008,7 +4043,11 @@ impl GraphicsPipelineHandler for GfxHandler {
                 ctx.is_ready = true;
                 ctx.egfx_ever_ready = true;
                 ctx.need_keyframe = true;
-                info!(?negotiated, "EGFX channel ready (H.264 active)");
+                info!(
+                    ?negotiated,
+                    codec = if ctx.hevc420 { "HEVC420" } else { "H.264" },
+                    "EGFX channel ready"
+                );
             } else {
                 ctx.is_ready = false;
                 // Decline at the CHANNEL level, not just skip-using-it: flag
@@ -4239,6 +4278,38 @@ impl GraphicsPipelineHandler for StubHandler {
     }
 }
 
+/// Frame body after the region metablock for negotiated EGFX 11.2 HEVC420.
+fn hevc_v112_payload(frame: &EncodedFrame) -> Result<Vec<u8>> {
+    let mut units: Vec<&[u8]> = frame.parameter_sets.iter().map(Vec::as_slice).collect();
+    let mut data = frame.data.as_slice();
+    while !data.is_empty() {
+        let (length, rest) = data
+            .split_first_chunk::<4>()
+            .ok_or_else(|| anyhow!("short HEVC NAL length"))?;
+        let (unit, tail) = rest
+            .split_at_checked(u32::from_be_bytes(*length) as usize)
+            .ok_or_else(|| anyhow!("short HEVC NAL"))?;
+        units.push(unit);
+        anyhow::ensure!(units.len() <= 512, "too many HEVC NAL units");
+        data = tail;
+    }
+    anyhow::ensure!(
+        !units.is_empty() && units.len() <= 512,
+        "invalid HEVC NAL count"
+    );
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(u32::try_from(units.len() * 4)?).to_le_bytes());
+    for unit in &units {
+        anyhow::ensure!(unit.len() >= 2, "short HEVC NAL header");
+        payload.extend_from_slice(&u32::try_from(unit.len() + 4)?.to_le_bytes());
+    }
+    for unit in units {
+        payload.extend_from_slice(&[0, 0, 0, 1]);
+        payload.extend_from_slice(unit);
+    }
+    Ok(payload)
+}
+
 /// Rewrite AVCC (4-byte length-prefixed NALs) to Annex-B (`00 00 00 01` start
 /// codes), prepending SPS/PPS on keyframes. Only used when `MACRDP_H264_ANNEXB`
 /// selects Annex-B framing.
@@ -4275,6 +4346,41 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires a VideoToolbox HEVC encoder"]
+    fn hardware_hevc_keyframe_has_v112_nal_size_table() -> anyhow::Result<()> {
+        let mut encoder = super::Encoder::new_with_codec(
+            320,
+            240,
+            60,
+            4_000_000,
+            2.0,
+            crate::videotoolbox::PictureCodec::Hevc420,
+        )?;
+        encoder.encode_bgra(&vec![127; 320 * 240 * 4], 320 * 4, true)?;
+        let frames = encoder.flush()?;
+        let frame = frames.first().expect("HEVC picture");
+        assert!(frame.is_keyframe);
+        let payload = super::hevc_v112_payload(frame)?;
+        let table_len = u32::from_le_bytes(payload[..4].try_into()?) as usize;
+        let mut remaining = &payload[4 + table_len..];
+        let mut types = Vec::new();
+        for entry in payload[4..4 + table_len].chunks_exact(4) {
+            let size = u32::from_le_bytes(entry.try_into()?) as usize;
+            let (nal, rest) = remaining.split_at(size);
+            assert_eq!(&nal[..4], &[0, 0, 0, 1]);
+            types.push((nal[4] >> 1) & 63);
+            remaining = rest;
+        }
+        assert!(remaining.is_empty());
+        for required in [32, 33, 34] {
+            assert!(types.contains(&required));
+        }
+        assert!(types.iter().any(|kind| (16..=21).contains(kind)));
+        Ok(())
+    }
+
     #[test]
     fn ack_lag_limit_tcp_is_off_unless_configured() {
         // TCP with N = 0 never drops, flush or not.

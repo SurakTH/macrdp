@@ -115,7 +115,7 @@ ironrdp-cliprdr        = { git = "https://github.com/clintcan/IronRDP.git", rev 
 ironrdp-connector      = { git = "https://github.com/clintcan/IronRDP.git", rev = "fd3798d35fbdd2e20f9bce23fa51ba7123b49be7" }
 ironrdp-core           = { git = "https://github.com/clintcan/IronRDP.git", rev = "fd3798d35fbdd2e20f9bce23fa51ba7123b49be7" }
 ironrdp-displaycontrol = { git = "https://github.com/clintcan/IronRDP.git", rev = "fd3798d35fbdd2e20f9bce23fa51ba7123b49be7" }
-ironrdp-egfx           = { git = "https://github.com/clintcan/IronRDP.git", rev = "fd3798d35fbdd2e20f9bce23fa51ba7123b49be7" }
+ironrdp-egfx           = { path = "vendor/ironrdp-egfx" }
 ironrdp-graphics       = { git = "https://github.com/clintcan/IronRDP.git", rev = "fd3798d35fbdd2e20f9bce23fa51ba7123b49be7" }
 ironrdp-pdu            = { git = "https://github.com/clintcan/IronRDP.git", rev = "fd3798d35fbdd2e20f9bce23fa51ba7123b49be7" }
 ironrdp-rdpsnd         = { git = "https://github.com/clintcan/IronRDP.git", rev = "fd3798d35fbdd2e20f9bce23fa51ba7123b49be7" }
@@ -135,6 +135,9 @@ ironrdp-usb            = { git = "https://github.com/clintcan/IronRDP.git", rev 
 # dependency on this repo. Use the local copy, so there is one.
 [patch."https://github.com/clintcan/macrdp"]
 macrdp-rdpeudp = { path = "vendor/macrdp-rdpeudp" }
+
+[patch."https://github.com/clintcan/IronRDP.git"]
+ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
 
 [profile.release]
 lto = "thin"

@@ -60,9 +60,16 @@ impl EncodeOutput {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PictureCodec {
+    Avc420,
+    Avc444,
+    Hevc420,
+}
+
 struct OutputContext {
     tx: mpsc::Sender<EncodeOutput>,
-    patch_sps: bool,
+    codec: PictureCodec,
     pending: std::sync::Mutex<std::collections::HashMap<i64, Option<std::time::Instant>>>,
 }
 
@@ -281,6 +288,7 @@ impl Encoder {
     /// Create a new H.264 encoder. `bitrate_bps` is the target average
     /// bitrate; `fps` sets the frame-duration hint used by VT's rate
     /// controller. The first encoded frame will always be a keyframe.
+    #[cfg(test)]
     pub fn new(
         width: u16,
         height: u16,
@@ -288,22 +296,29 @@ impl Encoder {
         bitrate_bps: u32,
         keyframe_secs: f32,
     ) -> Result<Self> {
-        Self::new_with_sps_policy(width, height, fps, bitrate_bps, keyframe_secs, true)
+        Self::new_with_codec(
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            keyframe_secs,
+            PictureCodec::Avc420,
+        )
     }
 
-    fn new_with_sps_policy(
+    pub(crate) fn new_with_codec(
         width: u16,
         height: u16,
         fps: u32,
         bitrate_bps: u32,
         keyframe_secs: f32,
-        patch_sps: bool,
+        codec: PictureCodec,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<EncodeOutput>();
         // Keep the callback context alive until the compression session is invalidated.
         let tx_box = Box::new(OutputContext {
             tx,
-            patch_sps,
+            codec,
             pending: Default::default(),
         });
         let tx_ptr = Box::as_ref(&tx_box) as *const OutputContext as *mut c_void;
@@ -311,7 +326,7 @@ impl Encoder {
         // Default to full-range NV12 — verified to fix mstsc's washed/lighter
         // image while keeping FreeRDP correct. Opt back out to video-range (let
         // VT convert from BGRA) with MACRDP_H264_FULL_RANGE=0 for debugging.
-        let full_range = !patch_sps
+        let full_range = codec != PictureCodec::Avc420
             || !matches!(
                 std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
                 Ok("0") | Ok("false") | Ok("FALSE")
@@ -327,6 +342,7 @@ impl Encoder {
             VT_KEYFRAME_BACKSTOP,
             tx_ptr,
             full_range,
+            codec,
         )?;
         Ok(Self {
             inner: session,
@@ -558,13 +574,13 @@ impl Avc444Encoder {
             .ok_or_else(|| anyhow!("AVC444 frame rate overflow"))?;
         // AVC444 is defined in YUV, so it always uses full-range NV12 input;
         // the AVC420-only debug override must not change its buffer contract.
-        let encoder = Encoder::new_with_sps_policy(
+        let encoder = Encoder::new_with_codec(
             encoded_width,
             encoded_height,
             stream_fps,
             bitrate_bps,
             keyframe_secs,
-            false,
+            PictureCodec::Avc444,
         )?;
         let all_intra_env = std::env::var("MACRDP_AVC444_ALL_INTRA").ok();
         let all_intra = avc444_all_intra_setting(all_intra_env.as_deref());
@@ -696,7 +712,7 @@ pub fn nv12_full_range_to_bgra(
 }
 
 mod ffi {
-    use super::{EncodeOutput, EncodedFrame, OutputContext};
+    use super::{EncodeOutput, EncodedFrame, OutputContext, PictureCodec};
     use anyhow::{anyhow, bail, Result};
     use std::ffi::c_void;
     use std::ptr;
@@ -791,6 +807,7 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
+        static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         // Color-space signaling so the encoded SPS VUI describes its color
@@ -891,6 +908,14 @@ mod ffi {
             param_set_count_out: *mut usize,
             nal_unit_header_length_out: *mut i32,
         ) -> OSStatus;
+        pub(super) fn CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+            fmt: CMFormatDescriptionRef,
+            param_set_index: usize,
+            param_set_pointer_out: *mut *const u8,
+            param_set_size_out: *mut usize,
+            param_set_count_out: *mut usize,
+            nal_unit_header_length_out: *mut i32,
+        ) -> OSStatus;
 
         // CFArray (used to test the "NotSync" keyframe attachment).
         pub(super) fn CFArrayGetCount(arr: CFArrayRef) -> isize;
@@ -967,6 +992,7 @@ mod ffi {
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
         full_range: bool,
+        codec: PictureCodec,
     ) -> Result<SessionGuard> {
         // Supplying explicit source attributes makes VideoToolbox expose a
         // matching CVPixelBufferPool. Allocating frames from that pool lets VT
@@ -1042,7 +1068,11 @@ mod ffi {
                 ptr::null(),
                 i32::from(width),
                 i32::from(height),
-                K_CM_VIDEO_CODEC_TYPE_H264,
+                if codec == PictureCodec::Hevc420 {
+                    u32::from_be_bytes(*b"hvc1")
+                } else {
+                    K_CM_VIDEO_CODEC_TYPE_H264
+                },
                 ptr::null(),
                 source_attributes,
                 ptr::null(),
@@ -1086,7 +1116,11 @@ mod ffi {
             set_string(
                 session,
                 kVTCompressionPropertyKey_ProfileLevel,
-                kVTProfileLevel_H264_Baseline_AutoLevel,
+                if codec == PictureCodec::Hevc420 {
+                    kVTProfileLevel_HEVC_Main_AutoLevel
+                } else {
+                    kVTProfileLevel_H264_Baseline_AutoLevel
+                },
             )?;
             // Tag the bitstream's color space explicitly (BT.709). Without this
             // VideoToolbox leaves the SPS VUI under-specified and each decoder
@@ -2010,7 +2044,7 @@ mod ffi {
                 "VideoToolbox output unavailable: status={status}, flags={info_flags}"
             ))
         } else {
-            extract_frame(sample_buffer, context.patch_sps)
+            extract_frame(sample_buffer, context.codec)
         };
         match result {
             Ok(mut frame) => {
@@ -2028,7 +2062,7 @@ mod ffi {
         }
     }
 
-    unsafe fn extract_frame(sbuf: CMSampleBufferRef, patch_sps: bool) -> Result<EncodedFrame> {
+    unsafe fn extract_frame(sbuf: CMSampleBufferRef, codec: PictureCodec) -> Result<EncodedFrame> {
         let bbuf = CMSampleBufferGetDataBuffer(sbuf);
         if bbuf.is_null() {
             bail!("CMSampleBufferGetDataBuffer returned null");
@@ -2071,7 +2105,12 @@ mod ffi {
                     let mut ptr_out: *const u8 = ptr::null();
                     let mut size_out: usize = 0;
                     let mut count_out: usize = 0;
-                    let st = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    let get_parameter_set = if codec == PictureCodec::Hevc420 {
+                        CMVideoFormatDescriptionGetHEVCParameterSetAtIndex
+                    } else {
+                        CMVideoFormatDescriptionGetH264ParameterSetAtIndex
+                    };
+                    let st = get_parameter_set(
                         fmt,
                         index,
                         &mut ptr_out,
@@ -2085,7 +2124,7 @@ mod ffi {
                     let slice = std::slice::from_raw_parts(ptr_out, size_out);
                     // Windows 10 mstsc shows a black screen unless the SPS
                     // states the decode buffering (see h264_sps.rs).
-                    parameter_sets.push(if patch_sps {
+                    parameter_sets.push(if codec == PictureCodec::Avc420 {
                         crate::h264_sps::fix_parameter_set(slice)
                     } else {
                         slice.to_vec()

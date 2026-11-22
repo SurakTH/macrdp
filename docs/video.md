@@ -5,6 +5,19 @@ How macrdp draws your screen: the H.264 pipeline (`--enable-h264`, optional
 capture (`--hidpi`), client-resolution auto-adopt and letterboxing, the mstsc
 reconnect quirk and its fixes, and the color-conversion implementation notes.
 
+## Experimental HEVC420 with Windows App
+
+Start the experimental binary with `MACRDP_EXPERIMENTAL_HEVC=1` and the usual
+`--enable-h264` arguments. The server selects HEVC420 when the client offers
+the supported EGFX 11.2 capability with flags `0x00000400`. Clients offering
+only AVC follow the existing AVC negotiation. The wire format follows the
+[FreeRDP HEVC420 decoder](https://github.com/FreeRDP/FreeRDP/blob/master/channels/rdpgfx/client/rdpgfx_codec.c).
+
+In Windows App, open Connection Information during the session. Under
+Graphics details, **Codecs used** identifies the active codec. **Client
+compatibility** lists available decoders. Verify that the desktop is visible
+and updates during scrolling before recording an interoperability result.
+
 ## Display resolution (`--hidpi`)
 
 By default macrdp captures and advertises the Mac's **logical** resolution — the points it reports in System Settings (e.g. 1512×982 on a default-scaled 14" MacBook). On a Retina panel that's half the physical pixels, so any client whose window is larger upscales it and text looks soft.
