@@ -2,6 +2,16 @@ import XCTest
 @testable import ControllerCore
 
 final class ConfigurationFileTests: XCTestCase {
+    func testExportedAndQuotedKeysMatchServerParsingAndApply() throws {
+        let original = "# keep\nexport H264_MAX_UNACKED_FRAMES='0'\nH264_MAX_UNACKED_FRAMES=\"4\"\n"
+            + "export RICH_CLIPBOARD='1'\n"
+        XCTAssertEqual(ConfigurationFile.parse(original),
+                       ["H264_MAX_UNACKED_FRAMES": "4", "RICH_CLIPBOARD": "1"])
+        let edited = try ConfigurationFile.merging(changes: ["H264_MAX_UNACKED_FRAMES": "3"], into: original)
+        XCTAssertEqual(edited, "# keep\nexport H264_MAX_UNACKED_FRAMES=3\nexport RICH_CLIPBOARD='1'\n")
+        XCTAssertEqual(ConfigurationFile.parse(edited)["H264_MAX_UNACKED_FRAMES"], "3")
+    }
+
     func testMergePreservesCommentsAndUneditedValuesAndRemovesDuplicateEditedKeys() throws {
         let text = "# personal settings\nFPS=30\nOTHER=latest\nFPS=12\n\n"
         let output = try ConfigurationFile.merging(changes: ["FPS": "60", "BITRATE": "25"], into: text)

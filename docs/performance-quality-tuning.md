@@ -257,3 +257,23 @@ MACRDP_NATIVE_FPS=15 ./start.sh native
 # Optional LAN experiment: migrate EGFX video to reliable UDP
 MACRDP_LAN_TRANSPORT=udp ./start.sh lan
 ```
+## 4K/60 Preview
+
+The Controller's **4K/60 Preview** profile uses NV12 capture, H.264 AVC420,
+an encoder queue of two frames, and the standard flush cadence. The Stable
+profile keeps BGRA and a one-frame encoder queue for 1080p typing.
+
+A local release benchmark submitted the same 4K motion fixture at 60 Hz to
+VideoToolbox. The 4K NV12 path with two frames in flight produced 172 of 180
+pictures (57.3 FPS, 35.05 ms p95 submit-to-output). Three frames in flight
+produced one more picture and raised p95 to 52.47 ms. The BGRA one-frame
+baseline produced 91 pictures. Both NV12 queue sizes had zero encoder drops;
+the missing pictures were skipped before encoding when the queue was full.
+The benchmark excludes ScreenCaptureKit, RDP transport and client presentation.
+
+A separate wired `mstsc` session negotiated AVC420 at 3840 × 2160 with
+synthetic input, a two-frame queue and blank recovery disabled, matching the
+preview profile. Over 16.3 s the server queued 855 frames (52.5 FPS), and
+sampled frame-ack latency was 9 ms median and 10 ms p95. No encoder-submit or
+graphics-dispatch errors occurred in that interval. The stream used a test
+pattern, so it did not exercise live screen capture or keyboard response.

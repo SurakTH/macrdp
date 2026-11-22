@@ -7,6 +7,129 @@ final class SettingsModelTests: XCTestCase {
     override func setUp() { controller = AppController() }
     override func tearDown() { controller = nil }
 
+    func testTCPPacingEditsCanonicalLimitAndMatchesEffectiveConfig() throws {
+        let original = """
+        ENABLE_H264=1
+        H264_MAX_UNACKED_FRAMES=0
+        TCP_VIDEO_BACKPRESSURE=1
+        EXTRA_FLAGS="--h264-max-unacked-frames 20 --fps 60"
+        """
+        var persisted = original
+        let model = SettingsModel(controller: controller, initialConfig: ConfigurationFile.parse(original),
+            saveSettings: { persisted = try ConfigurationFile.merging(changes: $0, into: persisted) })
+        XCTAssertFalse(model.tcpPacingEnabled)
+        XCTAssertEqual(model.savedTCPPacingSummary, "Off")
+        XCTAssertFalse(model.isDirty)
+        model.setTCPPacingEnabled(true)
+        XCTAssertEqual(model.tcpPacingLimit, "3")
+        for value in ["-1", "2.5", "4294967296", "invalid"] {
+            model.setTCPPacingLimit(value)
+            XCTAssertNotNil(model.validationError)
+            model.apply()
+            XCTAssertEqual(persisted, original)
+        }
+        model.setTCPPacingLimit("4")
+        XCTAssertNil(model.validationError)
+        model.apply()
+        XCTAssertEqual(model.savedTCPPacingSummary, "4 unacknowledged frames")
+        XCTAssertEqual(ConfigurationFile.parse(persisted)["H264_MAX_UNACKED_FRAMES"], "4")
+        XCTAssertEqual(ConfigurationFile.parse(persisted)["EXTRA_FLAGS"], "--fps 60")
+        model.setTCPPacingEnabled(false)
+        XCTAssertEqual(model.tcpPacingLimit, "0")
+        XCTAssertEqual(model.draft["TCP_VIDEO_BACKPRESSURE"], "0")
+        model.revert()
+        XCTAssertEqual(model.tcpPacingLimit, "4")
+        model.applyProfile(.stable)
+        XCTAssertFalse(model.tcpPacingEnabled)
+        XCTAssertEqual(model.selectedProfile, .stable)
+        XCTAssertEqual(SettingsModel.pacingLimit(in: ["TCP_VIDEO_BACKPRESSURE": "1"]), "3")
+        XCTAssertEqual(SettingsModel.pacingLimit(in: ["EXTRA_FLAGS": "--h264-max-unacked-frames=6"]), "6")
+    }
+
+    func testNewOptionsReadLegacyFlagsAndStayInDraftUntilApply() {
+        var writes: [[String: String]] = []
+        let model = SettingsModel(controller: controller, initialConfig: [
+            "ENABLE_H264": "1",
+            "VIRTUAL_DISPLAY": "1",
+            "EXTRA_FLAGS": "--virtual-display-hidpi auto --network-autodetect --no-rich-clipboard --stretch",
+        ], saveSettings: { writes.append($0) })
+        XCTAssertEqual(model.virtualDisplayScaling, .automatic)
+        XCTAssertTrue(model.bool("NETWORK_AUTODETECT"))
+        XCTAssertFalse(model.bool("RICH_CLIPBOARD"))
+        model.setVirtualDisplayScaling(.retina)
+        model.setBool("NETWORK_AUTODETECT", false)
+        model.setBool("RICH_CLIPBOARD", true)
+        model.setBool("CAPTURE_NV12", true)
+        model.setBool("ALT_SPACE_SPOTLIGHT", true)
+        XCTAssertTrue(writes.isEmpty)
+        model.apply()
+        XCTAssertEqual(writes.count, 1)
+        XCTAssertEqual(writes[0]["VD_HIDPI"], "1")
+        XCTAssertEqual(writes[0]["NETWORK_AUTODETECT"], "0")
+        XCTAssertEqual(writes[0]["RICH_CLIPBOARD"], "1")
+        XCTAssertEqual(writes[0]["CAPTURE_NV12"], "1")
+        XCTAssertEqual(writes[0]["ALT_SPACE_SPOTLIGHT"], "1")
+        XCTAssertEqual(writes[0]["EXTRA_FLAGS"], "--stretch")
+        XCTAssertFalse(model.bool("NETWORK_AUTODETECT"))
+        XCTAssertTrue(model.bool("RICH_CLIPBOARD"))
+    }
+
+    func testFourKPreviewStagesVideoAndStableCanRestoreItsDefaults() {
+        var initial = PerformanceProfile.stable.settings
+        initial.merge(["VIRTUAL_DISPLAY": "1", "VD_WIDTH": "2560", "VD_HEIGHT": "1440",
+                       "BIND": "127.0.0.1:4390",
+                       "EXTRA_FLAGS": "--avc444 --enable-h264 --enable-udp-multitransport --stretch"]) { _, new in new }
+        let model = SettingsModel(controller: controller, initialConfig: initial)
+        model.applyProfile(.fourK)
+        XCTAssertEqual(model.selectedProfile, .fourK)
+        XCTAssertTrue(model.bool("CAPTURE_NV12"))
+        XCTAssertTrue(model.bool("RESPONSIVE_CAPTURE"))
+        XCTAssertEqual(model.frameRate, "60")
+        XCTAssertEqual(model.captureResolutionChoice, "3840x2160")
+        XCTAssertEqual(model.bitrateMbps, "60")
+        XCTAssertEqual(model.encoderQueueDepth, "2")
+        XCTAssertFalse(model.fastFlushEnabled)
+        XCTAssertFalse(model.tcpPacingEnabled)
+        XCTAssertEqual(model.resolution, "2560x1440")
+        XCTAssertEqual(model.bindDisplay, "127.0.0.1:4390")
+        XCTAssertEqual(model.draft["EXTRA_FLAGS"], "--stretch")
+        model.applyProfile(.stable)
+        XCTAssertEqual(model.selectedProfile, .stable)
+        XCTAssertEqual(model.captureResolutionChoice, "1920x1080")
+        XCTAssertEqual(model.encoderQueueDepth, "1")
+        XCTAssertFalse(model.bool("CAPTURE_NV12"))
+    }
+
+    func testLegacyAndNewPersonalPresetsPreservePacingAndIndependentSettings() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = PersonalPresetStore(url: folder.appendingPathComponent("presets.json"))
+        let legacy = PersonalPreset(name: "Old", settings: ["ENABLE_H264": "1", "TCP_VIDEO_BACKPRESSURE": "1"])
+        try store.save([legacy])
+        let model = SettingsModel(controller: controller, initialConfig: [
+            "ENABLE_H264": "1", "VD_HIDPI": "auto", "VIRTUAL_DISPLAY": "1",
+            "EXTRA_FLAGS": "--h264-max-unacked-frames=8 --network-autodetect",
+            "ALT_SPACE_SPOTLIGHT": "1", "RICH_CLIPBOARD": "0",
+        ], presetStore: store)
+        model.selectPersonalPreset(legacy.id)
+        model.loadPersonalPreset()
+        XCTAssertEqual(model.tcpPacingLimit, "3")
+        XCTAssertTrue(model.bool("ALT_SPACE_SPOTLIGHT"))
+        XCTAssertEqual(model.virtualDisplayScaling, .automatic)
+        model.setTCPPacingLimit("5")
+        model.setBool("CAPTURE_NV12", true)
+        model.personalPresetName = "New"
+        model.savePersonalPreset()
+        model.applyProfile(.stable)
+        XCTAssertFalse(model.bool("CAPTURE_NV12"))
+        model.loadPersonalPreset()
+        XCTAssertEqual(model.tcpPacingLimit, "5")
+        XCTAssertTrue(model.bool("CAPTURE_NV12"))
+        XCTAssertTrue(model.bool("NETWORK_AUTODETECT"))
+        XCTAssertFalse(model.bool("RICH_CLIPBOARD"))
+        XCTAssertEqual(model.virtualDisplayScaling, .automatic)
+    }
+
     func testPersonalPresetSaveLoadRenameDeleteAndDraftIsolation() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: folder) }

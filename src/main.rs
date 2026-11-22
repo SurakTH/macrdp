@@ -27,6 +27,8 @@ mod cursor;
 mod file_promise;
 #[cfg(target_os = "macos")]
 mod file_promise_lazy;
+#[cfg(any(target_os = "macos", test))]
+mod frame_flush;
 #[cfg(target_os = "macos")]
 mod h264;
 mod h264_sps;
@@ -2572,6 +2574,30 @@ fn args_from_config(path: &Path) -> Result<Args> {
         }
         argv.push("--keychain".into());
     }
+    let mut configured_switch_flags: Vec<&str> = Vec::new();
+    for (key, flag, default) in [
+        ("ALT_BACKTICK_SWITCH", "--alt-backtick-switch", false),
+        ("ALT_SPACE_SPOTLIGHT", "--alt-space-spotlight", false),
+        ("ALT_Q_QUIT", "--alt-q-quit", false),
+        ("REVERSE_SCROLL", "--reverse-scroll", false),
+        ("RICH_CLIPBOARD", "--no-rich-clipboard", true),
+        ("CAPTURE_NV12", "--capture-nv12", false),
+        ("NETWORK_AUTODETECT", "--network-autodetect", false),
+        (
+            "ENABLE_MICROPHONE_REDIRECTION",
+            "--enable-microphone-redirection",
+            false,
+        ),
+        ("ENABLE_LOSSY_AUDIO", "--enable-lossy-audio", false),
+    ] {
+        if cfg.contains_key(key) {
+            configured_switch_flags.push(flag);
+            if on(key, default) != default {
+                argv.push(flag.into());
+            }
+        }
+    }
+
     if on("ENABLE_H264", false) {
         argv.push("--enable-h264".into());
     }
@@ -2590,15 +2616,6 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ALT_TAB_SWITCH", false) {
         argv.push("--alt-tab-switch".into());
     }
-    if on("ALT_BACKTICK_SWITCH", false) {
-        argv.push("--alt-backtick-switch".into());
-    }
-    if on("ALT_SPACE_SPOTLIGHT", false) {
-        argv.push("--alt-space-spotlight".into());
-    }
-    if on("ALT_Q_QUIT", false) {
-        argv.push("--alt-q-quit".into());
-    }
     if on("APP_SWITCHER_HUD", false) {
         argv.push("--app-switcher-hud".into());
     }
@@ -2611,23 +2628,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("AUTO_UNLOCK", false) {
         argv.push("--auto-unlock".into());
     }
-    if !on("RICH_CLIPBOARD", true) {
-        argv.push("--no-rich-clipboard".into());
-    }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
-    if on("NETWORK_AUTODETECT", false) {
-        argv.push("--network-autodetect".into());
-    }
-    if on("CAPTURE_NV12", false) {
-        argv.push("--capture-nv12".into());
-    }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
-    }
-    if on("REVERSE_SCROLL", false) {
-        argv.push("--reverse-scroll".into());
     }
     if let Some(list) = cfg.get("NO_REMAP_APPS") {
         if !list.is_empty() {
@@ -2647,9 +2652,6 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_CAMERA_REDIRECTION", false) {
         argv.push("--enable-camera-redirection".into());
     }
-    if on("ENABLE_MICROPHONE_REDIRECTION", false) {
-        argv.push("--enable-microphone-redirection".into());
-    }
     if on("ENABLE_UDP_MULTITRANSPORT", false) {
         argv.push("--enable-udp-multitransport".into());
     }
@@ -2658,9 +2660,6 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("ADAPTIVE_BITRATE", false) {
         argv.push("--adaptive-bitrate".into());
-    }
-    if on("ENABLE_LOSSY_AUDIO", false) {
-        argv.push("--enable-lossy-audio".into());
     }
     if on("VIRTUAL_DISPLAY", false) {
         argv.push("--virtual-display".into());
@@ -2792,7 +2791,6 @@ fn args_from_config(path: &Path) -> Result<Args> {
         }
     }
 
-    let mut configured_switch_flags: Vec<&str> = Vec::new();
     if physical_size_configured {
         configured_switch_flags.extend(["--no-client-resolution", "--hidpi"]);
     }
@@ -2943,9 +2941,15 @@ fn args_from_config(path: &Path) -> Result<Args> {
 
     // Keep unrelated escape-hatch flags. Dedicated keys override legacy values.
     if let Some(extra) = cfg.get("EXTRA_FLAGS") {
-        let mut toks = extra.split_whitespace();
+        let mut toks = extra.split_whitespace().peekable();
         while let Some(tok) = toks.next() {
             let flag = tok.split_once('=').map_or(tok, |(flag, _)| flag);
+            if flag == "--virtual-display-hidpi" && cfg.contains_key("VD_HIDPI") {
+                if tok == flag && matches!(toks.peek(), Some(&("on" | "auto"))) {
+                    toks.next();
+                }
+                continue;
+            }
             if (bitrate.is_some() && flag == "--bitrate") || configured_value_flags.contains(&flag)
             {
                 if !tok.contains('=') {
@@ -4458,6 +4462,48 @@ mod config_tests {
         ));
         fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn tcp_pacing_uses_numeric_limit_and_accepts_legacy_config() {
+        let path = write_temp("tcp-pacing", "TCP_VIDEO_BACKPRESSURE=1\n");
+        assert_eq!(args_from_config(&path).unwrap().h264_max_unacked_frames, 3);
+        for limit in [0, 4] {
+            fs::write(
+                &path,
+                format!("TCP_VIDEO_BACKPRESSURE=1\nH264_MAX_UNACKED_FRAMES={limit}\nEXTRA_FLAGS=--h264-max-unacked-frames 20 --fps 60\n"),
+            )
+            .unwrap();
+            let args = args_from_config(&path).unwrap();
+            assert_eq!(args.h264_max_unacked_frames, limit);
+            assert_eq!(args.fps, Some(60));
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn controller_feature_keys_override_legacy_extra_flags() {
+        let extra = "EXTRA_FLAGS=--capture-nv12 --no-rich-clipboard --network-autodetect --alt-space-spotlight --virtual-display-hidpi auto --enable-lossy-audio --fps 60\n";
+        let path = write_temp(
+            "controller-features",
+            &format!("VIRTUAL_DISPLAY=1\n{extra}"),
+        );
+        let args = args_from_config(&path).unwrap();
+        assert!(args.capture_nv12 && args.no_rich_clipboard && args.network_autodetect);
+        assert!(args.alt_space_spotlight && args.enable_lossy_audio);
+        assert!(matches!(args.virtual_display_hidpi, Some(VdHidpiArg::Auto)));
+
+        fs::write(
+            &path,
+            format!("VIRTUAL_DISPLAY=1\nVD_HIDPI=1\nCAPTURE_NV12=0\nRICH_CLIPBOARD=1\nNETWORK_AUTODETECT=1\nALT_SPACE_SPOTLIGHT=0\nENABLE_LOSSY_AUDIO=0\n{extra}"),
+        )
+        .unwrap();
+        let args = args_from_config(&path).unwrap();
+        assert!(!args.capture_nv12 && !args.no_rich_clipboard && args.network_autodetect);
+        assert!(!args.alt_space_spotlight && !args.enable_lossy_audio);
+        assert!(matches!(args.virtual_display_hidpi, Some(VdHidpiArg::On)));
+        assert_eq!(args.fps, Some(60));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

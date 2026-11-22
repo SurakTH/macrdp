@@ -273,7 +273,7 @@ private struct ConnectionTab: View {
                 }
                 .pickerStyle(.segmented)
                 Text(model.selectedProfile?.detail
-                    ?? "Custom settings. Choose a profile to stage its live-verified values, then Apply.")
+                    ?? "Custom settings. Choose a profile to stage its values, then Apply.")
                     .font(.caption).foregroundColor(.secondary)
                 Text("Profiles change video, audio and shortcut settings only. Network access stays a separate choice below.")
                     .font(.caption).foregroundColor(.secondary)
@@ -432,6 +432,15 @@ private struct VideoTab: View {
                     : "1080p is the tested starting point for typing. Higher resolutions sharpen detail but increase load. Fixed sizes stay fixed when the client window changes.")
                     .font(.caption).foregroundColor(.secondary)
             }
+            Section("TCP video pacing") {
+                Toggle("Pace TCP video when the client falls behind", isOn: Binding(
+                    get: { model.tcpPacingEnabled }, set: { model.setTCPPacingEnabled($0) }))
+                TextField("Unacknowledged frame limit", text: Binding(
+                    get: { model.tcpPacingLimit }, set: { model.setTCPPacingLimit($0) }), prompt: Text("0"))
+                Text("0 turns pacing off. Start at 3 for 4K over TCP. When the client falls behind, the server skips some captures before encoding.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            .disabled(!model.bool("ENABLE_H264"))
             Section("Experimental") {
                 TextField("H.264 encoder queue depth", text: Binding(
                     get: { model.encoderQueueDepth },
@@ -442,10 +451,6 @@ private struct VideoTab: View {
                 Toggle("Responsive capture", isOn: model.boolBinding("RESPONSIVE_CAPTURE"))
                     .disabled(!model.bool("ENABLE_H264"))
                 Text("Gives fresh desktop updates priority over duplicate frames and keeps less video queued. May skip intermediate motion under load. Try with Fast flush off first.")
-                    .font(.caption).foregroundColor(.secondary)
-                Toggle("Pace TCP video when the client falls behind", isOn: model.boolBinding("TCP_VIDEO_BACKPRESSURE"))
-                    .disabled(!model.bool("ENABLE_H264"))
-                Text("Temporarily sends fewer frames if the client is slow to acknowledge video. Try for 4K stutter during motion.")
                     .font(.caption).foregroundColor(.secondary)
                 Toggle("Fast flush (optional)", isOn: Binding(
                     get: { model.fastFlushEnabled },
@@ -464,11 +469,16 @@ private struct VideoTab: View {
                                 .disabled(!model.bool("ENABLE_H264"))
                         }
                     }
-                    Text("8–1000 ms. Lower values send the same trailing pictures closer together; capture FPS and bitrate stay the same.")
+                    Text("8–1000 ms. Lower values send trailing pictures closer together.")
                         .font(.caption).foregroundColor(.secondary)
                 }
-                Text("Off by default. May make typing feel faster, but can increase image artifacts. "
-                    + "Turn off to restore stable video. Apply restarts a running server.")
+                Text("Off uses the standard capture cadence. Faster intervals may make typing feel more responsive and can show transient image artifacts.")
+                    .font(.caption).foregroundColor(.secondary)
+                Toggle("NV12 capture for AVC420", isOn: model.boolBinding("CAPTURE_NV12"))
+                    .disabled(!model.bool("ENABLE_H264") || model.bool("AVC444"))
+                Text(model.bool("AVC444") || !model.bool("ENABLE_H264")
+                    ? "NV12 requires H.264 AVC420. Your preference is retained."
+                    : "Can reduce capture CPU use at high resolutions. Off uses the standard BGRA capture path.")
                     .font(.caption).foregroundColor(.secondary)
                 Toggle("AVC444 diagnostics", isOn: model.boolBinding("AVC444"))
                     .disabled(!model.bool("ENABLE_H264"))
@@ -489,6 +499,14 @@ private struct AudioTab: View {
                 Toggle("AAC audio", isOn: model.boolBinding("ENABLE_AAC"))
                 Text("Compresses forwarded audio as AAC-LC (~11× less bandwidth than PCM). Clients "
                     + "without AAC fall back to PCM. Adds ~40–50 ms latency, so it's off by default.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Audio transport") {
+                let lossy = model.bool("ENABLE_LOSSY_AUDIO")
+                Toggle("Loss-resilient UDP audio", isOn: model.boolBinding("ENABLE_LOSSY_AUDIO"))
+                    .disabled(!lossy && (!model.bool("ENABLE_AAC") || !model.bool("ENABLE_H264")
+                        || model.bool("UDP_MIGRATE_EGFX")))
+                Text("Requires AAC and H.264. Offers UDP automatically and uses TCP if the client or link can't use it. Keep Move video onto UDP off when using UDP audio.")
                     .font(.caption).foregroundColor(.secondary)
             }
         }
@@ -512,6 +530,15 @@ private struct DisplayTab: View {
                     }
                 }
                 .disabled(!model.bool("VIRTUAL_DISPLAY"))
+                Picker("Scaling", selection: Binding(
+                    get: { model.virtualDisplayScaling }, set: { model.setVirtualDisplayScaling($0) })) {
+                    ForEach(VirtualDisplayScaling.allCases, id: \.self) { scaling in
+                        Text(scaling.title).tag(scaling)
+                    }
+                }
+                .disabled(!model.bool("VIRTUAL_DISPLAY"))
+                Text("Retina uses twice the pixels per UI point. Automatic uses the scale requested by the client. For a 1920 × 1080 workspace at 2×, choose 3840 × 2160.")
+                    .font(.caption).foregroundColor(.secondary)
             }
             Section("Primary screen (while connected)") {
                 Picker("Physical panel", selection: Binding(
@@ -573,6 +600,7 @@ private struct InputTab: View {
                 if model.bool("MAP_CTRL_TO_CMD") {
                     ExcludeAppsView(model: model)
                 }
+                Toggle("Option+Space opens Spotlight", isOn: model.boolBinding("ALT_SPACE_SPOTLIGHT"))
             }
             Section("Mouse") {
                 Toggle("Reverse scroll direction", isOn: model.boolBinding("REVERSE_SCROLL"))
@@ -581,6 +609,7 @@ private struct InputTab: View {
             }
             Section("App switching") {
                 Toggle("Option+Tab switches apps", isOn: model.boolBinding("ALT_TAB_SWITCH"))
+                Toggle("Option+Backtick cycles the app's windows", isOn: model.boolBinding("ALT_BACKTICK_SWITCH"))
                 Toggle("Option+Q quits apps", isOn: model.boolBinding("ALT_Q_QUIT"))
                 Toggle("App-switcher HUD overlay", isOn: model.boolBinding("APP_SWITCHER_HUD"))
                 Toggle("Un-minimize on Cmd+Tab", isOn: model.boolBinding("UNMINIMIZE"))
@@ -626,6 +655,11 @@ private struct RedirectionTab: View {
         Form {
             Text("The connecting client must also opt in to each redirection.")
                 .font(.caption).foregroundColor(.secondary)
+            Section("Clipboard") {
+                Toggle("Keep text formatting (HTML and RTF)", isOn: model.boolBinding("RICH_CLIPBOARD", default: true))
+                Text("Plain text is still available when formatting is turned off.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
             Section("Drive") {
                 Toggle("Drive redirection", isOn: model.boolBinding("ENABLE_DRIVE_REDIRECTION"))
                 Text("The client's drive mounts on the Mac as a real volume (read-write).")
@@ -649,25 +683,32 @@ private struct RedirectionTab: View {
                     _ = micRefresh
                     return model.controller.micDriverStatus()
                 }()
+                let installerAvailable = model.controller.hasBundledMicInstaller
                 Toggle("Microphone redirection", isOn: model.boolBinding("ENABLE_MICROPHONE_REDIRECTION"))
+                    .disabled(status == .notInstalled && !model.bool("ENABLE_MICROPHONE_REDIRECTION"))
                 HStack {
                     Button(status == .updateAvailable ? "Update macrdp Microphone…"
                                : "Install macrdp Microphone…") {
                         model.controller.installMicDriver()
                         micRefresh += 1
                     }
-                    .disabled(status == .installed)
+                    .disabled(status == .installed || !installerAvailable)
                     if status != .notInstalled {
                         Button("Remove…") {
                             model.controller.removeMicDriver()
                             micRefresh += 1
                         }
+                        .disabled(!installerAvailable)
                     }
                 }
                 Text(status == .notInstalled ? "Driver: not installed"
                         : status == .updateAvailable ? "Driver: installed — this macrdp bundles a newer one"
                         : "Driver: installed")
                     .font(.caption)
+                if !installerAvailable {
+                    Text("The selected macrdp app does not include the microphone installer.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
                 Text("Presents the client's microphone as “macrdp Microphone” in Zoom / FaceTime / "
                     + "QuickTime. The driver must be installed once (admin; Core Audio restarts, "
                     + "briefly interrupting sound). Other accounts on this Mac can listen to a live "
@@ -686,10 +727,16 @@ private struct AdvancedTab: View {
             Section("UDP multitransport") {
                 Toggle("Offer UDP multitransport", isOn: model.boolBinding("ENABLE_UDP_MULTITRANSPORT"))
                 Toggle("Move video onto UDP (experimental, clean link only)", isOn: model.boolBinding("UDP_MIGRATE_EGFX"))
-                    .disabled(!model.bool("ENABLE_UDP_MULTITRANSPORT"))
+                    .disabled(!model.bool("ENABLE_UDP_MULTITRANSPORT")
+                        || (!model.bool("UDP_MIGRATE_EGFX") && model.bool("ENABLE_LOSSY_AUDIO")))
                 Text("Moving video onto the reliable UDP tunnel helps on a clean, low-latency link. "
                     + "Under packet loss the picture can stall for a few seconds until it moves back "
-                    + "to TCP. Auto-enables H.264. High-latency links never get UDP.")
+                    + "to TCP. Auto-enables H.264. Turn off loss-resilient UDP audio to use this mode.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Connection quality") {
+                Toggle("Report latency and bandwidth to the client", isOn: model.boolBinding("NETWORK_AUTODETECT"))
+                Text("Sends a short bandwidth test at sign-in and reports latency during the session. Supported clients show the results in their connection information.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Diagnostics") {
@@ -820,6 +867,7 @@ private struct StatusView: View {
                 row("Profile", model.appliedProfile?.title ?? "Custom")
                 row("Saved capture", model.savedCaptureSummary)
                 row("Saved flush", model.savedFlushSummary)
+                row("Saved TCP pacing", model.savedTCPPacingSummary)
                 if externalServer, let pid = live?.processId {
                     Label("Terminal server detected (pid \(pid))", systemImage: "terminal")
                     Text("These controls manage the installed server. Stop the terminal test before starting it here. Live video statistics below belong to the terminal server.")

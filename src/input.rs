@@ -219,6 +219,63 @@ fn is_remappable_shortcut(vk: u16) -> bool {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CtrlArrowAction {
+    MissionControl = 126,
+    ApplicationWindows = 125,
+    PreviousSpace = 123,
+    NextSpace = 124,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum CtrlArrowEvent {
+    Forward,
+    Consume,
+    Invoke(CtrlArrowAction),
+}
+
+/// Latch a consumed Ctrl+Arrow until its matching key-up. Modifier changes
+/// during repeat must not leak an unmatched arrow event to the focused app.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct CtrlArrows(u8);
+
+#[cfg(any(target_os = "macos", test))]
+impl CtrlArrows {
+    fn event(
+        &mut self,
+        vk: u16,
+        plain_ctrl: bool,
+        down: bool,
+        already_handled: bool,
+    ) -> CtrlArrowEvent {
+        use CtrlArrowAction::*;
+        use CtrlArrowEvent::*;
+
+        let action = match vk {
+            0x7E => MissionControl,
+            0x7D => ApplicationWindows,
+            0x7B => PreviousSpace,
+            0x7C => NextSpace,
+            _ => return Forward,
+        };
+        let mask = 1 << (action as u16 - 123);
+        if self.0 & mask != 0 {
+            if !down {
+                self.0 &= !mask;
+            }
+            return Consume;
+        }
+        if down && plain_ctrl && !already_handled {
+            self.0 |= mask;
+            return Invoke(action);
+        }
+        Forward
+    }
+}
+
 /// Pure decision table for the MOUSE half of the Ctrl→Cmd remap: should a
 /// left click's Control be delivered to macOS as Command?
 ///
@@ -316,8 +373,38 @@ fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
 mod coord_tests {
     use super::{
         is_remappable_shortcut, map_client_to_display, remove_switcher_selection, resync_plan,
-        scroll_lines, should_alt_q_quit, should_remap_click, wheel_delta, ResyncPlan,
+        scroll_lines, should_alt_q_quit, should_remap_click, wheel_delta, CtrlArrowAction,
+        CtrlArrowEvent, CtrlArrows, ResyncPlan,
     };
+
+    #[test]
+    fn ctrl_arrows_map_and_latch_each_physical_press_until_release() {
+        use CtrlArrowAction::*;
+        use CtrlArrowEvent::*;
+        let mut arrows = CtrlArrows::default();
+        for (scancode, action) in [
+            (0x48, MissionControl),
+            (0x50, ApplicationWindows),
+            (0x4B, PreviousSpace),
+            (0x4D, NextSpace),
+        ] {
+            let vk = super::scancodes::scancode_to_cgkeycode(scancode, true).unwrap();
+            assert_eq!(vk, action as u16);
+            assert_eq!(arrows.event(vk, false, true, false), Forward);
+            // Adding Ctrl during an already forwarded hold is not a new press.
+            assert_eq!(arrows.event(vk, true, true, true), Forward);
+            assert_eq!(arrows.event(vk, true, false, true), Forward);
+            assert_eq!(arrows.event(vk, true, true, false), Invoke(action));
+            assert_eq!(arrows.event(vk, true, true, false), Consume);
+            assert_eq!(arrows.event(vk, false, true, false), Consume);
+            assert_eq!(arrows.event(vk, false, false, false), Consume);
+            assert_eq!(arrows.event(vk, true, true, false), Invoke(action));
+            assert_eq!(arrows.event(vk, true, false, false), Consume);
+            let keypad = super::scancodes::scancode_to_cgkeycode(scancode, false).unwrap();
+            assert_eq!(arrows.event(keypad, true, true, false), Forward);
+        }
+        assert_eq!(arrows.event(0, true, true, false), Forward);
+    }
 
     #[test]
     fn reverse_scroll_inverts_the_wheel_only_when_on() {
@@ -749,12 +836,15 @@ pub(crate) use macos::gather_windows_onto_display;
 
 #[cfg(target_os = "macos")]
 mod macos {
+    mod system_shortcuts;
+
     use std::collections::HashSet;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    use super::is_remappable_shortcut;
     use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode, to_iso_key_order};
+    use super::{is_remappable_shortcut, CtrlArrowAction, CtrlArrowEvent, CtrlArrows};
+    use system_shortcuts::{Dispatcher, Shortcut};
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -1049,6 +1139,8 @@ mod macos {
         // key-up gets swallowed too so the focused app doesn't see a bare
         // release with no preceding press.
         consumed_keys: HashSet<u16>,
+        ctrl_arrows: CtrlArrows,
+        system_shortcuts: Option<Dispatcher>,
         // Virtual keycodes currently held that we remapped Ctrl→Cmd on the way
         // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
         // Cmd swap + restores the real (Ctrl) modifier state.
@@ -1150,6 +1242,8 @@ mod macos {
                 scroll_v_accum: 0,
                 scroll_h_accum: 0,
                 consumed_keys: HashSet::new(),
+                ctrl_arrows: CtrlArrows::default(),
+                system_shortcuts: None,
                 remapped_keys: HashSet::new(),
                 posted_keys: HashSet::new(),
                 left_click_remapped: false,
@@ -1313,6 +1407,8 @@ mod macos {
                 // key-down or a latch left by a Down whose Up never came.
                 self.remapped_keys.clear();
                 self.left_click_remapped = false;
+                self.ctrl_arrows = CtrlArrows::default();
+                self.system_shortcuts = None;
             }
 
             // Only bother macOS when a modifier was actually released: our
@@ -1401,6 +1497,8 @@ mod macos {
                 }
             }
             self.consumed_keys.clear();
+            self.ctrl_arrows = CtrlArrows::default();
+            self.system_shortcuts = None;
             self.click_left = None;
             self.click_right = None;
             self.click_middle = None;
@@ -1491,6 +1589,28 @@ mod macos {
                 "key post"
             );
 
+            // Mission Control and Spaces need System Events; ordinary
+            // synthesized CGEvents do not activate these macOS shortcuts.
+            if matches!(vk, 0x7B..=0x7E) {
+                let plain_ctrl = self.mods.has_ctrl()
+                    && !self.mods.has_shift()
+                    && !self.mods.has_alt()
+                    && !self.mods.has_cmd();
+                let already_handled =
+                    self.posted_keys.contains(&vk) || self.consumed_keys.contains(&vk);
+                match self
+                    .ctrl_arrows
+                    .event(vk, plain_ctrl, down, already_handled)
+                {
+                    CtrlArrowEvent::Invoke(action) => {
+                        self.dispatch_system_shortcut(Shortcut::ControlArrow(action));
+                        return;
+                    }
+                    CtrlArrowEvent::Consume => return,
+                    CtrlArrowEvent::Forward => {}
+                }
+            }
+
             // Symbolic-hotkey interception: WindowServer's internal hotkey
             // dispatcher (which fires Cmd+Tab, Cmd+Space, Cmd+Shift+3/4/5,
             // Mission Control, etc.) only triggers on kernel-injected HID
@@ -1500,6 +1620,9 @@ mod macos {
             // keystroke. Triggers on key-down; the matching key-up is
             // tracked in `consumed_keys` so the bare key-up doesn't reach
             // the focused app either.
+            if down && vk == VK_SPACE && self.consumed_keys.contains(&vk) {
+                return;
+            }
             if down && self.try_symbolic_hotkey(vk) {
                 self.consumed_keys.insert(vk);
                 return;
@@ -1726,7 +1849,26 @@ mod macos {
         /// Match the current modifier state + non-modifier vk against the
         /// set of symbolic hotkeys we re-implement. Returns true if we
         /// handled it (and the caller should suppress the keystroke).
-        fn try_symbolic_hotkey(&self, vk: u16) -> bool {
+        fn dispatch_system_shortcut(&mut self, shortcut: Shortcut) {
+            if self.system_shortcuts.is_none() {
+                match Dispatcher::start() {
+                    Ok(dispatcher) => self.system_shortcuts = Some(dispatcher),
+                    Err(error) => {
+                        warn!(%error, "System shortcut dispatcher could not start");
+                        match shortcut {
+                            Shortcut::ControlArrow(action) => invoke_ctrl_arrow(action),
+                            Shortcut::CommandSpace => invoke_spotlight(),
+                        }
+                        return;
+                    }
+                }
+            }
+            if let Some(dispatcher) = &self.system_shortcuts {
+                dispatcher.send(shortcut);
+            }
+        }
+
+        fn try_symbolic_hotkey(&mut self, vk: u16) -> bool {
             let f = self.mods.cg_flags();
             let cmd = f.contains(CGEventFlags::CGEventFlagCommand);
             let shift = f.contains(CGEventFlags::CGEventFlagShift);
@@ -1882,8 +2024,8 @@ mod macos {
                     cycle_apps(true);
                     true
                 }
-                (false, VK_SPACE) => {
-                    invoke_spotlight();
+                (false, VK_SPACE) if !self.posted_keys.contains(&vk) => {
+                    self.dispatch_system_shortcut(Shortcut::CommandSpace);
                     true
                 }
                 (true, VK_3) => {
@@ -4499,49 +4641,49 @@ mod macos {
         }
     }
 
+    fn invoke_ctrl_arrow(action: CtrlArrowAction) {
+        let keycode = action as u16;
+        run_system_events_key(
+            format!(
+                r#"tell application "System Events" to key code {keycode} using {{control down}}"#
+            ),
+            "Ctrl+Arrow",
+        );
+    }
+
     fn invoke_spotlight_via_osascript() {
-        debug!("invoke_spotlight: spawning osascript");
-        let script = r#"tell application "System Events" to key code 49 using {command down}"#;
-        let res = Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(script)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-        match res {
-            Ok(child) => {
-                let child_pid = child.id();
-                debug!(child_pid, "invoke_spotlight: osascript spawned");
-                // Reap on a background thread and log the exit status +
-                // any stderr so we can distinguish TCC denials, missing
-                // automation grants, etc. from a real launch.
-                std::thread::Builder::new()
-                    .name("invoke-spotlight-wait".into())
-                    .spawn(move || match child.wait_with_output() {
-                        Ok(out) => {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            debug!(
-                                child_pid,
-                                status = ?out.status,
-                                stdout = %stdout.trim(),
-                                stderr = %stderr.trim(),
-                                "invoke_spotlight: osascript exited"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                child_pid,
-                                error = %e,
-                                "invoke_spotlight: wait on osascript failed"
-                            );
-                        }
-                    })
-                    .ok();
-            }
-            Err(e) => {
-                warn!(error = %e, "invoke_spotlight: osascript spawn failed");
-            }
+        run_system_events_key(
+            r#"tell application "System Events" to key code 49 using {command down}"#.into(),
+            "Spotlight",
+        );
+    }
+
+    fn run_system_events_key(script: String, shortcut: &'static str) {
+        // The input handler holds its mutex here. Both launching osascript
+        // and waiting for it must happen off that path so Ctrl-up and later
+        // input can be handled while System Events is busy.
+        if let Err(error) = std::thread::Builder::new()
+            .name("system-shortcut".into())
+            .spawn(move || {
+                match Command::new("/usr/bin/osascript")
+                    .arg("-e")
+                    .arg(script)
+                    .stdout(std::process::Stdio::null())
+                    .output()
+                {
+                    Ok(out) if out.status.success() => {
+                        debug!(shortcut, "System Events shortcut sent")
+                    }
+                    Ok(out) => warn!(
+                        shortcut, status = ?out.status,
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "System Events shortcut failed"
+                    ),
+                    Err(error) => warn!(shortcut, %error, "System Events shortcut could not run"),
+                }
+            })
+        {
+            warn!(shortcut, %error, "System Events shortcut worker could not start");
         }
     }
 
@@ -4720,6 +4862,44 @@ mod macos {
     #[cfg(test)]
     mod modifier_state_tests {
         use super::*;
+
+        #[test]
+        fn ctrl_arrow_release_does_not_leave_either_control_key_held() {
+            for ctrl in [VK_LCTRL, VK_RCTRL] {
+                for release_ctrl_first in [true, false] {
+                    let mut mods = ModifierState::default();
+                    let mut arrows = CtrlArrows::default();
+                    assert!(mods.apply(ctrl, true));
+                    assert_eq!(
+                        arrows.event(VK_RIGHT, mods.has_ctrl(), true, false),
+                        CtrlArrowEvent::Invoke(CtrlArrowAction::NextSpace)
+                    );
+                    assert!(!mods.apply(ctrl, true));
+                    if release_ctrl_first {
+                        assert!(mods.apply(ctrl, false));
+                    }
+                    assert_eq!(
+                        arrows.event(VK_RIGHT, mods.has_ctrl(), false, false),
+                        CtrlArrowEvent::Consume
+                    );
+                    if !release_ctrl_first {
+                        assert!(mods.has_ctrl());
+                        assert!(mods.apply(ctrl, false));
+                    }
+                    assert_eq!(
+                        mods.cg_flags().bits()
+                            & (CGEventFlags::CGEventFlagControl.bits()
+                                | NX_DEVICE_L_CTRL
+                                | NX_DEVICE_R_CTRL),
+                        0
+                    );
+                    assert_eq!(
+                        arrows.event(VK_RIGHT, mods.has_ctrl(), true, false),
+                        CtrlArrowEvent::Forward
+                    );
+                }
+            }
+        }
 
         /// The stale-modifier resync must drop every HELD modifier but leave
         /// Caps Lock alone — it's a toggle reconciled by `synchronize()`, and

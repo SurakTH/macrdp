@@ -1,0 +1,281 @@
+//! Reuse the trusted System Events path without starting osascript for each tap.
+use super::CtrlArrowAction;
+use core_foundation::{
+    array::CFArray,
+    base::{CFType, CFTypeRef, TCFType},
+    boolean::CFBoolean,
+    dictionary::CFDictionary,
+    number::CFNumber,
+    string::{CFString, CFStringRef},
+};
+use std::{
+    io::{self, BufRead, BufReader, Write},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_QUEUE_AGE: Duration = Duration::from_secs(1);
+const COMPLETED: &str = "macrdp-shortcut-complete";
+const FAILED: &str = "macrdp-shortcut-error: ";
+
+pub(super) enum Shortcut {
+    ControlArrow(CtrlArrowAction),
+    CommandSpace,
+}
+
+pub(super) struct Dispatcher {
+    request: SyncSender<(Shortcut, Instant)>,
+    closed: Arc<AtomicBool>,
+}
+
+impl Dispatcher {
+    pub(super) fn start() -> io::Result<Self> {
+        let (request, pending) = mpsc::sync_channel(8);
+        let closed = Arc::new(AtomicBool::new(false));
+        let worker_closed = closed.clone();
+        thread::Builder::new()
+            .name("macrdp-system-shortcuts".into())
+            .spawn(move || dispatch(pending, &worker_closed))?;
+        Ok(Self { request, closed })
+    }
+
+    pub(super) fn send(&self, shortcut: Shortcut) {
+        if let Err(error) = self.request.try_send((shortcut, Instant::now())) {
+            tracing::debug!(%error, "System shortcut queue busy");
+        }
+    }
+}
+
+impl Drop for Dispatcher {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
+    let mut process = None;
+    let mut reuse_failed = false;
+    loop {
+        let (shortcut, queued) = match pending.recv_timeout(IDLE_TIMEOUT) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                process = None;
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if closed.load(Ordering::Acquire) {
+            break;
+        }
+        if queued.elapsed() > MAX_QUEUE_AGE {
+            continue;
+        }
+
+        let (keycode, modifier, label) = match shortcut {
+            Shortcut::ControlArrow(action) => (action as u16, "control", "Ctrl+Arrow"),
+            Shortcut::CommandSpace if cmd_space_selects_input_source() => {
+                (49, "command", "Cmd+Space")
+            }
+            Shortcut::CommandSpace => {
+                objc2::rc::autoreleasepool(|_| super::invoke_spotlight());
+                continue;
+            }
+        };
+        let script = format!(
+            r#"tell application "System Events" to key code {keycode} using {{{modifier} down}}"#
+        );
+        if reuse_failed {
+            super::run_system_events_key(script, label);
+            continue;
+        }
+
+        // A known-dead child has received no new command and can be replaced.
+        if process
+            .as_mut()
+            .is_some_and(|p: &mut ScriptProcess| !p.running())
+        {
+            process = None;
+        }
+        if process.is_none() {
+            match ScriptProcess::start() {
+                Ok(child) => process = Some(child),
+                Err(error) => {
+                    tracing::debug!(%error, "Reusable System Events helper unavailable");
+                    reuse_failed = true;
+                    super::run_system_events_key(script, label);
+                    continue;
+                }
+            }
+        }
+        if let Some(child) = process.as_mut() {
+            if let Err(error) = child.run(&script) {
+                // After writing, the action may already have happened. Never
+                // replay it, which could toggle the language or Space twice.
+                tracing::warn!(shortcut = label, %error, "System Events shortcut failed");
+                process = None;
+                reuse_failed = true;
+            }
+        }
+    }
+}
+
+struct ScriptProcess {
+    child: Child,
+    input: ChildStdin,
+    reply: Receiver<Result<(), String>>,
+}
+
+impl ScriptProcess {
+    fn start() -> io::Result<Self> {
+        let mut child = Command::new("/usr/bin/osascript")
+            .arg("-i")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let input = child.stdin.take().expect("piped stdin");
+        let errors = child.stderr.take().expect("piped stderr");
+        let (completed, reply) = mpsc::sync_channel(1);
+        if let Err(error) = thread::Builder::new()
+            .name("macrdp-system-shortcut-replies".into())
+            .spawn(move || {
+                for line in BufReader::new(errors).lines().map_while(Result::ok) {
+                    let line = line.trim();
+                    let result = if line == COMPLETED {
+                        Some(Ok(()))
+                    } else {
+                        line.strip_prefix(FAILED)
+                            .map(|message| Err(message.to_owned()))
+                    };
+                    if let Some(result) = result {
+                        if completed.send(result).is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(Self {
+            child,
+            input,
+            reply,
+        })
+    }
+
+    fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn run(&mut self, script: &str) -> Result<(), String> {
+        // Interactive results and uncaught script errors go to buffered
+        // stdout. Log exactly one explicit result to stderr instead.
+        writeln!(
+            self.input,
+            "try\n{script}\nlog \"{COMPLETED}\"\non error detail\nlog (\"{FAILED}\" & detail)\nend try"
+        )
+        .map_err(|error| error.to_string())?;
+        self.reply
+            .recv_timeout(REPLY_TIMEOUT)
+            .map_err(|error| error.to_string())?
+    }
+}
+
+impl Drop for ScriptProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFPreferencesCopyAppValue(key: CFStringRef, app: CFStringRef) -> CFTypeRef;
+}
+
+fn cmd_space_selects_input_source() -> bool {
+    let key = CFString::from_static_string("AppleSymbolicHotKeys");
+    let app = CFString::from_static_string("com.apple.symbolichotkeys");
+    // SAFETY: The Copy API returns an owned property list or null.
+    let bindings = unsafe {
+        let value = CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), app.as_concrete_TypeRef());
+        if value.is_null() {
+            return false;
+        }
+        CFType::wrap_under_create_rule(value).downcast_into::<CFDictionary>()
+    };
+    bindings.is_some_and(|list| {
+        ["60", "61"]
+            .iter()
+            .any(|id| is_cmd_space(&list, id) == Some(true))
+    })
+}
+
+fn property(dict: &CFDictionary, key: &str) -> Option<CFType> {
+    let key = CFString::new(key);
+    let value = *dict.find(key.as_CFTypeRef())?;
+    // SAFETY: The property-list dictionary holds a Core Foundation object.
+    Some(unsafe { CFType::wrap_under_get_rule(value) })
+}
+
+fn is_cmd_space(bindings: &CFDictionary, id: &str) -> Option<bool> {
+    let entry = property(bindings, id)?.downcast_into::<CFDictionary>()?;
+    let enabled = bool::from(property(&entry, "enabled")?.downcast_into::<CFBoolean>()?);
+    let value = property(&entry, "value")?.downcast_into::<CFDictionary>()?;
+    let parameters = property(&value, "parameters")?.downcast_into::<CFArray>()?;
+    let number = |index| {
+        let value = *parameters.get(index)?;
+        // SAFETY: The array retains this property-list object.
+        unsafe { CFType::wrap_under_get_rule(value) }
+            .downcast_into::<CFNumber>()?
+            .to_i32()
+    };
+    // These are the two input-source entries. Match a plain Command+Space
+    // binding only; custom chords and disabled entries keep their old route.
+    Some(enabled && number(1)? == 49 && number(2)? == 1 << 20)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_worker_reuses_process_after_multiple_requests() {
+        let mut process = ScriptProcess::start().unwrap();
+        let pid = process.child.id();
+        process.run("set fixture to 1 + 1").unwrap();
+        assert!(process.run("error \"test error\"").is_err());
+        process.run("set fixture to 2 + 2").unwrap();
+        assert_eq!(process.child.id(), pid);
+    }
+
+    #[test]
+    fn only_an_enabled_plain_cmd_space_binding_switches_input_source() {
+        use core_foundation::{data::CFData, propertylist};
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>60</key><dict><key>enabled</key><true/><key>value</key><dict><key>parameters</key><array><integer>32</integer><integer>49</integer><integer>1048576</integer></array></dict></dict>
+<key>61</key><dict><key>enabled</key><false/><key>value</key><dict><key>parameters</key><array><integer>32</integer><integer>49</integer><integer>1048576</integer></array></dict></dict>
+<key>62</key><dict><key>enabled</key><true/><key>value</key><dict><key>parameters</key><array><integer>32</integer><integer>49</integer><integer>1179648</integer></array></dict></dict>
+</dict></plist>"#;
+        let (value, _) = propertylist::create_with_data(CFData::from_buffer(xml), 0).unwrap();
+        let list = unsafe { CFType::wrap_under_create_rule(value) }
+            .downcast_into::<CFDictionary>()
+            .unwrap();
+        assert_eq!(is_cmd_space(&list, "60"), Some(true));
+        assert_eq!(is_cmd_space(&list, "61"), Some(false));
+        assert_eq!(is_cmd_space(&list, "62"), Some(false));
+        assert_eq!(is_cmd_space(&list, "missing"), None);
+    }
+}

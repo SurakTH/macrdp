@@ -3,6 +3,28 @@ import Foundation
 /// Merge only edited settings into the latest file, then replace it atomically.
 /// Comments and settings owned by other tools survive a GUI Apply.
 public enum ConfigurationFile {
+    public static func parse(_ text: String) -> [String: String] {
+        var settings: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard let (key, rawValue) = assignment(in: String(line)) else { continue }
+            var value = rawValue
+            if value.count >= 2, let quote = value.first,
+               (quote == "\"" || quote == "'"), value.last == quote {
+                value = String(value.dropFirst().dropLast())
+            }
+            settings[key] = value
+        }
+        return settings
+    }
+
+    private static func assignment(in raw: String) -> (key: String, value: String)? {
+        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { return nil }
+        let rawKey = line[..<eq]
+        let key = rawKey.hasPrefix("export ") ? rawKey.dropFirst(7) : rawKey
+        return (key.trimmingCharacters(in: .whitespaces), line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces))
+    }
+
     public static func save(changes: [String: String], to url: URL) throws {
         let text = try String(contentsOf: url, encoding: .utf8)
         let updated = try merging(changes: changes, into: text)
@@ -21,14 +43,13 @@ public enum ConfigurationFile {
         var remaining = changes
         var lines: [String] = []
         for raw in text.components(separatedBy: "\n") {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") {
-                let key = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
+            if let (key, _) = assignment(in: raw) {
                 if let value = changes[key] {
                     // Collapse duplicate edited keys so the last occurrence
                     // cannot silently override the user's selection.
                     if remaining.removeValue(forKey: key) != nil {
-                        lines.append("\(key)=\(value)")
+                        let prefix = raw.trimmingCharacters(in: .whitespaces).hasPrefix("export ") ? "export " : ""
+                        lines.append("\(prefix)\(key)=\(value)")
                     }
                     continue
                 }

@@ -445,6 +445,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         locateServerApp()?.appendingPathComponent("Contents/Resources/macrdp-mic.driver").path
     }
 
+    var hasBundledMicInstaller: Bool {
+        guard let app = locateServerApp(),
+              let driver = bundledMicDriverPath(), micDriverBuild(at: driver) != nil else { return false }
+        return FileManager.default.isExecutableFile(atPath: app.appendingPathComponent(
+            "Contents/Resources/install-audio-plugin.sh").path)
+    }
+
     /// Whether the driver is installed, and whether macrdp.app bundles a newer one.
     func micDriverStatus() -> MicDriverStatus {
         guard let installed = micDriverBuild(at: Self.micDriverInstalledPath) else { return .notInstalled }
@@ -1043,17 +1050,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func readConfig() -> [String: String] {
         guard let text = try? String(contentsOf: configURL, encoding: .utf8) else { return [:] }
-        var d: [String: String] = [:]
-        for raw in text.split(separator: "\n") {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty || line.hasPrefix("#") { continue }
-            guard let eq = line.firstIndex(of: "=") else { continue }
-            let k = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
-            var v = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-            v = v.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            d[k] = v
-        }
-        return d
+        return ConfigurationFile.parse(text)
     }
 
     func saveConfig(changes: [String: String]) throws {

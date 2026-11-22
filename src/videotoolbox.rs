@@ -126,15 +126,14 @@ pub struct Encoder {
     /// blacks there. FreeRDP honors the range flag so it stays correct either
     /// way. Opt back out to video-range with `MACRDP_H264_FULL_RANGE=0`.
     full_range: bool,
-    /// The periodic keyframe interval in frames, enforced HERE by
-    /// [`Encoder::encode_bgra`], not by VideoToolbox (see [`VT_KEYFRAME_BACKSTOP`]).
+    /// Periodic keyframe interval shared by the BGRA and NV12 input paths.
     keyframe_interval: u32,
     /// Frames encoded since the last keyframe, counting that keyframe.
     frames_since_keyframe: u32,
 }
 
 /// The `MaxKeyFrameInterval` handed to VideoToolbox at session creation: high
-/// enough never to fire, so [`Encoder::encode_bgra`] alone schedules the
+/// enough never to fire, so [`Encoder`] alone schedules the
 /// periodic keyframes. VideoToolbox fixes the interval when the session is
 /// created and silently ignores later changes: measured 2026-11-13, a session
 /// made with a 6-frame interval still emitted a keyframe every 6 frames after
@@ -323,6 +322,7 @@ impl Encoder {
         let session = ffi::create_session(
             width,
             height,
+            fps,
             bitrate_bps,
             VT_KEYFRAME_BACKSTOP,
             tx_ptr,
@@ -369,6 +369,19 @@ impl Encoder {
         self.keyframe_interval = keyframe_frames.max(1);
     }
 
+    fn should_force_keyframe(&self, requested: bool) -> bool {
+        requested || keyframe_due(self.frames_since_keyframe, self.keyframe_interval)
+    }
+
+    fn record_submission(&mut self, keyframe: bool) {
+        self.next_pts = self.next_pts.wrapping_add(1);
+        self.frames_since_keyframe = if keyframe {
+            1
+        } else {
+            self.frames_since_keyframe.saturating_add(1)
+        };
+    }
+
     /// Submit a BGRA frame for encoding. `stride` is in bytes per row
     /// of the source buffer — VideoToolbox is told the source pixel
     /// format is `kCVPixelFormatType_32BGRA`, so each pixel is 4 bytes
@@ -397,26 +410,20 @@ impl Encoder {
                 self.height
             );
         }
-        let pts = self.next_pts;
-        self.next_pts = self.next_pts.wrapping_add(1);
-        let due = keyframe_due(self.frames_since_keyframe, self.keyframe_interval);
-        let force_keyframe = force_keyframe || due;
-        self.frames_since_keyframe = if force_keyframe {
-            1
-        } else {
-            self.frames_since_keyframe.saturating_add(1)
-        };
+        let force_keyframe = self.should_force_keyframe(force_keyframe);
         ffi::encode_frame(
             &self.inner,
             bgra,
             self.width,
             self.height,
             stride,
-            pts,
+            self.next_pts,
             self.fps,
             force_keyframe,
             self.full_range,
-        )
+        )?;
+        self.record_submission(force_keyframe);
+        Ok(())
     }
 
     /// Submit a capture-owned full-range NV12 (`420f`) pixel buffer for
@@ -450,9 +457,16 @@ impl Encoder {
         if fmt != ffi::K_CV_PIXEL_FORMAT_TYPE_420F {
             bail!("pixel buffer format {fmt:#010x} is not full-range NV12 ('420f')");
         }
-        let pts = self.next_pts;
-        self.next_pts = self.next_pts.wrapping_add(1);
-        ffi::submit_to_vt(&self.inner, pixel_buffer, pts, self.fps, force_keyframe)
+        let force_keyframe = self.should_force_keyframe(force_keyframe);
+        ffi::submit_to_vt(
+            &self.inner,
+            pixel_buffer,
+            self.next_pts,
+            self.fps,
+            force_keyframe,
+        )?;
+        self.record_submission(force_keyframe);
+        Ok(())
     }
 
     /// Submit planar YUV420 with an explicit PTS. AVC444 uses this to label
@@ -771,6 +785,7 @@ mod ffi {
         // Constant string handles for VT property keys + profile levels.
         // These are global symbols, dereferenced for the actual CFStringRef.
         pub(super) static kVTCompressionPropertyKey_RealTime: CFStringRef;
+        pub(super) static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
@@ -947,6 +962,7 @@ mod ffi {
     pub(super) fn create_session(
         width: u16,
         height: u16,
+        fps: u32,
         bitrate_bps: u32,
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
@@ -1049,6 +1065,13 @@ mod ffi {
         // does not tolerate B-frames or reorder delay.
         unsafe {
             set_bool(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)?;
+            // Let the encoder configure its real-time engine for the PTS
+            // cadence before the first frame. Capture still controls pacing.
+            let _ = set_i32(
+                session,
+                kVTCompressionPropertyKey_ExpectedFrameRate,
+                fps.min(i32::MAX as u32) as i32,
+            );
             set_bool(
                 session,
                 kVTCompressionPropertyKey_AllowFrameReordering,
@@ -1100,10 +1123,10 @@ mod ffi {
             // that "heals on redraw / after a while". An IDR does cost a brief
             // hitch (a large intra frame can trip EGFX backpressure), so lower =
             // faster recovery, higher = smoother typing. The session's first
-            // keyframe is still forced explicitly in encode_bgra(); this governs
+            // keyframe is still forced explicitly by Encoder; this governs
             // only the periodic safety net. (Was fps*30 ≈ 30s, which let mstsc
             // corruption persist for half a minute.) Since 2026-11-13 the caller
-            // passes VT_KEYFRAME_BACKSTOP here and Encoder::encode_bgra schedules
+            // passes VT_KEYFRAME_BACKSTOP here and Encoder schedules
             // the periodic keyframe itself, because VideoToolbox ignores a later
             // change to this property. The interval comes from --keyframe-interval
             // (seconds), already converted to a frame count by the caller.
@@ -1654,7 +1677,7 @@ mod ffi {
         Ok(())
     }
 
-    fn frame_buffer(
+    pub(super) fn frame_buffer(
         guard: &SessionGuard,
         width: u16,
         height: u16,
@@ -2613,9 +2636,67 @@ mod tests {
 }
 
 #[cfg(test)]
+fn prepared_nv12(encoder: &Encoder, bgra: &[u8]) -> Result<screencapturekit::cv::CVPixelBuffer> {
+    use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
+
+    let width = usize::from(encoder.width);
+    let height = usize::from(encoder.height);
+    let buffer = ffi::frame_buffer(
+        &encoder.inner,
+        encoder.width,
+        encoder.height,
+        ffi::K_CV_PIXEL_FORMAT_TYPE_420F,
+    )?;
+    // Adopt the +1 reference returned by the pool or Core Video allocation.
+    let buffer = CVPixelBuffer::from_raw(buffer.cast_mut()).expect("non-null CVPixelBuffer");
+    let mut lock = buffer
+        .lock(CVPixelBufferLockFlags::NONE)
+        .map_err(|error| anyhow!("locking NV12 fixture: {error}"))?;
+    let y_stride = lock.bytes_per_row_of_plane(0);
+    let uv_stride = lock.bytes_per_row_of_plane(1);
+    let y = lock.base_address_of_plane_mut(0).expect("Y plane");
+    let uv = lock.base_address_of_plane_mut(1).expect("UV plane");
+    // SAFETY: the read/write lock holds two separate planes for these sizes.
+    let y_plane = unsafe { std::slice::from_raw_parts_mut(y, y_stride * height) };
+    let uv_plane = unsafe { std::slice::from_raw_parts_mut(uv, uv_stride * (height / 2)) };
+    ffi::bgra_to_nv12_full_range_vimage(
+        bgra,
+        width * 4,
+        width,
+        height,
+        y_plane,
+        y_stride,
+        uv_plane,
+        uv_stride,
+    )?;
+    drop(lock);
+    Ok(buffer)
+}
+
+#[cfg(test)]
 mod version_comparison {
-    use super::{EncodeOutput, Encoder};
+    use super::{prepared_nv12, EncodeOutput, Encoder};
+    use std::collections::VecDeque;
     use std::time::{Duration, Instant};
+
+    fn motion_fixture(width: usize, height: usize) -> Vec<Vec<u8>> {
+        (0..4)
+            .map(|phase| {
+                let mut frame = vec![0; width * height * 4];
+                for (index, pixel) in frame.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let x = index % width;
+                    let y = index / width + phase * 13;
+                    pixel.copy_from_slice(&[
+                        (x ^ y) as u8,
+                        (x + y / 4) as u8,
+                        ((x / 16 + y / 12) % 2 * 200) as u8,
+                        255,
+                    ]);
+                }
+                frame
+            })
+            .collect()
+    }
 
     // Identical workload for the baseline and the integration candidate.
     // Measures the CPU/VideoToolbox path without the RDP transport or a client.
@@ -2627,42 +2708,152 @@ mod version_comparison {
         for (width, height, bitrate) in [(1920_u16, 1080_u16, 35_000_000), (3840, 2160, 60_000_000)]
         {
             let stride = usize::from(width) * 4;
-            let frames: Vec<_> = (0..4)
-                .map(|phase| {
-                    let mut bytes = vec![0; stride * usize::from(height)];
-                    for (index, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                        let x = index % usize::from(width);
-                        let y = index / usize::from(width) + phase * 13;
-                        pixel.copy_from_slice(&[
-                            (x ^ y) as u8,
-                            (x + y / 4) as u8,
-                            ((x / 16 + y / 12) % 2 * 200) as u8,
-                            255,
-                        ]);
+            let frames = motion_fixture(width.into(), height.into());
+            for direct_nv12 in [false, true] {
+                let mut encoder = Encoder::new(width, height, 60, bitrate, 2.0)?;
+                // Prepare the same pixels outside the timer, as ScreenCaptureKit
+                // does for direct NV12 input in a desktop session.
+                let nv12_frames = if direct_nv12 {
+                    frames
+                        .iter()
+                        .map(|frame| prepared_nv12(&encoder, frame))
+                        .collect::<anyhow::Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
+                let outputs = encoder.take_receiver().expect("encoder output receiver");
+                let mut times = Vec::with_capacity(FRAMES);
+                let mut pictures = 0;
+                for index in 0..(WARMUP + FRAMES) {
+                    let frame_index = index % frames.len();
+                    let started = Instant::now();
+                    if direct_nv12 {
+                        encoder.encode_pixel_buffer(&nv12_frames[frame_index], false)?;
+                    } else {
+                        encoder.encode_bgra(&frames[frame_index], stride, false)?;
                     }
-                    bytes
-                })
-                .collect();
-            let mut encoder = Encoder::new(width, height, 60, bitrate, 2.0)?;
-            let outputs = encoder.take_receiver().expect("encoder output receiver");
-            let mut times = Vec::with_capacity(FRAMES);
-            let mut pictures = 0;
-            for index in 0..(WARMUP + FRAMES) {
-                let started = Instant::now();
-                encoder.encode_bgra(&frames[index % frames.len()], stride, index == 0)?;
-                let outcome = outputs.recv_timeout(Duration::from_secs(3))?;
-                if index >= WARMUP {
-                    times.push(started.elapsed().as_secs_f64() * 1_000.0);
-                    pictures += usize::from(matches!(outcome, EncodeOutput::Picture(_)));
+                    let outcome = outputs.recv_timeout(Duration::from_secs(3))?;
+                    if index >= WARMUP {
+                        times.push(started.elapsed().as_secs_f64() * 1_000.0);
+                        pictures += usize::from(matches!(outcome, EncodeOutput::Picture(_)));
+                    }
+                }
+                times.sort_by(f64::total_cmp);
+                let input = if direct_nv12 { "NV12" } else { "BGRA" };
+                println!(
+                    "AVC420 {input} {width}x{height}: {pictures}/{FRAMES} pictures, median {:.2} ms, p95 {:.2} ms",
+                    times[FRAMES / 2],
+                    times[(FRAMES * 95).div_ceil(100) - 1],
+                );
+                assert_eq!(pictures, FRAMES, "the hardware encoder dropped pictures");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nv12_honors_periodic_and_forced_keyframes() -> anyhow::Result<()> {
+        let mut encoder = Encoder::new(320, 240, 30, 2_000_000, 0.1)?;
+        let frame = prepared_nv12(&encoder, &vec![90; 320 * 240 * 4])?;
+        let mut keyframes = Vec::new();
+        for index in 0..13 {
+            if index == 5 {
+                encoder.set_keyframe_interval(100);
+            }
+            if index == 9 {
+                encoder.set_keyframe_interval(2);
+            }
+            encoder.encode_pixel_buffer(&frame, index == 7)?;
+            for output in encoder.flush()? {
+                if output.is_keyframe {
+                    keyframes.push(output.pts);
                 }
             }
-            times.sort_by(f64::total_cmp);
+        }
+        assert_eq!(keyframes, [0, 3, 7, 9, 11]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the macOS hardware encoder; run in release mode"]
+    fn bench_4k_at_60hz_with_bounded_encoder_queue() -> anyhow::Result<()> {
+        const WIDTH: usize = 3840;
+        const HEIGHT: usize = 2160;
+        const CAPTURES: u32 = 180;
+        const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+        let frames = motion_fixture(WIDTH, HEIGHT);
+
+        for (direct_nv12, depth) in [(false, 1), (true, 1), (true, 2), (true, 3)] {
+            let mut encoder = Encoder::new(WIDTH as u16, HEIGHT as u16, 60, 60_000_000, 2.0)?;
+            let nv12 = if direct_nv12 {
+                frames
+                    .iter()
+                    .map(|frame| prepared_nv12(&encoder, frame))
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            let submit = |encoder: &mut Encoder, index: usize| {
+                if direct_nv12 {
+                    encoder.encode_pixel_buffer(&nv12[index], false)
+                } else {
+                    encoder.encode_bgra(&frames[index], WIDTH * 4, false)
+                }
+            };
+            submit(&mut encoder, 0)?;
+            anyhow::ensure!(encoder.flush()?.len() == 1, "warmup picture missing");
+            let outputs = encoder.take_receiver().expect("encoder output receiver");
+            let start = Instant::now();
+            let mut in_flight = VecDeque::<Instant>::new();
+            let mut latency = Vec::new();
+            let mut skips = 0;
+            let mut drops = 0;
+            for tick in 0..CAPTURES {
+                let capture_at = start + TICK * tick;
+                while !in_flight.is_empty() {
+                    match outputs.recv_timeout(capture_at.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(outcome) => {
+                            let submitted_at = in_flight.pop_front().unwrap();
+                            match outcome {
+                                EncodeOutput::Picture(_) => {
+                                    latency.push(submitted_at.elapsed().as_secs_f64() * 1_000.0);
+                                }
+                                EncodeOutput::Dropped { .. } => drops += 1,
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                std::thread::sleep(capture_at.saturating_duration_since(Instant::now()));
+                if in_flight.len() < depth {
+                    in_flight.push_back(Instant::now());
+                    submit(&mut encoder, tick as usize % frames.len())?;
+                } else {
+                    skips += 1;
+                }
+            }
+            while let Some(submitted_at) = in_flight.pop_front() {
+                match outputs.recv_timeout(Duration::from_secs(3))? {
+                    EncodeOutput::Picture(_) => {
+                        latency.push(submitted_at.elapsed().as_secs_f64() * 1_000.0);
+                    }
+                    EncodeOutput::Dropped { .. } => drops += 1,
+                }
+            }
+            anyhow::ensure!(!latency.is_empty(), "no pictures encoded");
+            latency.sort_by(f64::total_cmp);
+            let p95 = latency[(latency.len() * 95).div_ceil(100) - 1];
+            let input = if direct_nv12 { "NV12" } else { "BGRA" };
             println!(
-                "AVC420 {width}x{height} at 60 FPS configuration: {pictures}/{FRAMES} pictures, median {:.2} ms, p95 {:.2} ms",
-                times[FRAMES / 2],
-                times[(FRAMES * 95).div_ceil(100) - 1],
+                "4K60 {input}, depth {depth}: {}/{} pictures ({:.1} fps), {skips} capture skips, {drops} encoder drops, p95 {p95:.2} ms",
+                latency.len(),
+                CAPTURES,
+                latency.len() as f64 / (CAPTURES * TICK).as_secs_f64(),
             );
-            assert_eq!(pictures, FRAMES, "the hardware encoder dropped pictures");
+            assert_eq!(latency.len() as u32 + skips + drops, CAPTURES);
         }
         Ok(())
     }

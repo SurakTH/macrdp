@@ -8,7 +8,7 @@ import SwiftUI
 /// Network exposure is deliberately not part of a performance profile; the
 /// user enables LAN access separately and sees the existing security warning.
 enum PerformanceProfile: String, CaseIterable, Identifiable {
-    case stable, ultimate, lan, native, fast
+    case stable, ultimate, lan, native, fast, fourK
 
     var id: String { rawValue }
 
@@ -19,6 +19,7 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
         case .lan: return "LAN Max"
         case .native: return "Native"
         case .fast: return "Fast"
+        case .fourK: return "4K/60 Preview"
         }
     }
 
@@ -34,6 +35,8 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             return "Sharpest text and UI: HiDPI bitmap/RemoteFX at a stable 12 FPS."
         case .fast:
             return "Lowest latency: AVC420 at 60 FPS, 50 Mbps and a minimal one-frame pipeline."
+        case .fourK:
+            return "4K at up to 60 FPS with NV12 capture, 60 Mbps adaptive, and TCP. Virtual displays use their own resolution or the client's request."
         }
     }
 
@@ -51,7 +54,9 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             "FLUSH_FRAMES": "4",
             "FLUSH_INTERVAL_MS": "",
             "RESPONSIVE_CAPTURE": "0",
-            "TCP_VIDEO_BACKPRESSURE": "0",
+            "H264_MAX_UNACKED_FRAMES": "0",
+            "CAPTURE_NV12": "0",
+            "ENABLE_LOSSY_AUDIO": "0",
             "STATS_ENDPOINT": "1",
         ]
         switch self {
@@ -97,18 +102,47 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
                 "H264_FRAMES_IN_FLIGHT": "1", "UNMINIMIZE": "0",
                 "BLANK_RECOVERY": "0",
             ]) { _, new in new }
+        case .fourK:
+            values.merge([
+                "ENABLE_H264": "1", "HIDPI": "0", "CAPTURE_SIZE": "3840x2160",
+                "ENABLE_AAC": "0", "ADAPTIVE_BITRATE": "1", "ENABLE_UDP_MULTITRANSPORT": "0",
+                "BITRATE": "60", "FPS": "60", "KEYFRAME_ON_CHANGE": "0",
+                "H264_FRAMES_IN_FLIGHT": "2", "FLUSH_FRAMES": "2",
+                "RESPONSIVE_CAPTURE": "1", "CAPTURE_NV12": "1",
+                "UNMINIMIZE": "0", "BLANK_RECOVERY": "0",
+            ]) { _, new in new }
         }
         return values
     }
 
     func matches(_ config: [String: String]) -> Bool {
         settings.allSatisfy { key, value in
-            config[key, default: Self.settingFallback(key)] == value
+            if key == "H264_MAX_UNACKED_FRAMES" {
+                return UInt32(SettingsModel.pacingLimit(in: config)) == UInt32(value)
+            }
+            if key == "CAPTURE_NV12" || key == "ENABLE_LOSSY_AUDIO" {
+                return SettingsModel.settingEnabled(key, in: config) == (value == "1")
+            }
+            return config[key, default: Self.settingFallback(key)] == value
         }
     }
 
     static func settingFallback(_ key: String) -> String {
-        ["RESPONSIVE_CAPTURE", "TCP_VIDEO_BACKPRESSURE"].contains(key) ? "0" : ""
+        key == "RESPONSIVE_CAPTURE" ? "0" : ""
+    }
+}
+
+enum VirtualDisplayScaling: String, CaseIterable {
+    case standard = "0"
+    case retina = "1"
+    case automatic = "auto"
+
+    var title: String {
+        switch self {
+        case .standard: return "Standard (1×)"
+        case .retina: return "Retina (2×)"
+        case .automatic: return "Automatic · follow client"
+        }
     }
 }
 
@@ -225,6 +259,9 @@ final class SettingsModel: ObservableObject {
         if !interval.isEmpty, UInt64(interval).map({ (8...1000).contains($0) }) != true {
             return "Fast-flush interval must be a whole number from 8 to 1000 ms."
         }
+        if UInt32(tcpPacingLimit) == nil {
+            return "TCP frame limit must be a whole number from 0 to 4294967295. Use 0 to turn pacing off."
+        }
         if !bool("VIRTUAL_DISPLAY"), let size = draft["CAPTURE_SIZE"], !size.isEmpty,
            !Self.validCaptureSize(size) {
             return "Resolution must use even dimensions from 200 to 8192, e.g. 2560x1440."
@@ -314,14 +351,40 @@ final class SettingsModel: ObservableObject {
 
     // MARK: - Typed value access + SwiftUI bindings
 
+    private static let managedSwitches = [
+        "CAPTURE_NV12": "--capture-nv12",
+        "ALT_BACKTICK_SWITCH": "--alt-backtick-switch",
+        "ALT_SPACE_SPOTLIGHT": "--alt-space-spotlight",
+        "ALT_Q_QUIT": "--alt-q-quit",
+        "REVERSE_SCROLL": "--reverse-scroll",
+        "ENABLE_LOSSY_AUDIO": "--enable-lossy-audio",
+        "ENABLE_MICROPHONE_REDIRECTION": "--enable-microphone-redirection",
+        "NETWORK_AUTODETECT": "--network-autodetect",
+        "RICH_CLIPBOARD": "--no-rich-clipboard",
+    ]
+
+    static func settingEnabled(_ key: String, in config: [String: String], default def: Bool = false) -> Bool {
+        if let value = config[key] { return value == "1" }
+        guard let flag = managedSwitches[key] else { return def }
+        let hasFlag = (config["EXTRA_FLAGS"] ?? "").split(whereSeparator: { $0.isWhitespace }).contains { $0 == flag }
+        return key == "RICH_CLIPBOARD" ? !hasFlag : hasFlag
+    }
+
     func bool(_ key: String, default def: Bool = false) -> Bool {
-        (draft[key] ?? (def ? "1" : "0")) == "1"
+        Self.settingEnabled(key, in: draft, default: def)
     }
 
     func string(_ key: String, default def: String = "") -> String { draft[key] ?? def }
 
     func setBool(_ key: String, _ value: Bool) {
         draft[key] = value ? "1" : "0"
+        if let flag = Self.managedSwitches[key] {
+            let extra = string("EXTRA_FLAGS")
+            let cleaned = extra.split(whereSeparator: { $0.isWhitespace })
+                .filter { $0 != flag && !$0.hasPrefix(flag + "=") }
+                .joined(separator: " ")
+            if cleaned != extra { draft["EXTRA_FLAGS"] = cleaned }
+        }
         // Honor the control the user touched: disabling H.264 must not be
         // undone by the dependent UDP-video setting during normalization.
         if key == "ENABLE_H264", !value {
@@ -450,6 +513,8 @@ final class SettingsModel: ObservableObject {
         values["BITRATE"] = bitrateMbps
         values["H264_FRAMES_IN_FLIGHT"] = encoderQueueDepth
         values["FLUSH_INTERVAL_MS"] = fastFlushInterval
+        values["H264_MAX_UNACKED_FRAMES"] = tcpPacingLimit
+        for key in Self.presetSwitches { values[key] = bool(key) ? "1" : "0" }
         let id = replace ? personalPresetID! : UUID()
         let preset = PersonalPreset(id: id,
             name: personalPresetName.trimmingCharacters(in: .whitespacesAndNewlines), settings: values)
@@ -489,11 +554,18 @@ final class SettingsModel: ObservableObject {
         guard let preset = selectedPersonalPreset else { return }
         customCaptureSelected = false
         fastFlushSelected = false
-        for key in PersonalPreset.allowedKeys { draft[key] = preset.settings[key] ?? PerformanceProfile.settingFallback(key) }
+        for key in PersonalPreset.allowedKeys.subtracting(Self.presetSwitches)
+            .subtracting(["H264_MAX_UNACKED_FRAMES", "TCP_VIDEO_BACKPRESSURE"]) {
+            draft[key] = preset.settings[key] ?? PerformanceProfile.settingFallback(key)
+        }
+        for key in Self.presetSwitches {
+            if let value = preset.settings[key] { draft[key] = value }
+        }
+        setTCPPacingLimit(Self.pacingLimit(in: preset.settings))
         setFrameRate(preset.settings["FPS"] ?? "")
         setBitrate(preset.settings["BITRATE"] ?? "")
         setEncoderQueueDepth(preset.settings["H264_FRAMES_IN_FLIGHT"] ?? "")
-        cleanExtraFlags(["--flush-interval-ms", "--width", "--height", "--hidpi", "--no-client-resolution"])
+        clearLegacyVideoProfileFlags()
         normalize()
         presetError = nil
         presetMessage = "Preset loaded into draft. Review settings, then Apply."
@@ -501,17 +573,59 @@ final class SettingsModel: ObservableObject {
 
     // MARK: - Performance profiles
 
+    private static let presetSwitches = [
+        "CAPTURE_NV12", "REVERSE_SCROLL", "ALT_Q_QUIT", "ALT_BACKTICK_SWITCH",
+        "ALT_SPACE_SPOTLIGHT", "ENABLE_LOSSY_AUDIO",
+    ]
+
     func applyProfile(_ profile: PerformanceProfile) {
         customCaptureSelected = false
         fastFlushSelected = false
         for (key, value) in profile.settings { draft[key] = value }
+        setTCPPacingLimit(profile.settings["H264_MAX_UNACKED_FRAMES"] ?? "0")
         if let depth = profile.settings["H264_FRAMES_IN_FLIGHT"] { setEncoderQueueDepth(depth) }
         if let fps = profile.settings["FPS"] { setFrameRate(fps) }
         if let bitrate = profile.settings["BITRATE"], !bitrate.isEmpty {
             setBitrate(bitrate)
         }
-        cleanExtraFlags(["--flush-interval-ms", "--width", "--height", "--hidpi", "--no-client-resolution"])
+        clearLegacyVideoProfileFlags()
         normalize()
+    }
+
+    private func clearLegacyVideoProfileFlags() {
+        cleanExtraFlags([
+            "--flush-interval-ms", "--width", "--height", "--hidpi", "--no-client-resolution",
+            "--enable-h264", "--avc444", "--adaptive-bitrate",
+            "--enable-aac", "--enable-udp-multitransport", "--udp-migrate-egfx",
+        ])
+    }
+
+    static func pacingLimit(in config: [String: String]) -> String {
+        if let limit = config["H264_MAX_UNACKED_FRAMES"], !limit.isEmpty { return limit }
+        if let legacy = config["TCP_VIDEO_BACKPRESSURE"] { return legacy == "1" ? "3" : "0" }
+        return extraFlagValue("--h264-max-unacked-frames", in: config["EXTRA_FLAGS"] ?? "") ?? "0"
+    }
+
+    var tcpPacingLimit: String { Self.pacingLimit(in: draft) }
+    var tcpPacingEnabled: Bool { (UInt32(tcpPacingLimit) ?? 0) > 0 }
+
+    func setTCPPacingLimit(_ value: String) {
+        let limit = value.trimmingCharacters(in: .whitespaces)
+        draft["H264_MAX_UNACKED_FRAMES"] = limit
+        // Preserve the on/off choice when a user returns to the older server.
+        draft["TCP_VIDEO_BACKPRESSURE"] = (UInt32(limit) ?? 0) > 0 ? "1" : "0"
+        cleanExtraFlags(["--h264-max-unacked-frames"])
+    }
+
+    func setTCPPacingEnabled(_ enabled: Bool) {
+        if enabled == tcpPacingEnabled { return }
+        setTCPPacingLimit(enabled ? "3" : "0")
+    }
+
+    var savedTCPPacingSummary: String {
+        guard saved["ENABLE_H264"] == "1" else { return "Requires H.264" }
+        let limit = UInt32(Self.pacingLimit(in: saved)) ?? 0
+        return limit == 0 ? "Off" : "\(limit) unacknowledged frames"
     }
 
     /// A stored empty key explicitly overrides old EXTRA_FLAGS values.
@@ -603,6 +717,22 @@ final class SettingsModel: ObservableObject {
     }
 
     // MARK: - Virtual-display resolution
+
+    var virtualDisplayScaling: VirtualDisplayScaling {
+        if let value = draft["VD_HIDPI"] {
+            return VirtualDisplayScaling(rawValue: value.lowercased()) ?? .standard
+        }
+        let flag = "--virtual-display-hidpi"
+        let extra = string("EXTRA_FLAGS")
+        if Self.extraFlagValue(flag, in: extra) == "auto" { return .automatic }
+        return extra.split(whereSeparator: { $0.isWhitespace }).contains { $0 == flag || $0 == flag + "=on" }
+            ? .retina : .standard
+    }
+
+    func setVirtualDisplayScaling(_ scaling: VirtualDisplayScaling) {
+        draft["VD_HIDPI"] = scaling.rawValue
+        cleanExtraFlags(["--virtual-display-hidpi"])
+    }
 
     var resolution: String {
         "\(string("VD_WIDTH", default: "1920"))x\(string("VD_HEIGHT", default: "1080"))"

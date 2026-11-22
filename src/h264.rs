@@ -7,7 +7,7 @@
 //!
 //! Flow — two decoupled threads (the "push model"):
 //!
-//!   Capture thread (`submit_bgra`, once per SCK frame):
+//!   Capture thread (`submit_pixel_buffer`, once per SCK frame):
 //!     1. First call lazily creates the EGFX surface + VT encoder AND spawns the
 //!        ship thread (not in `on_ready`, which holds the server mutex).
 //!     2. Drop-to-latest throttle: if `submitted - shipped` ≥
@@ -77,7 +77,7 @@ use crate::videotoolbox::{Avc444Encoder, EncodeOutput, EncodedFrame, Encoder};
 /// ~10 fps: enough trailing frames for mstsc to keep presenting + acking (so
 /// the window reopens and lag recovers) while still throttling well below the
 /// full 60 fps so the client's decode queue drains net. See the gate in
-/// `submit_bgra` and `ConnectionContext::last_throttle_ship`.
+/// `submit_pixel_buffer` and `ConnectionContext::last_throttle_ship`.
 const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
 
 /// P3 cold-start guard: how long after the first frame-ack the adaptive controller
@@ -188,17 +188,27 @@ impl VideoEncoder {
     }
 
     fn submit(&mut self, frame: FrameInput<'_>, keyframe: bool) -> Result<()> {
-        match (self, frame) {
-            (Self::Avc420(encoder), FrameInput::Bgra { bgra, stride }) => {
-                encoder.encode_bgra(bgra, stride, keyframe)
+        use screencapturekit::cv::CVPixelBufferLockFlags;
+
+        match frame {
+            FrameInput::Bgra(pb) => {
+                // Only map the surface after the pipeline has room for it.
+                let pixels = pb
+                    .lock(CVPixelBufferLockFlags::READ_ONLY)
+                    .map_err(|error| anyhow!("CVPixelBuffer::lock OSStatus {error}"))?;
+                match self {
+                    Self::Avc420(encoder) => {
+                        encoder.encode_bgra(pixels.as_slice(), pixels.bytes_per_row(), keyframe)
+                    }
+                    Self::Avc444(encoder) => {
+                        encoder.encode_bgra(pixels.as_slice(), pixels.bytes_per_row(), keyframe)
+                    }
+                }
             }
-            (Self::Avc420(encoder), FrameInput::Nv12(pb)) => {
-                encoder.encode_pixel_buffer(pb, keyframe)
-            }
-            (Self::Avc444(encoder), FrameInput::Bgra { bgra, stride }) => {
-                encoder.encode_bgra(bgra, stride, keyframe)
-            }
-            (Self::Avc444(_), FrameInput::Nv12(_)) => Err(anyhow!("AVC444 requires BGRA capture")),
+            FrameInput::Nv12(pb) => match self {
+                Self::Avc420(encoder) => encoder.encode_pixel_buffer(pb, keyframe),
+                Self::Avc444(_) => Err(anyhow!("AVC444 requires BGRA capture")),
+            },
         }
     }
 
@@ -222,7 +232,7 @@ struct ConnectionContext {
     need_keyframe: bool,
     /// Whether the client's advertised EGFX caps indicate AVC420 (H.264)
     /// decode support. Set in `capabilities_advertise`, read in `on_ready`:
-    /// if false we leave `is_ready` false so `submit_bgra` returns `Ok(false)`
+    /// if false we leave `is_ready` false so submission returns `Inactive`
     /// and capture.rs falls back to legacy BitmapUpdate, instead of shipping
     /// AVC420 to a client that can't decode it (which it rejects with
     /// ERROR_NOT_SUPPORTED and a dead graphics channel).
@@ -244,7 +254,7 @@ struct ConnectionContext {
     /// live 2026-07-04).
     egfx_declined: Arc<AtomicBool>,
     /// Drop-to-latest throttle counters for the push pipeline. `submitted` is
-    /// bumped by `submit_bgra` (capture thread) per frame handed to VT;
+    /// bumped by `submit_pixel_buffer` (capture thread) per frame handed to VT;
     /// `shipped` is bumped by the ship thread per frame pulled back out and
     /// sent. `submitted - shipped` is how many frames are in the VT/ship
     /// pipeline; when it reaches `max_in_flight` the capture thread skips
@@ -265,7 +275,7 @@ struct ConnectionContext {
     /// (reset on reconnect), all init to `now` so warmup doesn't false-trigger.
     /// `last_ack_at` + `acks_suspended` set in `on_frame_ack`; `last_ship_at` set
     /// in `ship_frames`; `last_recovery_at` set when a recovery IDR is armed in
-    /// `submit_bgra`. See [`should_force_recovery_idr`].
+    /// `submit_pixel_buffer`. See [`should_force_recovery_idr`].
     last_ack_at: Instant,
     /// When the acked-frame id last ADVANCED (a real ack, not the suspend
     /// sentinel — `last_ack_at` refreshes on suspends too, by design, for the
@@ -284,7 +294,7 @@ struct ConnectionContext {
     /// Their difference is the client's decode backlog. On TCP the socket's own
     /// backpressure paces the server to the client; on the UDP tunnel nothing
     /// does, so without this the server floods frames and the client's decode
-    /// queue runs away → frozen video. `submit_bgra` drops captures (to latest)
+    /// queue runs away → frozen video. `submit_pixel_buffer` drops captures (to latest)
     /// when the lag exceeds the threshold — but only once `egfx_acks_seen` (avoid
     /// a cold-start false drop before the first ack) and only while EGFX is on the
     /// UDP tunnel (`Gfx::egfx_on_udp`) and acks aren't suspended. `Arc` so the
@@ -1550,7 +1560,7 @@ fn resync_drain_step(
 /// picture). Works on BOTH transports; on TCP it's the only fps lever (there's no UDP
 /// frame-ack backpressure gate). When the link recovers (`congested` clears or the
 /// controller climbs off the floor) it stops dropping and the full capture rate resumes.
-/// Unit-tested. See [`Gfx::submit_bgra`].
+/// Unit-tested. See [`Gfx::submit_pixel_buffer`].
 fn frame_drop_at_floor(
     at_floor: bool,
     congested: bool,
@@ -1614,7 +1624,7 @@ fn ack_lag_limit(on_udp: bool, udp_limit: u64, tcp_limit: u64, flush: bool) -> u
 
 /// Cloneable factory + frame-submit handle. One clone is boxed into
 /// `RdpServer::builder().with_gfx_factory(...)`; another lives on the capture
-/// side as the `submit_bgra` entry point.
+/// side as the `submit_pixel_buffer` entry point.
 #[derive(Clone)]
 pub struct Gfx {
     sender: Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>,
@@ -1631,10 +1641,10 @@ pub struct Gfx {
     keyframe_secs: f32,
     /// Capture-side drop-to-latest depth (from `--h264-frames-in-flight`): the
     /// max frames allowed in the VT/ship pipeline (`submitted - shipped`) before
-    /// `submit_bgra` skips a capture. Bounds interactive latency under load: a
+    /// `submit_pixel_buffer` skips a capture. Bounds interactive latency under load: a
     /// deeper window buffers more (smoother video) but lets a backlog build; a
     /// shallow one drops-to-latest sooner (snappier) at the cost of more skips.
-    /// Read in `submit_bgra` — NOT the EGFX send-side window (that's `u32::MAX`,
+    /// Read in `submit_pixel_buffer` — NOT the EGFX send-side window (that's `u32::MAX`,
     /// so encoded frames are never dropped, which would break the H.264 chain).
     max_in_flight: u32,
     wire_format: WireFormat,
@@ -1642,19 +1652,19 @@ pub struct Gfx {
     /// Ack-driven IDR recovery (EGFX-on-lossy). `recovery_enabled` is the opt-in
     /// env gate (`MACRDP_UDP_EGFX_ACK_RECOVERY`); `egfx_on_lossy` is the *runtime*
     /// gate the vendored server flips true when it migrates EGFX onto the lossy
-    /// tunnel. Both must hold for `submit_bgra` to arm a recovery IDR. Default-off
+    /// tunnel. Both must hold for `submit_pixel_buffer` to arm a recovery IDR. Default-off
     /// → byte-identical to the pre-feature path.
     recovery_enabled: bool,
     recovery_params: RecoveryParams,
     egfx_on_lossy: Arc<AtomicBool>,
     /// Runtime gate the vendored server flips true when EGFX is migrated onto the
     /// UDP multitransport tunnel (reliable OR lossy). Enables the frame-ack-lag
-    /// backpressure in `submit_bgra` — only on the UDP tunnel, since the TCP path
+    /// backpressure in `submit_pixel_buffer` — only on the UDP tunnel, since the TCP path
     /// is paced by socket backpressure and must stay byte-identical (never-drop
     /// push model). Stays false on TCP → the gate is a no-op there.
     egfx_on_udp: Arc<AtomicBool>,
     /// Max EGFX frame-ack lag (shipped − decoded, in frames) tolerated on the UDP
-    /// tunnel before `submit_bgra` drops captures to let the client catch up.
+    /// tunnel before `submit_pixel_buffer` drops captures to let the client catch up.
     /// `MACRDP_UDP_EGFX_MAX_FRAME_LAG` (default 16 ≈ 266 ms at 60 fps). High enough
     /// that a healthy high-RTT link never trips it; low enough to cap the decode
     /// backlog so video degrades to choppy-but-live instead of freezing.
@@ -1665,7 +1675,7 @@ pub struct Gfx {
     /// EGFX-over-UDP → TCP watchdog. On by default (disable with
     /// `MACRDP_UDP_EGFX_WATCHDOG=0`); only ever acts while EGFX is on the RELIABLE
     /// UDP tunnel (`egfx_on_udp && !egfx_on_lossy`), so it's a no-op unless
-    /// `--udp-migrate-egfx` is in use. On a detected wedge `submit_bgra` forces an
+    /// `--udp-migrate-egfx` is in use. On a detected wedge `submit_pixel_buffer` forces an
     /// IDR, resets the lag baseline, and sets `demigrate_request` — the cue the
     /// vendored server reads to flip EGFX routing back to the TCP DRDYNVC channel.
     watchdog_enabled: bool,
@@ -1796,8 +1806,16 @@ pub struct Gfx {
 /// converts to NV12 itself, or an NV12 pixel buffer ScreenCaptureKit already
 /// converted on the GPU.
 enum FrameInput<'a> {
-    Bgra { bgra: &'a [u8], stride: usize },
+    Bgra(&'a screencapturekit::cv::CVPixelBuffer),
     Nv12(&'a screencapturekit::cv::CVPixelBuffer),
+}
+
+/// A deferred capture still belongs to EGFX, but must not spend a trailing
+/// flush slot until the encoder actually accepts it.
+pub(crate) enum FrameSubmission {
+    Inactive,
+    Deferred,
+    Submitted,
 }
 
 impl Gfx {
@@ -2121,7 +2139,7 @@ impl Gfx {
         );
     }
 
-    /// Called by capture when [`Self::submit_bgra`] returned `Ok(false)`:
+    /// Called by capture when [`Self::submit_pixel_buffer`] returned `Inactive`:
     /// true means "do not send this frame as a legacy bitmap update" because
     /// the connection is still negotiating EGFX (see [`hold_legacy_for_egfx`]).
     /// Capture keeps the frame and submits it again when EGFX is ready, or
@@ -2139,7 +2157,7 @@ impl Gfx {
             return false;
         };
         if ctx.is_ready {
-            // EGFX became ready after `submit_bgra` returned `Ok(false)` for
+            // EGFX became ready after `submit_pixel_buffer` returned `Inactive` for
             // this frame: do not send a legacy picture now; capture submits
             // its held frame to EGFX on the next loop.
             return true;
@@ -2176,39 +2194,21 @@ impl Gfx {
     /// frame sent again on a static screen so mstsc presents it. Those are
     /// exempt from the TCP ack-lag cap (see [`ack_lag_limit`]).
     ///
-    /// Returns `Ok(true)` when EGFX is the active display path (so the caller
-    /// should suppress legacy BitmapUpdates for this frame — even if this
-    /// particular frame was skipped for backpressure or isn't encoded yet).
-    /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
-    /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
-    pub fn submit_bgra(
-        &self,
-        bgra: &[u8],
-        stride: usize,
-        request_keyframe: bool,
-        flush: bool,
-    ) -> Result<bool> {
-        self.submit_frame(FrameInput::Bgra { bgra, stride }, request_keyframe, flush)
-    }
-
-    /// [`Self::submit_bgra`] for a capture-owned full-range NV12 pixel buffer
-    /// (`--capture-nv12`): VideoToolbox encodes it as-is, with no CPU colour
-    /// conversion and no copy. Same return contract.
-    pub fn submit_nv12(
+    /// An inactive pipeline leaves the frame to the legacy bitmap path.
+    pub(crate) fn submit_pixel_buffer(
         &self,
         pixel_buffer: &screencapturekit::cv::CVPixelBuffer,
+        nv12: bool,
         request_keyframe: bool,
         flush: bool,
-    ) -> Result<bool> {
-        self.submit_frame(FrameInput::Nv12(pixel_buffer), request_keyframe, flush)
-    }
+    ) -> Result<FrameSubmission> {
+        use FrameSubmission::{Deferred, Inactive, Submitted};
 
-    fn submit_frame(
-        &self,
-        frame: FrameInput<'_>,
-        request_keyframe: bool,
-        flush: bool,
-    ) -> Result<bool> {
+        let frame = if nv12 {
+            FrameInput::Nv12(pixel_buffer)
+        } else {
+            FrameInput::Bgra(pixel_buffer)
+        };
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -2220,13 +2220,13 @@ impl Gfx {
         // `server_handle`, which is never taken while holding ctx — the ship/ack
         // lock-order invariant). The decision extracts what the action needs here.
         let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
-        let force_keyframe = {
+        {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
-                return Ok(false); // no active connection
+                return Ok(Inactive); // no active connection
             };
             if !ctx.is_ready {
-                return Ok(false); // channel not negotiated yet (or non-EGFX client)
+                return Ok(Inactive); // channel not negotiated yet (or non-EGFX client)
             }
             // Arm the keyframe BEFORE the throttle check so a large change that
             // lands on a dropped frame still forces the IDR on the next encoded
@@ -2498,6 +2498,20 @@ impl Gfx {
                     }
                 }
             }
+            if let Some((action, server_handle, width, height, attempt)) = blank_recovery {
+                // Recovery can acquire the server handle. Release ctx first.
+                drop(guard);
+                let result = match action {
+                    BlankAction::Remap => self.perform_blank_remap(&server_handle, width, height),
+                    BlankAction::Drop => self.perform_blank_drop(),
+                    BlankAction::Reactivate => self.perform_blank_reactivate(width, height),
+                };
+                if let Err(error) = result {
+                    warn!(?error, ?action, attempt, "EGFX blank recovery failed");
+                }
+                return Ok(Deferred);
+            }
+
             // Manual-resync drain (the Ctrl+Alt+Shift+R hotkey): hold new
             // captures until the client's decoder has emptied, then let the
             // armed IDR through (see `resync_drain_step`). Dropping before
@@ -2509,7 +2523,7 @@ impl Gfx {
                 let acked = ctx.last_acked_frame_id.load(Ordering::Relaxed);
                 match resync_drain_step(ctx.resync_drain_until, now, shipped, acked) {
                     ResyncDrain::Off => {}
-                    ResyncDrain::Hold => return Ok(true),
+                    ResyncDrain::Hold => return Ok(Deferred),
                     ResyncDrain::Done => {
                         ctx.resync_drain_until = None;
                         info!(
@@ -2545,7 +2559,7 @@ impl Gfx {
                     trace!(
                         "EGFX at bitrate floor + congested; dropping capture (frame-rate floor)"
                     );
-                    return Ok(true);
+                    return Ok(Deferred);
                 }
                 if at_floor && ctx.adaptive_congested {
                     ctx.last_floor_fps_pass = now;
@@ -2571,7 +2585,7 @@ impl Gfx {
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
                 );
-                return Ok(true); // still the active path; just dropped this frame
+                return Ok(Deferred); // still the active path; just dropped this frame
             }
             // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
             // socket backpressure to pace us to the client (unlike TCP), so without
@@ -2627,7 +2641,7 @@ impl Gfx {
                             lag,
                             "EGFX client ack lag high; dropping capture (trickle floor)"
                         );
-                        return Ok(true);
+                        return Ok(Deferred);
                     }
                     ctx.last_throttle_ship = now;
                     trace!(
@@ -2637,40 +2651,17 @@ impl Gfx {
                     // fall through: ship this one to keep the client presenting/acking
                 }
             }
-            std::mem::replace(&mut ctx.need_keyframe, false)
-        };
+            let force_keyframe = std::mem::replace(&mut ctx.need_keyframe, false);
 
-        // Run the armed recovery action now that ctx is released (lock order).
-        // This capture is dropped either way: a remap re-arms `need_keyframe`,
-        // so the NEXT capture ships as the IDR into the fresh surface, cleanly
-        // ordered after the queued CreateSurface/Map PDUs; a drop needs no frame
-        // at all (the connection is ending).
-        if let Some((action, server_handle, width, height, attempt)) = blank_recovery {
-            let result = match action {
-                BlankAction::Remap => self.perform_blank_remap(&server_handle, width, height),
-                BlankAction::Drop => self.perform_blank_drop(),
-                BlankAction::Reactivate => self.perform_blank_reactivate(width, height),
-            };
-            if let Err(e) = result {
-                warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
-            }
-            return Ok(true);
-        }
-
-        // Submit to VideoToolbox (async). The ship thread delivers + ships the
-        // output; we just count the submission for the drop-to-latest throttle.
-        {
-            let mut guard = self.ctx.lock().unwrap();
-            let Some(ctx) = guard.as_mut() else {
-                return Ok(true);
-            };
+            // Submit to VideoToolbox while this context is still current.
+            // A resize must not feed the old capture into the new encoder.
             // Congestion-responsive control (P1 bitrate + P2a IDR backoff): compute
             // the adjustments (mutates ctx adaptive state, may set need_keyframe)
             // BEFORE borrowing the encoder, then apply them live. No-op unless
             // adaptive is enabled AND EGFX is on a UDP tunnel.
             let adaptive = self.adaptive_bitrate_step(ctx);
             let Some(encoder) = ctx.encoder.as_mut() else {
-                return Ok(true);
+                return Ok(Deferred);
             };
             if let Some(bps) = adaptive.bitrate_bps {
                 if let Err(e) = encoder.set_bitrate(bps) {
@@ -2685,7 +2676,11 @@ impl Gfx {
                 if let Some(stats) = crate::stats::global() {
                     stats.encode_submit_errors.fetch_add(1, Ordering::Relaxed);
                 }
-                return Err(error);
+                warn!(
+                    ?error,
+                    "EGFX capture submit failed; retaining the frame for retry"
+                );
+                return Ok(Deferred);
             }
             if let Some(stats) = crate::stats::global() {
                 stats.encode_submitted.fetch_add(1, Ordering::Relaxed);
@@ -2697,11 +2692,11 @@ impl Gfx {
             }
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(true)
+        Ok(Submitted)
     }
 
     /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
-    /// once per capture from `submit_bgra` while holding the ctx lock; rate-limited to
+    /// once per capture from `submit_pixel_buffer` while holding the ctx lock; rate-limited to
     /// one step per `adaptive_interval`. Detects congestion from the client's frame-ack
     /// lag (fast, leads the watchdog) and the shared retransmit counter (late), and
     /// per interval:
@@ -3310,7 +3305,7 @@ impl Gfx {
             // Order matters only in that both must be cleared before the
             // post-reactivation submit: encoder drop tears down the old VT
             // session + ship thread now; surface_id=None makes the next
-            // `submit_bgra` run `setup_locked` (which also rebuilds the
+            // `submit_pixel_buffer` run `setup_locked` (which also rebuilds the
             // encoder and resets the throttle counters).
             ctx.shipped = Arc::new(AtomicU64::new(0));
             ctx.encoder = None;
@@ -3533,7 +3528,7 @@ impl Gfx {
                     None => server.send_avc420_frame(surface_id, &payload, &regions, ts_ms),
                 };
                 // Record the newest shipped frame id for the UDP frame-ack-lag
-                // backpressure gate (`submit_bgra`), and stamp the ship time
+                // backpressure gate (`submit_pixel_buffer`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
                 // round trip for the queue-delay congestion signal.
                 if let Some(frame_id) = sent {
@@ -3863,7 +3858,7 @@ impl GraphicsPipelineHandler for GfxHandler {
     /// chain and produces persistent artifacts on the client (observed:
     /// `send_avc420_frame returned None` dropped a 209 KB IDR mid-stream).
     /// Throttling belongs at *capture* (drop-to-latest BEFORE encode, gated by
-    /// `--h264-frames-in-flight` in `submit_bgra`), never after encode.
+    /// `--h264-frames-in-flight` in `submit_pixel_buffer`), never after encode.
     fn max_frames_in_flight(&self) -> u32 {
         u32::MAX
     }
@@ -3915,7 +3910,7 @@ impl GraphicsPipelineHandler for GfxHandler {
     fn on_ready(&mut self, negotiated: &CapabilitySet) {
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             // Only drive the H.264 path if the client advertised AVC420 decode
-            // support. Otherwise leave is_ready false → submit_bgra returns
+            // support. Otherwise leave is_ready false → submit_pixel_buffer returns
             // Ok(false) → capture.rs uses legacy BitmapUpdate. Shipping AVC420
             // to a non-AVC client gets it rejected (ERROR_NOT_SUPPORTED) and
             // kills the graphics channel.
@@ -3964,7 +3959,7 @@ impl GraphicsPipelineHandler for GfxHandler {
             // The client sends FrameAcknowledge after it DECODES a frame, so this
             // is the floor of its decode backlog. Only advance on a real ack (not
             // the suspend sentinel), and mark that we've seen at least one ack so
-            // `submit_bgra` doesn't false-drop during cold start.
+            // `submit_pixel_buffer` doesn't false-drop during cold start.
             if !ctx.acks_suspended {
                 ctx.last_acked_frame_id
                     .store(u64::from(frame_id), Ordering::Relaxed);

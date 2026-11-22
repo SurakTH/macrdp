@@ -1078,9 +1078,11 @@ fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
 mod macos {
     use super::*;
 
+    use crate::frame_flush::FrameFlush;
+    use crate::h264::FrameSubmission::{Deferred, Inactive, Submitted};
     use anyhow::{anyhow, Context};
     use screencapturekit::async_api::AsyncSCShareableContent;
-    use screencapturekit::cm::CMSampleBuffer;
+    use screencapturekit::cm::{CMSampleBuffer, SCFrameStatus};
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
     use screencapturekit::prelude::{
         CMTime, PixelFormat as SckPixelFormat, SCContentFilter, SCDisplay, SCError, SCStream,
@@ -1113,10 +1115,36 @@ mod macos {
     /// Samples kept for a consumer that falls behind; the oldest is dropped.
     const SAMPLE_BUFFER: usize = 4;
 
+    struct CaptureSample {
+        buffer: CMSampleBuffer,
+        status: Option<SCFrameStatus>,
+    }
+
+    impl CaptureSample {
+        fn has_content(&self) -> bool {
+            self.status.is_none_or(SCFrameStatus::has_content)
+        }
+    }
+
     #[derive(Default)]
     struct SampleQueue {
-        samples: std::collections::VecDeque<CMSampleBuffer>,
+        samples: std::collections::VecDeque<CaptureSample>,
         stopped: bool,
+    }
+
+    impl SampleQueue {
+        fn pop_latest_content(&mut self) -> Option<CaptureSample> {
+            let index = self.samples.iter().rposition(CaptureSample::has_content)?;
+            if index > 0 {
+                self.samples.drain(..index);
+                if let Some(stats) = crate::stats::global() {
+                    stats
+                        .capture_superseded
+                        .fetch_add(index as u64, Ordering::Relaxed);
+                }
+            }
+            self.samples.pop_front()
+        }
     }
 
     #[derive(Default)]
@@ -1154,13 +1182,15 @@ mod macos {
             let on_sample = Arc::clone(&samples);
             stream.add_output_handler(
                 move |sample: CMSampleBuffer, _| {
+                    let status = sample.frame_status();
+                    let sample = CaptureSample {
+                        buffer: sample,
+                        status,
+                    };
                     let mut q = on_sample.queue.lock().unwrap();
                     if let Some(stats) = crate::stats::global() {
                         stats.capture_samples.fetch_add(1, Ordering::Relaxed);
-                        if sample
-                            .frame_status()
-                            .is_some_and(|status| !status.has_content())
-                        {
+                        if !sample.has_content() {
                             stats.capture_idle.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -1186,27 +1216,23 @@ mod macos {
             })
         }
 
-        async fn next(&self) -> Option<CMSampleBuffer> {
+        fn try_latest_content(&self) -> Option<CaptureSample> {
+            if !self.responsive_capture {
+                return None;
+            }
+            self.samples.queue.lock().unwrap().pop_latest_content()
+        }
+
+        async fn next(&self) -> Option<CaptureSample> {
             loop {
                 {
                     let mut q = self.samples.queue.lock().unwrap();
-                    if self.responsive_capture {
-                        if let Some(index) = q.samples.iter().rposition(|sample| {
-                            sample
-                                .frame_status()
-                                .is_none_or(|status| status.has_content())
-                        }) {
-                            if index > 0 {
-                                q.samples.drain(..index);
-                                if let Some(stats) = crate::stats::global() {
-                                    stats
-                                        .capture_superseded
-                                        .fetch_add(index as u64, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(sample) = q.samples.pop_front() {
+                    let sample = if self.responsive_capture {
+                        q.pop_latest_content().or_else(|| q.samples.pop_front())
+                    } else {
+                        q.samples.pop_front()
+                    };
+                    if let Some(sample) = sample {
                         return Some(sample);
                     }
                     if q.stopped {
@@ -1271,15 +1297,8 @@ mod macos {
         /// (`--flush-frames`). Each is a tiny skip-P-frame; mstsc needs ≥2 to
         /// display a frame, default 4 gives margin. 0 disables the burst.
         flush_frames: u32,
-        /// Trailing flush re-submits remaining after the last real change
-        /// (EGFX/H.264 path only). SCK stops delivering frames on a static
-        /// screen, so the last change before a pause (e.g. the final keystroke)
-        /// would otherwise sit in mstsc's ~2-frame AVC420 presentation buffer
-        /// until the next on-screen change or the periodic keyframe — that's
-        /// the "typing follows the keyframe" lag. We re-submit the last frame
-        /// `flush_frames` times to push it through within a couple of frame
-        /// intervals. Stays 0 (no-op) on the legacy bitmap path.
-        flush_remaining: u32,
+        /// Deadline and remaining retries for the latest retained EGFX frame.
+        flush_burst: FrameFlush,
         /// Last frame submitted to EGFX, re-encoded as cheap skip-P-frames
         /// during a flush burst. Held as a retained SCK pixel buffer rather
         /// than a byte copy: copying the whole frame after every submit was
@@ -1325,8 +1344,7 @@ mod macos {
         /// stutter even though no real minimize happened.
         suppressed_since: Option<Instant>,
         /// True once the EGFX/H.264 encoder has accepted at least one
-        /// frame for this session (i.e., `gfx.submit_bgra` returned
-        /// `Ok(true)`). The suppress gate is a no-op until this is set —
+        /// frame for this session. The suppress gate is a no-op until this is set —
         /// mstsc's normal connect handshake includes a
         /// `SuppressOutput { None }` *before* its display surface is
         /// fully initialized, and stopping the first EGFX frame from
@@ -1408,27 +1426,72 @@ mod macos {
                 self.egfx_pending_frame = false;
                 return;
             };
-            match submit_to_gfx(gfx, pb, self.nv12, true, false) {
-                Ok(true) => {
+            match gfx.submit_pixel_buffer(pb, self.nv12, true, false) {
+                Ok(outcome @ (Submitted | Deferred)) => {
                     self.egfx_pending_frame = false;
-                    self.seeded = true;
-                    self.first_egfx_frame_sent = true;
-                    self.flush_remaining = self.flush_frames;
+                    self.track_egfx_frame(matches!(outcome, Submitted));
                     tracing::info!(
                         dropped_bitmap_updates = queued - self.pending.len(),
                         "EGFX ready — re-sent the pre-EGFX frame over H.264"
                     );
                 }
-                Ok(false) => {}
+                Ok(Inactive) => {}
                 Err(e) => {
                     self.egfx_pending_frame = false;
-                    tracing::warn!(error = ?e, "EGFX submit_bgra failed");
+                    tracing::warn!(error = ?e, "EGFX promotion submit failed");
                 }
             }
         }
     }
 
     impl ScreenCaptureUpdates {
+        fn track_egfx_frame(&mut self, submitted: bool) {
+            self.seeded = true;
+            self.first_egfx_frame_sent |= submitted;
+            self.flush_burst.arm(
+                self.flush_frames,
+                submitted,
+                Instant::now(),
+                self.flush_interval,
+            );
+        }
+
+        fn flush_cached_frame(&mut self) {
+            let (Some(gfx), Some(pb)) = (self.gfx.as_ref(), self.last_frame.as_ref()) else {
+                self.flush_burst.clear();
+                return;
+            };
+            let result =
+                gfx.submit_pixel_buffer(pb, self.nv12, self.flush_burst.force_keyframe(), true);
+            let submitted = match result {
+                Ok(Submitted) => true,
+                Ok(Deferred) => false,
+                Ok(Inactive) => {
+                    self.flush_burst.clear();
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "EGFX trailing frame submit failed");
+                    false
+                }
+            };
+            self.first_egfx_frame_sent |= submitted;
+            self.flush_burst
+                .attempted(submitted, Instant::now(), self.flush_interval);
+        }
+
+        fn refresh_idle_resume(&mut self) {
+            if !self.was_suppressed || self.last_frame.is_none() {
+                return;
+            }
+            if let Some(gfx) = self.gfx.as_ref() {
+                self.was_suppressed = false;
+                gfx.demigrate_on_resume();
+                self.flush_burst
+                    .repaint_now(self.flush_frames, Instant::now());
+            }
+        }
+
         /// The SCK stream sent no frame for one interval while a frame is held
         /// for the EGFX negotiation (`held_frame`): submit it to EGFX if EGFX
         /// is ready now, keep holding it while the hold lasts, or send it as a
@@ -1438,18 +1501,14 @@ mod macos {
                 self.held_frame = false;
                 return;
             };
-            // `submit_to_gfx` hands the buffer over as NV12 or locks it as BGRA,
-            // matching the capture format (`--capture-nv12`).
-            match submit_to_gfx(gfx, pb, self.nv12, true, false) {
-                Ok(true) => {
+            match gfx.submit_pixel_buffer(pb, self.nv12, true, false) {
+                Ok(outcome @ (Submitted | Deferred)) => {
                     self.held_frame = false;
-                    self.seeded = true;
-                    self.first_egfx_frame_sent = true;
-                    self.flush_remaining = self.flush_frames;
+                    self.track_egfx_frame(matches!(outcome, Submitted));
                     tracing::debug!("EGFX ready — submitted the frame held during the negotiation");
                 }
-                Ok(false) if gfx.hold_legacy(self.started_at) => {}
-                Ok(false) => {
+                Ok(Inactive) if gfx.hold_legacy(self.started_at) => {}
+                Ok(Inactive) => {
                     // Hold over without EGFX: send the held frame as a full
                     // legacy picture (converted back to BGRA in NV12 mode).
                     self.held_frame = false;
@@ -1735,7 +1794,7 @@ mod macos {
                 frame_interval,
                 flush_frames,
                 flush_interval: flush_interval.unwrap_or(frame_interval),
-                flush_remaining: 0,
+                flush_burst: FrameFlush::default(),
                 last_frame: None,
                 egfx_pending_frame: false,
                 started_at: Instant::now(),
@@ -1793,7 +1852,11 @@ mod macos {
                 match DisplayStream::start(display, &self.stream_config) {
                     Ok(stream) => {
                         self.stream = stream;
-                        // The screen changed while the capture was down.
+                        // Do not replay a pixel buffer from the stopped stream.
+                        self.last_frame = None;
+                        self.flush_burst.clear();
+                        self.held_frame = false;
+                        self.egfx_pending_frame = false;
                         self.seeded = false;
                         tracing::info!(
                             display_id = self.display_id,
@@ -1879,30 +1942,6 @@ mod macos {
         });
     }
 
-    /// Hand one captured frame to the H.264 pipeline: the buffer itself in NV12
-    /// mode, its locked BGRA bytes otherwise. Same return contract as
-    /// [`crate::h264::Gfx::submit_bgra`].
-    fn submit_to_gfx(
-        gfx: &crate::h264::Gfx,
-        pixel_buffer: &CVPixelBuffer,
-        nv12: bool,
-        request_keyframe: bool,
-        flush: bool,
-    ) -> Result<bool> {
-        if nv12 {
-            return gfx.submit_nv12(pixel_buffer, request_keyframe, flush);
-        }
-        let guard = pixel_buffer
-            .lock(CVPixelBufferLockFlags::READ_ONLY)
-            .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))?;
-        gfx.submit_bgra(
-            guard.as_slice(),
-            guard.bytes_per_row(),
-            request_keyframe,
-            flush,
-        )
-    }
-
     /// Convert a locked NV12 capture frame to tightly packed BGRA in `out`.
     fn nv12_to_bgra(
         guard: &screencapturekit::cv::CVPixelBufferLockGuard<'_>,
@@ -1939,7 +1978,7 @@ mod macos {
             .iter()
             .step_by(61)
             .fold((u8::MAX, u8::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-        tracing::info!(
+        tracing::debug!(
             pixel_format = format_args!("{:#010x}", pixel_buffer.pixel_format()),
             luma_min = min,
             luma_max = max,
@@ -2167,7 +2206,7 @@ mod macos {
                             let started = *self.suppressed_since.get_or_insert_with(Instant::now);
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
                                 self.was_suppressed = true;
-                                self.flush_remaining = 0;
+                                self.flush_burst.clear();
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                                 continue;
                             }
@@ -2177,55 +2216,39 @@ mod macos {
                     }
                 }
 
-                // While a flush burst OR a debounced resize is pending, don't
-                // block indefinitely on SCK: it stops delivering frames on a
-                // static screen, so wait at most one frame interval before
-                // looping back to the top (where the flush burst re-submits the
-                // last frame, and a settled resize gets picked up promptly
-                // instead of stalling until the next real desktop change).
-                // Neither pending — the common idle case — still wakes at the
-                // cursor-poll interval, so a pointer-shape change on a static
-                // screen (the resize arrows at a window edge, which change no
-                // pixels because the captured frame excludes the cursor) gets
-                // polled and sent instead of waiting for the next redraw.
-                // A frame held during the EGFX negotiation also waits at most
-                // one frame interval, so it goes out once EGFX is ready even
-                // when the screen is static.
-                let sample = if self.flush_remaining > 0
-                    || self.pending_resize.has_pending()
-                    || self.held_frame
-                {
-                    let wait = if self.pending_resize.has_pending() || self.held_frame {
+                // An absolute deadline also fires while SCK produces idle
+                // samples. Resetting a relative timeout on those samples can
+                // leave the final visible update in the client decoder.
+                let now = Instant::now();
+                let flush_at = self.flush_burst.deadline().filter(|_| !self.held_frame);
+                let sample = if flush_at.is_some_and(|deadline| deadline <= now) {
+                    if let Some(fresh) = self.stream.try_latest_content() {
+                        Some(fresh)
+                    } else {
+                        self.flush_cached_frame();
+                        continue;
+                    }
+                } else {
+                    let poll_interval = if self.pending_resize.has_pending()
+                        || self.held_frame
+                        || self.was_suppressed
+                    {
                         self.frame_interval
                     } else {
-                        self.flush_interval
+                        CURSOR_POLL_INTERVAL
                     };
-                    match tokio::time::timeout(wait, self.stream.next()).await {
+                    let poll_at = now + poll_interval;
+                    let wake_at = flush_at.map_or(poll_at, |deadline| deadline.min(poll_at));
+                    match tokio::time::timeout_at(wake_at.into(), self.stream.next()).await {
                         Ok(sample) => sample,
                         Err(_) => {
                             if self.held_frame {
                                 self.send_held_frame();
-                                continue;
-                            }
-                            if self.flush_remaining > 0 {
-                                self.flush_remaining -= 1;
-                                if let Some(gfx) = self.gfx.as_ref() {
-                                    if let Some(pb) = self.last_frame.as_ref() {
-                                        if let Err(e) =
-                                            submit_to_gfx(gfx, pb, self.nv12, false, true)
-                                        {
-                                            tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
-                                        }
-                                    }
-                                }
+                            } else {
+                                self.refresh_idle_resume();
                             }
                             continue;
                         }
-                    }
-                } else {
-                    match tokio::time::timeout(CURSOR_POLL_INTERVAL, self.stream.next()).await {
-                        Ok(sample) => sample,
-                        Err(_) => continue,
                     }
                 };
                 let Some(sample) = sample else {
@@ -2234,11 +2257,13 @@ mod macos {
                 };
 
                 // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
-                if let Some(status) = sample.frame_status() {
-                    if !status.has_content() {
-                        continue;
+                if !sample.has_content() {
+                    if sample.status == Some(SCFrameStatus::Idle) {
+                        self.refresh_idle_resume();
                     }
+                    continue;
                 }
+                let sample = sample.buffer;
 
                 if let Some(stats) = crate::stats::global() {
                     stats.capture_content.fetch_add(1, Ordering::Relaxed);
@@ -2267,16 +2292,15 @@ mod macos {
                         force_full_frame = self.force_full_frame,
                         "capture: first frame delivered"
                     );
-                    if self.nv12 {
+                    if self.nv12 && tracing::enabled!(tracing::Level::DEBUG) {
                         log_nv12_luma_range(&pixel_buffer);
                     }
                 }
 
                 // EGFX/H.264 path: submit the full frame to the encoder. Once
-                // EGFX has negotiated (`Ok(true)`), it owns the display — skip
-                // the legacy BitmapUpdate emission entirely (cursor still flows
-                // via the poll at the top of the loop). Before negotiation, or
-                // for non-EGFX clients (`Ok(false)`), fall through to legacy.
+                // EGFX owns the display after negotiation, including when the
+                // encoder defers a frame. Only an inactive pipeline falls
+                // through to legacy BitmapUpdates.
                 if let Some(gfx) = self.gfx.as_ref() {
                     // On-demand keyframes (opt-in via --keyframe-on-change). A
                     // large change at once (window raised to front, scroll, app
@@ -2356,30 +2380,18 @@ mod macos {
                     } else {
                         false
                     };
-                    match submit_to_gfx(
-                        gfx,
+                    match gfx.submit_pixel_buffer(
                         &pixel_buffer,
                         self.nv12,
                         big_change || resume_keyframe,
                         false,
                     ) {
-                        Ok(true) => {
+                        Ok(outcome @ (Submitted | Deferred)) => {
                             self.held_frame = false;
-                            self.seeded = true;
-                            // First-EGFX-frame milestone: arms the suppress
-                            // gate (see `first_egfx_frame_sent` in the struct).
-                            if !self.first_egfx_frame_sent {
-                                self.first_egfx_frame_sent = true;
-                                tracing::debug!(
-                                    "first EGFX frame shipped — suppress gate now armed"
-                                );
-                            }
-                            // Stash this frame and arm the flush burst so that,
-                            // once SCK goes idle after this change, we re-submit
-                            // it enough times to drain mstsc's presentation
-                            // buffer. A retain, not a copy (see `last_frame`).
-                            self.last_frame = Some(pixel_buffer.clone());
-                            self.flush_remaining = self.flush_frames;
+                            // Keep the newest pixels, even if the encoder was
+                            // busy. The flush timer retries them if capture goes idle.
+                            self.last_frame = Some(pixel_buffer);
+                            self.track_egfx_frame(matches!(outcome, Submitted));
                             continue;
                         }
                         // EGFX still negotiating on this connection: do not send
@@ -2387,12 +2399,12 @@ mod macos {
                         // frozen on a legacy picture sent just before EGFX starts;
                         // see `hold_legacy_for_egfx`). Keep it: on a static screen
                         // no other frame may come (see `held_frame`).
-                        Ok(false) if gfx.hold_legacy(self.started_at) => {
+                        Ok(Inactive) if gfx.hold_legacy(self.started_at) => {
                             self.last_frame = Some(pixel_buffer.clone());
                             self.held_frame = true;
                             continue;
                         }
-                        Ok(false) => {
+                        Ok(Inactive) => {
                             // Not ready yet: this frame goes out as legacy
                             // bitmaps, but retain it to re-send over H.264
                             // once the pipeline comes up (a retain, not a
@@ -2404,7 +2416,7 @@ mod macos {
                                 self.egfx_pending_frame = true;
                             }
                         }
-                        Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
+                        Err(error) => tracing::warn!(?error, "EGFX setup failed"),
                     }
                 }
 

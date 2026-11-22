@@ -556,12 +556,39 @@ the server default of 2. For a 4K/60 comparison, keep resolution, bitrate,
 transport and flush settings fixed, then compare depths 1 and 2 during the
 same scrolling or motion sequence. Check both frame rate and input response.
 
-**Pace TCP video when the client falls behind** is an opt-in H.264 setting
-(`TCP_VIDEO_BACKPRESSURE=1`, or `MACRDP_TCP_VIDEO_BACKPRESSURE=1` for a direct
-CLI launch). When recent frame acknowledgements show a backlog, it temporarily
-paces frame submission before encoding. Compare with the option off using the
-same resolution, queue depth and bitrate. It can reduce motion frame rate
-while the client catches up.
+**Video → TCP video pacing** limits how far H.264 on TCP can run ahead of
+client acknowledgements. The switch suggests 3 outstanding frames when enabled,
+and the field accepts an explicit limit. Enter 0 to disable it. The server reads
+`H264_MAX_UNACKED_FRAMES` (CLI `--h264-max-unacked-frames`). Older configs
+with only `TCP_VIDEO_BACKPRESSURE=1` use a limit of 3. When both keys are
+present, the numeric value takes precedence. Status shows the saved limit.
+Compare limits with resolution, encoder depth, and bitrate held constant.
+
+**Video → Experimental → NV12 capture for AVC420** is opt-in and requires
+H.264 AVC420. It can reduce capture CPU use on large displays and uses the
+same periodic and recovery keyframe schedule as BGRA.
+
+**Connection → 4K/60 Preview** stages a 3840 × 2160 physical capture, a 60 FPS
+limit, NV12, and an adaptive bitrate ceiling of 60 Mbps over TCP. It keeps the
+encoder queue at two frames and uses the standard flush cadence. A virtual display
+keeps its own resolution and may follow the client request. Choose Stable to
+restore the profile for 1080p typing. Use **Performance** to compare queued
+FPS, acknowledgement latency, and encoder or pacing skips during the same
+motion sequence.
+
+**Display → Virtual display → Scaling** offers Standard (1×), Retina (2×)
+and Automatic (`VD_HIDPI=auto`). Automatic follows the client scale
+announcement. At 2×, 3840 × 2160 pixels give a 1920 × 1080 point workspace.
+This setting applies to the virtual display. Physical-screen capture
+continues to use its independent resolution setting.
+
+**Input** includes Option+Space for Spotlight and Option+Backtick for cycling
+windows in the active app. **Redirection → Clipboard** controls HTML/RTF
+formatting, which defaults to on. **Advanced → Connection quality** sends
+latency and bandwidth measurements to client apps that can display them.
+**Audio → Audio transport** offers loss-resilient UDP audio with AAC and
+H.264 enabled. It offers UDP automatically and shares the channel-switch
+operation with the optional UDP video mode, so choose one of those modes.
 
 Status distinguishes saved settings from the live session size and the
 configured capture FPS limit. A separate terminal test detected via diagnostics
@@ -576,9 +603,11 @@ save the current draft. **Load** stages the selected preset; review it and use
 presets do not restart the server or change config.env.
 
 Presets are stored atomically in `~/Library/Application Support/macrdp/presets.json`
-with private file permissions. They include video, audio and shortcut options;
-network addresses, accounts, arbitrary EXTRA_FLAGS and display takeover settings
-are excluded. Custom virtual-display sizing remains in Display.
+with private file permissions. They include video, audio and shortcut options,
+including the TCP frame limit, NV12, and the input shortcuts. Older presets with
+the pacing switch load into the equivalent numeric limit. Network addresses,
+accounts, arbitrary EXTRA_FLAGS and display takeover settings are excluded.
+Virtual-display sizing and scaling remain in Display.
 
 **Performance** polls the loopback statistics endpoint every two seconds while
 visible. Enable **Advanced → Live statistics endpoint**, then Apply if needed.
