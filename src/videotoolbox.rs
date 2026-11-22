@@ -312,15 +312,22 @@ impl Encoder {
         // Default to full-range NV12 — verified to fix mstsc's washed/lighter
         // image while keeping FreeRDP correct. Opt back out to video-range (let
         // VT convert from BGRA) with MACRDP_H264_FULL_RANGE=0 for debugging.
-        let full_range = !matches!(
-            std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
-            Ok("0") | Ok("false") | Ok("FALSE")
-        );
+        let full_range = !patch_sps
+            || !matches!(
+                std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
+                Ok("0") | Ok("false") | Ok("FALSE")
+            );
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let session =
-            ffi::create_session(width, height, bitrate_bps, VT_KEYFRAME_BACKSTOP, tx_ptr)?;
+        let session = ffi::create_session(
+            width,
+            height,
+            bitrate_bps,
+            VT_KEYFRAME_BACKSTOP,
+            tx_ptr,
+            full_range,
+        )?;
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -690,6 +697,7 @@ mod ffi {
     pub(super) type CFDictionaryRef = CFTypeRef;
     pub(super) type CFArrayRef = CFTypeRef;
     pub(super) type CVPixelBufferRef = CFTypeRef;
+    type CVPixelBufferPoolRef = CFTypeRef;
     pub(super) type CVImageBufferRef = CFTypeRef;
     pub(super) type CMSampleBufferRef = CFTypeRef;
     pub(super) type CMBlockBufferRef = CFTypeRef;
@@ -801,6 +809,18 @@ mod ffi {
         ) -> CFDictionaryRef;
 
         // CVPixelBuffer.
+        pub(super) static kCVPixelBufferWidthKey: CFStringRef;
+        pub(super) static kCVPixelBufferHeightKey: CFStringRef;
+        pub(super) static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
+
+        pub(super) fn CVPixelBufferPoolCreatePixelBuffer(
+            allocator: CFAllocatorRef,
+            pixel_buffer_pool: CVPixelBufferPoolRef,
+            pixel_buffer_out: *mut CVPixelBufferRef,
+        ) -> i32;
+        pub(super) fn VTCompressionSessionGetPixelBufferPool(
+            session: VTCompressionSessionRef,
+        ) -> CVPixelBufferPoolRef;
         pub(super) fn CVPixelBufferCreate(
             allocator: CFAllocatorRef,
             width: usize,
@@ -930,7 +950,76 @@ mod ffi {
         bitrate_bps: u32,
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
+        full_range: bool,
     ) -> Result<SessionGuard> {
+        // Supplying explicit source attributes makes VideoToolbox expose a
+        // matching CVPixelBufferPool. Allocating frames from that pool lets VT
+        // recycle its large backing stores after each asynchronous encode,
+        // instead of asking CoreVideo for a fresh 1080p/4K allocation at 60 Hz.
+        let pixel_format = if full_range {
+            K_CV_PIXEL_FORMAT_TYPE_420F
+        } else {
+            K_CV_PIXEL_FORMAT_TYPE_32_BGRA
+        };
+        let width_i32 = i32::from(width);
+        let height_i32 = i32::from(height);
+        let pixel_format_i32 = pixel_format as i32;
+        let width_number = unsafe {
+            CFNumberCreate(
+                ptr::null(),
+                KCF_NUMBER_INT32_TYPE,
+                &width_i32 as *const i32 as *const c_void,
+            )
+        };
+        let height_number = unsafe {
+            CFNumberCreate(
+                ptr::null(),
+                KCF_NUMBER_INT32_TYPE,
+                &height_i32 as *const i32 as *const c_void,
+            )
+        };
+        let pixel_format_number = unsafe {
+            CFNumberCreate(
+                ptr::null(),
+                KCF_NUMBER_INT32_TYPE,
+                &pixel_format_i32 as *const i32 as *const c_void,
+            )
+        };
+        if width_number.is_null() || height_number.is_null() || pixel_format_number.is_null() {
+            unsafe {
+                for number in [width_number, height_number, pixel_format_number] {
+                    if !number.is_null() {
+                        CFRelease(number);
+                    }
+                }
+            }
+            bail!("CFNumberCreate failed for source pixel-buffer attributes");
+        }
+        let source_attributes = unsafe {
+            let keys = [
+                kCVPixelBufferWidthKey,
+                kCVPixelBufferHeightKey,
+                kCVPixelBufferPixelFormatTypeKey,
+            ];
+            let values = [width_number, height_number, pixel_format_number];
+            CFDictionaryCreate(
+                ptr::null(),
+                keys.as_ptr().cast(),
+                values.as_ptr().cast(),
+                keys.len() as isize,
+                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+            )
+        };
+        unsafe {
+            CFRelease(width_number);
+            CFRelease(height_number);
+            CFRelease(pixel_format_number);
+        }
+        if source_attributes.is_null() {
+            bail!("CFDictionaryCreate failed for source pixel-buffer attributes");
+        }
+
         let mut session: VTCompressionSessionRef = ptr::null();
         let status = unsafe {
             VTCompressionSessionCreate(
@@ -939,13 +1028,14 @@ mod ffi {
                 i32::from(height),
                 K_CM_VIDEO_CODEC_TYPE_H264,
                 ptr::null(),
-                ptr::null(),
+                source_attributes,
                 ptr::null(),
                 Some(output_callback),
                 tx_ctx,
                 &mut session,
             )
         };
+        unsafe { CFRelease(source_attributes) };
         if status != 0 || session.is_null() {
             bail!("VTCompressionSessionCreate failed: OSStatus {status}");
         }
@@ -1583,6 +1673,38 @@ mod ffi {
         Ok(())
     }
 
+    fn frame_buffer(
+        guard: &SessionGuard,
+        width: u16,
+        height: u16,
+        pixel_format: OSType,
+    ) -> Result<CVPixelBufferRef> {
+        let mut buffer = ptr::null();
+        let pool = unsafe { VTCompressionSessionGetPixelBufferPool(guard.session) };
+        if !pool.is_null() {
+            let status =
+                unsafe { CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &mut buffer) };
+            if status == 0 && !buffer.is_null() {
+                return Ok(buffer);
+            }
+        }
+
+        let status = unsafe {
+            CVPixelBufferCreate(
+                ptr::null(),
+                width.into(),
+                height.into(),
+                pixel_format,
+                ptr::null(),
+                &mut buffer,
+            )
+        };
+        if status != 0 || buffer.is_null() {
+            bail!("CVPixelBuffer allocation failed: {status}");
+        }
+        Ok(buffer)
+    }
+
     #[allow(clippy::too_many_arguments)] // internal FFI helper; grouping into a struct adds no clarity
     pub(super) fn encode_frame(
         guard: &SessionGuard,
@@ -1603,34 +1725,34 @@ mod ffi {
             K_CV_PIXEL_FORMAT_TYPE_32_BGRA
         };
         let preparation = crate::stats::global().map(|s| (s, std::time::Instant::now()));
-        let mut pbuf: CVPixelBufferRef = ptr::null();
-        let status = unsafe {
-            CVPixelBufferCreate(
-                ptr::null(),
-                width.into(),
-                height.into(),
-                pixel_format,
-                ptr::null(),
-                &mut pbuf,
-            )
-        };
-        if status != 0 || pbuf.is_null() {
-            bail!("CVPixelBufferCreate failed: {status}");
-        }
+        let pbuf = frame_buffer(guard, width, height, pixel_format)?;
 
         // Pixel buffer ownership: VTCompressionSessionEncodeFrame
         // retains the CVPixelBuffer for the duration of the encode, so
         // we release our reference right after submit. The actual
         // CFRelease lives in the cleanup path below regardless of
         // success/failure so we don't leak on errors.
-        let result = unsafe {
-            CVPixelBufferLockBaseAddress(pbuf, 0);
+        let lock_status = unsafe { CVPixelBufferLockBaseAddress(pbuf, 0) };
+        if lock_status != 0 {
+            unsafe { CFRelease(pbuf) };
+            bail!("CVPixelBufferLockBaseAddress failed: {lock_status}");
+        }
+
+        let populate_result: Result<()> = (|| unsafe {
             if full_range {
                 // Two planes: Y (full size) + interleaved CbCr (half size).
                 let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
                 let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
                 let cbcr_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 1) as *mut u8;
                 let cbcr_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 1);
+                if y_base.is_null() || cbcr_base.is_null() {
+                    bail!("CVPixelBuffer returned a null NV12 plane");
+                }
+                if y_stride < usize::from(width) || cbcr_stride < usize::from(width) {
+                    bail!(
+                        "CVPixelBuffer NV12 stride too small: Y {y_stride}, CbCr {cbcr_stride}, width {width}"
+                    );
+                }
                 let y_plane =
                     std::slice::from_raw_parts_mut(y_base, y_stride * usize::from(height));
                 let cbcr_plane = std::slice::from_raw_parts_mut(
@@ -1668,6 +1790,14 @@ mod ffi {
                 let dst = CVPixelBufferGetBaseAddress(pbuf) as *mut u8;
                 let dst_stride = CVPixelBufferGetBytesPerRow(pbuf);
                 let row_bytes = usize::from(width) * 4;
+                if dst.is_null() {
+                    bail!("CVPixelBuffer returned a null BGRA base address");
+                }
+                if dst_stride < row_bytes {
+                    bail!(
+                        "CVPixelBuffer BGRA stride too small: have {dst_stride}, need {row_bytes}"
+                    );
+                }
                 // CVPixelBuffer may have a different stride than the source
                 // (alignment to 64 bytes is common). Copy row by row.
                 for row in 0..usize::from(height) {
@@ -1680,12 +1810,23 @@ mod ffi {
                     );
                 }
             }
-            CVPixelBufferUnlockBaseAddress(pbuf, 0);
-            if let Some((stats, start)) = preparation {
-                stats.record_encode_preparation(start.elapsed());
-            }
-            submit_to_vt(guard, pbuf, pts, fps, force_keyframe)
-        };
+            Ok(())
+        })();
+        let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pbuf, 0) };
+        if let Err(error) = populate_result {
+            unsafe { CFRelease(pbuf) };
+            return Err(error);
+        }
+        if unlock_status != 0 {
+            unsafe { CFRelease(pbuf) };
+            bail!("CVPixelBufferUnlockBaseAddress failed: {unlock_status}");
+        }
+
+        if let Some((stats, started)) = preparation {
+            stats.record_encode_preparation(started.elapsed());
+        }
+
+        let result = submit_to_vt(guard, pbuf, pts, fps, force_keyframe);
         unsafe { CFRelease(pbuf) };
         result
     }
@@ -1707,20 +1848,7 @@ mod ffi {
         let half_width = width_usize / 2;
         let half_height = height_usize / 2;
 
-        let mut pbuf: CVPixelBufferRef = ptr::null();
-        let status = unsafe {
-            CVPixelBufferCreate(
-                ptr::null(),
-                width.into(),
-                height.into(),
-                K_CV_PIXEL_FORMAT_TYPE_420F,
-                ptr::null(),
-                &mut pbuf,
-            )
-        };
-        if status != 0 || pbuf.is_null() {
-            bail!("AVC444 CVPixelBuffer allocation failed: {status}");
-        }
+        let pbuf = frame_buffer(guard, width, height, K_CV_PIXEL_FORMAT_TYPE_420F)?;
 
         let lock_status = unsafe { CVPixelBufferLockBaseAddress(pbuf, 0) };
         if lock_status != 0 {
