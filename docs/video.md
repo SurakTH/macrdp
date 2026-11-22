@@ -18,6 +18,12 @@ Graphics details, **Codecs used** identifies the active codec. **Client
 compatibility** lists available decoders. Verify that the desktop is visible
 and updates during scrolling before recording an interoperability result.
 
+In the wired 1080p/60 trial on November 22, 2026, Windows App client
+1.2.7493.0 (x64) on Windows 11 build 26300 reported HEVC as the active
+codec. The tester saw the Mac desktop update during movement. The client
+reported 65 FPS in one snapshot. Sustained frame rate and comparative
+image quality still need a matched H.264 run.
+
 ## Display resolution (`--hidpi`)
 
 By default macrdp captures and advertises the Mac's **logical** resolution — the points it reports in System Settings (e.g. 1512×982 on a default-scaled 14" MacBook). On a Retina panel that's half the physical pixels, so any client whose window is larger upscales it and text looks soft.
