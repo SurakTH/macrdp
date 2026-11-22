@@ -7,8 +7,12 @@ reconnect quirk and its fixes, and the color-conversion implementation notes.
 
 ## Experimental HEVC420 with Windows App
 
-Start the experimental binary with `MACRDP_EXPERIMENTAL_HEVC=1` and the usual
-`--enable-h264` arguments. The server selects HEVC420 when the client offers
+In Controller, choose **Prefer H.265 (HEVC) · Preview** under Video → Video codec,
+or choose a 1080p/60, 1440p/60, or 4K/60 preset under **HEVC profiles**. Review
+the changes and click Apply. Performance shows the codec negotiated for the
+current session. For config files, set `ENABLE_H264=1` and `PREFER_HEVC=1`.
+For direct command-line launches, set `MACRDP_EXPERIMENTAL_HEVC=1` and pass
+`--enable-h264`. The server selects HEVC420 when the client offers
 the supported EGFX 11.2 capability with flags `0x00000400`. Clients offering
 only AVC follow the existing AVC negotiation. The wire format follows the
 [FreeRDP HEVC420 decoder](https://github.com/FreeRDP/FreeRDP/blob/master/channels/rdpgfx/client/rdpgfx_codec.c).
@@ -23,6 +27,66 @@ In the wired 1080p/60 trial on November 22, 2026, Windows App client
 codec. The tester saw the Mac desktop update during movement. The client
 reported 65 FPS in one snapshot. Sustained frame rate and comparative
 image quality still need a matched H.264 run.
+
+### 4K HEVC latency tuning
+
+In Video → TCP video pacing, set **Unacknowledged frame limit** to 3 to
+bound the decode backlog with compatible TCP clients. Keep the same workload
+when comparing runs. **ACK queue delay** describes server-side acknowledgement
+timing. Check actual drag and scroll responsiveness in Windows App as well.
+
+In Video → Advanced Video, **Prioritize HEVC encoding speed** enables the
+VideoToolbox speed hint. For config files, use `HEVC_HIGH_SPEED=1`. For a
+direct CLI launch, set `MACRDP_HEVC_HIGH_SPEED=1`. The **4K/60 HEVC
+Preview** profile enables it and uses an acknowledgement limit of two. Check small text during motion at the same bitrate when comparing the
+two modes.
+
+With **Responsive capture** and the standard flush cadence, macrdp waits
+another half of a capture interval before the first duplicate frame. If the
+latest capture has yet to be submitted, it still retries at the normal cadence.
+
+HEVC with TCP video pacing watches for a pending local graphics write. After
+50 ms it defers new encoder submissions. When the pending write completes,
+it wakes the capture loop to retry an unsent picture ahead of the normal
+flush timer. The diagnostic recording counts local-write deferrals
+alongside overall TCP pacing deferrals. It also reports client graphics timing
+when the client sends it, including the number of nonzero reports used in each
+average. These client times describe parts of frame processing. Measuring
+input-to-screen delay requires timing the input and the visible result.
+
+In a follow-up Windows App session, the TCP recovery notification was used
+once shortly after connection. The next two windows of 60 and 90 seconds
+queued 54.9 and 58.6 FPS, with ACK queue p95 of 15 and 13 ms respectively.
+Neither window had a local TCP write deferral. The Mac main display used a
+3840×2160 backing mode at 60 Hz with a 1920×1080 logical desktop.
+
+A short controlled motion test queued 59.5–60.0 FPS with 6–8 ms ACK queue
+p95. This included two 60 Hz animation phases and one 30 Hz phase. The
+capture stream delivered roughly 60 pixel buffers per second in every
+phase, including a stationary test window. The number of buffers measures
+capture throughput. It does not establish how often the app content changed.
+
+Windows App 1.2.7493.0 subsequently reported 58 FPS, HEVC, and GPU
+presentation capability in the wired 4K session. During the 5.9 seconds
+before that snapshot, macrdp queued 58.1 FPS and timed 58.2 frame
+acknowledgements per second. Sampled ACK queue p95 was 12 ms. The client
+snapshot and server counters describe throughput over a short interval.
+
+An 80 ms VideoToolbox data-rate limit was tested with a synthetic moving
+4K/60 pattern at a 60 Mbps average target. Limits of 0.6–1.0 MB reduced
+the largest encoded frame by 8–17%, dropped 4–33 of 120 input frames, and
+lowered sampled luma PSNR by about 2 dB. The unrestricted runs encoded all
+120 frames. These settings were left out of the preview preset.
+
+In a wired 4K trial with a 60 FPS limit, a 60 Mbps target, direct NV12
+capture, HEVC high-speed encoding and an acknowledgement limit of two, two
+runs of the updated build queued about 58 frames per second. The longer run
+recorded 29 ms at p95 for the acknowledgement queue, compared with 46 ms in
+an earlier run using the same settings. The workloads varied. The updated
+build still logged occasional slow writes of large graphics batches. These
+writes can delay graphics acknowledgements. The server handles Fast-Path
+mouse and keyboard input separately, and the logs alone do not identify
+input-to-screen latency.
 
 ## Display resolution (`--hidpi`)
 

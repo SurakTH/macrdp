@@ -8,13 +8,18 @@ import SwiftUI
 /// Network exposure is deliberately not part of a performance profile; the
 /// user enables LAN access separately and sees the existing security warning.
 enum PerformanceProfile: String, CaseIterable, Identifiable {
-    case stable, ultimate, lan, native, fast, fourK, fourKText
+    case stable, hevc1080, hevc1440, hevc4K, ultimate, lan, native, fast, fourK, fourKText
+
+    static let hevcProfiles: [Self] = [.hevc1080, .hevc1440, .hevc4K]
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .stable: return "Stable"
+        case .hevc1080: return "1080p/60 HEVC Preview"
+        case .hevc1440: return "1440p/60 HEVC Preview"
+        case .hevc4K: return "4K/60 HEVC Preview"
         case .ultimate: return "Ultimate"
         case .lan: return "LAN Max"
         case .native: return "Native"
@@ -28,6 +33,12 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
         switch self {
         case .stable:
             return "1080p AVC420 at 60 FPS with a 60 Mbps adaptive bitrate target over TCP. Tested on wired LAN."
+        case .hevc4K:
+            return "4K/60 over TCP with HEVC on compatible clients, faster encoding, NV12, and a two-frame acknowledgement limit."
+        case .hevc1080:
+            return "1080p/60 over TCP with HEVC on compatible clients, direct NV12 capture, and a 60 Mbps adaptive ceiling."
+        case .hevc1440:
+            return "2560 × 1440 at 60 FPS over TCP with direct NV12 capture and a 60 Mbps adaptive ceiling."
         case .ultimate:
             return "Best overall balance: AVC420 at 60 FPS, 25 Mbps adaptive, UDP offered, AAC."
         case .lan:
@@ -46,6 +57,8 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
     var settings: [String: String] {
         var values = [
             "AVC444": "0",
+            "PREFER_HEVC": "0",
+            "HEVC_HIGH_SPEED": "0",
             "CAPTURE_SIZE": "",
             "UDP_MIGRATE_EGFX": "0",
             "KEYFRAME_INTERVAL": "2.0",
@@ -61,6 +74,18 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             "STATS_ENDPOINT": "1",
         ]
         switch self {
+        case .hevc4K:
+            return PerformanceProfile.hevc1080.settings.merging([
+                "CAPTURE_SIZE": "3840x2160", "HEVC_HIGH_SPEED": "1",
+                "RESPONSIVE_CAPTURE": "1", "H264_MAX_UNACKED_FRAMES": "2",
+                "KEYFRAME_ON_CHANGE": "0",
+            ]) { _, new in new }
+        case .hevc1080:
+            return PerformanceProfile.stable.settings.merging([
+                "PREFER_HEVC": "1", "CAPTURE_NV12": "1",
+            ]) { _, new in new }
+        case .hevc1440:
+            return PerformanceProfile.hevc1080.settings.merging(["CAPTURE_SIZE": "2560x1440"]) { _, new in new }
         case .stable:
             values.merge([
                 "ENABLE_H264": "1", "HIDPI": "0", "CAPTURE_SIZE": "1920x1080",
@@ -121,7 +146,7 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             if key == "H264_MAX_UNACKED_FRAMES" {
                 return UInt32(SettingsModel.pacingLimit(in: config)) == UInt32(value)
             }
-            if key == "CAPTURE_NV12" || key == "ENABLE_LOSSY_AUDIO" {
+            if ["CAPTURE_NV12", "ENABLE_LOSSY_AUDIO", "PREFER_HEVC", "HEVC_HIGH_SPEED"].contains(key) {
                 return SettingsModel.settingEnabled(key, in: config) == (value == "1")
             }
             return config[key, default: Self.settingFallback(key)] == value
@@ -130,6 +155,27 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
 
     static func settingFallback(_ key: String) -> String {
         key == "RESPONSIVE_CAPTURE" ? "0" : ""
+    }
+}
+
+enum VideoCodecPreference: String, CaseIterable {
+    case h264, hevc, bitmap
+
+    init(config: [String: String]) {
+        let extra = (config["EXTRA_FLAGS"] ?? "").split(whereSeparator: \.isWhitespace)
+        if config["ENABLE_H264"] == "1" || extra.contains("--enable-h264") {
+            self = config["PREFER_HEVC"] == "1" ? .hevc : .h264
+        } else {
+            self = .bitmap
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .h264: return "H.264 (AVC)"
+        case .hevc: return "Prefer H.265 (HEVC) · Preview"
+        case .bitmap: return "Bitmap / Legacy"
+        }
     }
 }
 
@@ -257,8 +303,11 @@ final class SettingsModel: ObservableObject {
             available && settingEnabled(key, in: config) ? "On" : "Off"
         }
         let physicalSize = config["CAPTURE_SIZE"] ?? ""
-        let video = settingEnabled("ENABLE_H264", in: config)
+        let preference = VideoCodecPreference(config: config)
+        let video = preference != .bitmap
         let avc444 = settingEnabled("AVC444", in: config)
+        let avc = avc444 ? "H.264 AVC444" : "H.264 AVC420"
+        let codec = preference == .hevc ? "Prefer H.265 (HEVC) · \(avc) fallback" : avc
         let size = config["VIRTUAL_DISPLAY"] == "1"
             ? "Virtual display · " + formattedSize(virtualResolution(config))
             : physicalSize.isEmpty
@@ -273,7 +322,8 @@ final class SettingsModel: ObservableObject {
             ("Capture size", size),
             ("Frame rate limit", "\(fps) fps"),
             ("Bitrate ceiling", video ? "\(bitrate) Mbps" : "Unavailable"),
-            ("Video codec", video ? (avc444 ? "H.264 AVC444" : "H.264 AVC420") : "Bitmap / RemoteFX"),
+            ("Video codec", video ? codec : "Bitmap / RemoteFX"),
+            ("Prioritize HEVC encoding speed", toggle("HEVC_HIGH_SPEED", when: preference == .hevc)),
             ("Adaptive bitrate", toggle("ADAPTIVE_BITRATE", when: video)),
             ("Capture mode", video && !avc444 && settingEnabled("CAPTURE_NV12", in: config) ? "NV12" : "Standard"),
             ("Responsive capture", toggle("RESPONSIVE_CAPTURE", when: video)),
@@ -469,6 +519,16 @@ final class SettingsModel: ObservableObject {
 
     func boolBinding(_ key: String, default def: Bool = false) -> Binding<Bool> {
         Binding(get: { self.bool(key, default: def) }, set: { self.setBool(key, $0) })
+    }
+
+    var videoCodecPreference: VideoCodecPreference { VideoCodecPreference(config: draft) }
+
+    func setVideoCodecPreference(_ preference: VideoCodecPreference) {
+        cleanExtraFlags(preference == .bitmap ? ["--enable-h264", "--avc444"] : ["--enable-h264"])
+        if preference != .bitmap {
+            draft["PREFER_HEVC"] = preference == .hevc ? "1" : "0"
+        }
+        setBool("ENABLE_H264", preference != .bitmap)
     }
 
     func stringBinding(_ key: String, default def: String = "") -> Binding<String> {

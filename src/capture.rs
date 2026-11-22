@@ -1081,6 +1081,11 @@ mod macos {
     use crate::frame_flush::FrameFlush;
     use crate::h264::FrameSubmission::{Deferred, Inactive, Submitted};
     use anyhow::{anyhow, Context};
+    use core_foundation::array::CFArray;
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::{CFString, CFStringRef};
     use screencapturekit::async_api::AsyncSCShareableContent;
     use screencapturekit::cm::{CMSampleBuffer, SCFrameStatus};
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
@@ -1144,14 +1149,66 @@ mod macos {
 
     struct CaptureSample {
         buffer: CMSampleBuffer,
+        image: Option<CVPixelBuffer>,
         status: Option<SCFrameStatus>,
         received_at: Option<Instant>,
     }
 
     impl CaptureSample {
         fn has_content(&self) -> bool {
-            self.status.is_none_or(SCFrameStatus::has_content)
+            self.image.is_some()
         }
+    }
+
+    #[link(name = "CoreMedia", kind = "framework")]
+    unsafe extern "C" {
+        fn CMSampleBufferGetSampleAttachmentsArray(
+            sample: CFTypeRef,
+            create_if_necessary: u8,
+        ) -> CFTypeRef;
+    }
+
+    #[link(name = "ScreenCaptureKit", kind = "framework")]
+    unsafe extern "C" {
+        static SCStreamFrameInfoStatus: CFStringRef;
+    }
+
+    fn screen_frame_status(sample: &CMSampleBuffer) -> Option<SCFrameStatus> {
+        // ScreenCaptureKit stores the enum's integer raw value in the
+        // dictionary. screencapturekit 2.1 casts it directly to the Swift enum.
+        // SAFETY: the live sample owns the attachment array. Wrap borrowed
+        // Core Foundation objects under the get rule to retain them locally.
+        let attachments = unsafe { CMSampleBufferGetSampleAttachmentsArray(sample.as_ptr(), 0) };
+        if attachments.is_null() {
+            return None;
+        }
+        let attachments = unsafe {
+            CFArray::<CFDictionary<CFString, CFType>>::wrap_under_get_rule(attachments.cast())
+        };
+        let first = attachments.get(0)?;
+        let key = unsafe { CFString::wrap_under_get_rule(SCStreamFrameInfoStatus) };
+        status_from_attachments(&first, &key)
+    }
+
+    fn status_from_attachments(
+        attachments: &CFDictionary<CFString, CFType>,
+        key: &CFString,
+    ) -> Option<SCFrameStatus> {
+        let raw = attachments.find(key)?.downcast::<CFNumber>()?.to_i32()?;
+        SCFrameStatus::from_raw(raw)
+    }
+
+    #[test]
+    fn screen_capture_status_decodes_integer_attachments() {
+        let key = unsafe { CFString::wrap_under_get_rule(SCStreamFrameInfoStatus) };
+        let attachments =
+            CFDictionary::from_CFType_pairs(&[(key.clone(), CFNumber::from(1).as_CFType())]);
+        assert_eq!(
+            status_from_attachments(&attachments, &key),
+            Some(SCFrameStatus::Idle)
+        );
+        let malformed = CFDictionary::from_CFType_pairs(&[(key.clone(), key.as_CFType())]);
+        assert_eq!(status_from_attachments(&malformed, &key), None);
     }
 
     #[derive(Default)]
@@ -1211,9 +1268,14 @@ mod macos {
             stream.add_output_handler(
                 move |sample: CMSampleBuffer, _| {
                     let stats = crate::stats::global();
-                    let status = sample.frame_status();
+                    let status = screen_frame_status(&sample);
+                    let image = status
+                        .is_none_or(SCFrameStatus::has_content)
+                        .then(|| sample.image_buffer())
+                        .flatten();
                     let sample = CaptureSample {
                         buffer: sample,
+                        image,
                         status,
                         received_at: stats.map(|_| Instant::now()),
                     };
@@ -1484,11 +1546,21 @@ mod macos {
         fn track_egfx_frame(&mut self, submitted: bool) {
             self.seeded = true;
             self.first_egfx_frame_sent |= submitted;
+            // With responsive capture, give the next display tick a chance
+            // to arrive before encoding a copy. Explicit fast-flush intervals
+            // still keep their requested cadence.
+            let trailing_delay =
+                if self.stream.responsive_capture && self.flush_interval == self.frame_interval {
+                    self.frame_interval + self.frame_interval / 2
+                } else {
+                    Duration::ZERO
+                };
             self.flush_burst.arm(
                 self.flush_frames,
                 submitted,
                 Instant::now(),
                 self.flush_interval,
+                trailing_delay,
             );
         }
 
@@ -2204,6 +2276,12 @@ mod macos {
                 self.promote_frame_to_egfx();
 
                 if let Some(update) = self.pending.pop_front() {
+                    if matches!(&update, DisplayUpdate::Bitmap(_)) {
+                        if let Some(stats) = crate::stats::global() {
+                            stats.end_video_session();
+                            stats.set_video_codec(crate::stats::VideoCodec::Bitmap);
+                        }
+                    }
                     return Ok(Some(update));
                 }
 
@@ -2276,7 +2354,27 @@ mod macos {
                     };
                     let poll_at = now + poll_interval;
                     let wake_at = flush_at.map_or(poll_at, |deadline| deadline.min(poll_at));
-                    match tokio::time::timeout_at(wake_at.into(), self.stream.next()).await {
+                    let sample = tokio::time::timeout_at(wake_at.into(), self.stream.next());
+                    let sample = if let Some(gfx) = self
+                        .gfx
+                        .as_ref()
+                        .filter(|_| !self.held_frame && self.flush_burst.has_deferred_capture())
+                    {
+                        tokio::select! {
+                            biased;
+                            sample = sample => sample,
+                            () = gfx.wait_for_tcp_dispatch_resume() => {
+                                self.flush_burst.retry_deferred_now(Instant::now());
+                                if let Some(stats) = crate::stats::global() {
+                                    stats.tcp_resume_wakes.fetch_add(1, Ordering::Relaxed);
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        sample.await
+                    };
+                    match sample {
                         Ok(sample) => sample,
                         Err(_) => {
                             if self.held_frame {
@@ -2294,21 +2392,18 @@ mod macos {
                 };
 
                 // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
-                if !sample.has_content() {
+                let Some(pixel_buffer) = sample.image else {
                     if sample.status == Some(SCFrameStatus::Idle) {
                         self.refresh_idle_resume();
                     }
                     continue;
-                }
+                };
                 let received_at = sample.received_at;
                 let sample = sample.buffer;
 
                 if let Some(stats) = crate::stats::global() {
                     stats.capture_content.fetch_add(1, Ordering::Relaxed);
                 }
-                let Some(pixel_buffer) = sample.image_buffer() else {
-                    continue;
-                };
 
                 // Dimensions come from the buffer itself, no lock: in NV12 mode
                 // the EGFX path never needs the pixels on the CPU at all.

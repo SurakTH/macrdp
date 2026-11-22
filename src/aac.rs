@@ -394,9 +394,9 @@ mod tests {
             pcm.extend_from_slice(&v.to_le_bytes()); // R
         }
 
-        // Feed in resampler-sized chunks (~941 frames) to mimic the real path.
+        // Feed 10 ms of PCM per call, matching the capture resampler.
         let mut packets = Vec::new();
-        for chunk in pcm.chunks(941 * 4) {
+        for chunk in pcm.chunks(sample_rate as usize / 100 * 4) {
             packets.extend(enc.encode(chunk).expect("encode"));
         }
 

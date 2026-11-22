@@ -808,6 +808,9 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
         static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
+        static kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: CFStringRef;
+        static kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: CFStringRef;
+        static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         // Color-space signaling so the encoded SPS VUI describes its color
@@ -939,6 +942,12 @@ mod ffi {
             output_callback_ref_con: *mut c_void,
             compression_session_out: *mut VTCompressionSessionRef,
         ) -> OSStatus;
+        fn VTSessionCopyProperty(
+            session: VTCompressionSessionRef,
+            property_key: CFStringRef,
+            allocator: CFAllocatorRef,
+            value_out: *mut CFTypeRef,
+        ) -> OSStatus;
         pub(super) fn VTSessionSetProperty(
             session: VTCompressionSessionRef,
             property_key: CFStringRef,
@@ -1062,6 +1071,22 @@ mod ffi {
             bail!("CFDictionaryCreate failed for source pixel-buffer attributes");
         }
 
+        let specification = if codec == PictureCodec::Hevc420 {
+            unsafe {
+                let key = kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder;
+                let value = kCFBooleanTrue;
+                CFDictionaryCreate(
+                    ptr::null(),
+                    &key,
+                    &value,
+                    1,
+                    &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                    &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+                )
+            }
+        } else {
+            ptr::null()
+        };
         let mut session: VTCompressionSessionRef = ptr::null();
         let status = unsafe {
             VTCompressionSessionCreate(
@@ -1073,7 +1098,7 @@ mod ffi {
                 } else {
                     K_CM_VIDEO_CODEC_TYPE_H264
                 },
-                ptr::null(),
+                specification,
                 source_attributes,
                 ptr::null(),
                 Some(output_callback),
@@ -1081,7 +1106,12 @@ mod ffi {
                 &mut session,
             )
         };
-        unsafe { CFRelease(source_attributes) };
+        unsafe {
+            CFRelease(source_attributes);
+            if !specification.is_null() {
+                CFRelease(specification);
+            }
+        }
         if status != 0 || session.is_null() {
             bail!("VTCompressionSessionCreate failed: OSStatus {status}");
         }
@@ -1171,9 +1201,39 @@ mod ffi {
             )?;
         }
 
+        if codec == PictureCodec::Hevc420
+            && std::env::var("MACRDP_HEVC_HIGH_SPEED").as_deref() == Ok("1")
+        {
+            match unsafe {
+                set_bool(
+                    session,
+                    kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+                    kCFBooleanTrue,
+                )
+            } {
+                Ok(()) => tracing::info!("HEVC high-speed encoding enabled"),
+                Err(error) => tracing::warn!(%error, "HEVC high-speed encoding unavailable"),
+            }
+        }
+
         let prepared = unsafe { VTCompressionSessionPrepareToEncodeFrames(session) };
         if prepared != 0 {
             bail!("VTCompressionSessionPrepareToEncodeFrames failed: OSStatus {prepared}");
+        }
+        if codec == PictureCodec::Hevc420 {
+            unsafe {
+                let mut value = ptr::null();
+                let status = VTSessionCopyProperty(
+                    session,
+                    kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                    ptr::null(),
+                    &mut value,
+                );
+                if status == 0 && !value.is_null() {
+                    tracing::info!(hardware = value == kCFBooleanTrue, "HEVC encoder ready");
+                    CFRelease(value);
+                }
+            }
         }
         Ok(guard)
     }

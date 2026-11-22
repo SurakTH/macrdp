@@ -3,6 +3,24 @@ import CoreFoundation
 
 struct LiveStats {
     let videoActive: Bool?
+    let videoCodec: String?
+    var videoCodecLabel: String {
+        switch videoCodec {
+        case "hevc420": return "H.265 / HEVC · 4:2:0"
+        case "avc420": return "H.264 / AVC · 4:2:0"
+        case "avc444": return "H.264 / AVC · 4:4:4"
+        case "bitmap": return "Bitmap graphics"
+        case "none": return "Waiting for video"
+        default: return "Not reported by server"
+        }
+    }
+    func sessionCodecLabel(preference: VideoCodecPreference) -> String {
+        if hasActiveVideo && preference == .hevc && (videoCodec == "avc420" || videoCodec == "avc444") {
+            return "H.264 · fallback"
+        }
+        return videoCodecLabel
+    }
+
     var hasActiveVideo: Bool { videoActive != false && width > 0 && height > 0 }
     let processId: Int
     let width: Int
@@ -65,7 +83,7 @@ struct LiveStats {
                   let micros = number(prefix + "_total_us") else { return nil }
             return TimingTotals(samples: samples, micros: micros)
         }
-        return LiveStats(videoActive: o["video_active"] as? Bool, processId: int("process_id"), width: int("width"), height: int("height"),
+        return LiveStats(videoActive: o["video_active"] as? Bool, videoCodec: o["video_codec"] as? String, processId: int("process_id"), width: int("width"), height: int("height"),
             bitrateBps: int("bitrate_bps"), ceilingBps: int("ceiling_bps"),
             rttMs: int("rtt_ms"), queueMs: int("queue_delay_ms"), fps: int("fps"),
             frames: int("frames_sent"), adaptive: (o["adaptive"] as? NSNumber)?.boolValue ?? false,
@@ -179,7 +197,7 @@ enum PerformanceAvailability: Equatable {
         case .stopped: return "The managed server is stopped. Start it in Status, then connect from Windows."
         case .disabled: return "Live statistics are off in the saved settings. Enable them in Advanced and Apply."
         case .unavailable: return "The server is running, but telemetry could not be read. Check the statistics port and server logs."
-        case .waitingForVideo: return "Telemetry is available. Connect with an H.264 client to see video metrics."
+        case .waitingForVideo: return "Telemetry is available. Connect with a compatible client to see encoded video metrics."
         case .streaming: return "Live · refreshes every 2 seconds"
         }
     }

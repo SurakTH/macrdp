@@ -133,11 +133,24 @@ final class PerformanceTelemetryTests: XCTestCase {
         history.record(nil)
         XCTAssertTrue(history.samples.isEmpty)
         XCTAssertNil(LiveStats.decode(Data("{}".utf8)))
+        XCTAssertEqual(try snapshot(["video_codec": "hevc420"]).videoCodecLabel, "H.265 / HEVC · 4:2:0")
+        XCTAssertEqual(try snapshot(["video_codec": "avc420"]).videoCodecLabel, "H.264 / AVC · 4:2:0")
+        XCTAssertEqual(try snapshot(["video_codec": "none"]).videoCodecLabel, "Waiting for video")
         let legacy = try XCTUnwrap(LiveStats.decode(Data("{\"width\":1920,\"fps\":60}".utf8)))
         XCTAssertNil(legacy.queuedFrames)
         history.record(legacy)
         history.record(legacy)
         XCTAssertNil(history.latest)
+    }
+
+    func testCodecFallbackRequiresActiveAvcAndSavedHevcPreference() throws {
+        let avc = try snapshot(["video_codec": "avc420"])
+        XCTAssertEqual(avc.sessionCodecLabel(preference: .hevc), "H.264 · fallback")
+        XCTAssertEqual(avc.sessionCodecLabel(preference: .h264), "H.264 / AVC · 4:2:0")
+        XCTAssertEqual(try snapshot(["video_codec": "avc444"]).sessionCodecLabel(preference: .hevc), "H.264 · fallback")
+        XCTAssertEqual(try snapshot(["video_codec": "hevc420"]).sessionCodecLabel(preference: .hevc), "H.265 / HEVC · 4:2:0")
+        XCTAssertEqual(try snapshot(["video_codec": "bitmap"]).sessionCodecLabel(preference: .hevc), "Bitmap graphics")
+        XCTAssertEqual(try snapshot(["video_codec": "avc420", "video_active": false]).sessionCodecLabel(preference: .hevc), avc.videoCodecLabel)
     }
 
     func testStaleAckIsUnknownAndHistoryIsBounded() throws {

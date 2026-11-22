@@ -58,7 +58,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use ironrdp_core::{Encode, EncodeResult, WriteCursor, decode, impl_as_any};
+use ironrdp_core::{Encode, EncodeResult, WriteCursor, cast_length, decode, ensure_size, impl_as_any};
 use ironrdp_dvc::{DvcEncode, DvcMessage, DvcProcessor, DvcServerProcessor};
 use ironrdp_graphics::zgfx::{CompressionMode, Compressor, compress_and_wrap_egfx, wrap_uncompressed};
 use ironrdp_pdu::gcc::Monitor;
@@ -85,6 +85,65 @@ const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 3;
 
 /// Special queue depth value indicating client has disabled acknowledgments
 const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = 0xFFFFFFFF;
+
+// MS-RDPEGFX 2.2.1.1. Match ironrdp_graphics::zgfx::wrap_uncompressed.
+const ZGFX_SEGMENT_LIMIT: usize = 65_535;
+const ZGFX_SINGLE_HEADER: [u8; 2] = [0xE0, 0x04];
+const ZGFX_MULTIPART_HEADER_SIZE: usize = 7;
+const ZGFX_SEGMENT_HEADER_SIZE: usize = 5;
+
+/// Owns the uncompressed PDU so DVC can pack it after the graphics lock is released.
+struct ZgfxUncompressedPdu(GfxPdu);
+
+impl Encode for ZgfxUncompressedPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        let pdu_size = self.0.size();
+        if pdu_size <= ZGFX_SEGMENT_LIMIT {
+            dst.write_array(ZGFX_SINGLE_HEADER);
+            return self.0.encode(dst);
+        }
+
+        let segments = pdu_size.div_ceil(ZGFX_SEGMENT_LIMIT);
+        let count = cast_length!("segmentCount", segments, in: dst)?;
+        let length = cast_length!("uncompressedSize", pdu_size, in: dst)?;
+        let wrapped_size = self.size();
+        let output = &mut dst.remaining_mut()[..wrapped_size];
+        self.0.encode(&mut WriteCursor::new(&mut output[..pdu_size]))?;
+        // Starting at the tail keeps the yet-to-be-moved data intact. Use the
+        // DVC destination as scratch to avoid a second frame-sized allocation.
+        for index in (0..segments).rev() {
+            let start = index * ZGFX_SEGMENT_LIMIT;
+            let segment_size = (pdu_size - start).min(ZGFX_SEGMENT_LIMIT);
+            let header_at = start + ZGFX_MULTIPART_HEADER_SIZE + index * ZGFX_SEGMENT_HEADER_SIZE;
+            output.copy_within(start..start + segment_size, header_at + ZGFX_SEGMENT_HEADER_SIZE);
+            let mut header = WriteCursor::new(&mut output[header_at..]);
+            header.write_u32(cast_length!("segmentSize", segment_size + 1, in: header)?);
+            header.write_u8(ZGFX_SINGLE_HEADER[1]);
+        }
+        let mut header = WriteCursor::new(output);
+        header.write_u8(0xE1);
+        header.write_u16(count);
+        header.write_u32(length);
+        dst.advance(wrapped_size);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn size(&self) -> usize {
+        let size = self.0.size();
+        if size <= ZGFX_SEGMENT_LIMIT {
+            size + ZGFX_SINGLE_HEADER.len()
+        } else {
+            size + ZGFX_MULTIPART_HEADER_SIZE + size.div_ceil(ZGFX_SEGMENT_LIMIT) * ZGFX_SEGMENT_HEADER_SIZE
+        }
+    }
+}
+
+impl DvcEncode for ZgfxUncompressedPdu {}
 
 /// Pre-encoded ZGFX-wrapped bytes for DVC transmission.
 ///
@@ -263,9 +322,9 @@ pub struct QoeMetrics {
     pub frame_id: u32,
     /// Client timestamp when decode started
     pub timestamp: u32,
-    /// Time difference for serial encode (microseconds)
+    /// Client StartFrame decode to EndFrame decode (milliseconds).
     pub time_diff_se: u16,
-    /// Time difference for decode and render (microseconds)
+    /// Client EndFrame decode to render completion (milliseconds).
     pub time_diff_dr: u16,
 }
 
@@ -1448,15 +1507,30 @@ impl GraphicsPipelineServer {
         regions: &[Avc420Region],
         timestamp_ms: u32,
     ) -> Option<u32> {
-        self.send_420_frame(surface_id, h264_data, regions, timestamp_ms, Codec1Type::Avc420)
+        self.send_420_frame(surface_id, regions, timestamp_ms, Codec1Type::Avc420, || {
+            encode_avc420_bitmap_stream(regions, h264_data)
+        })
     }
 
-    /// V11.2 HEVC NAL size table and Annex B data following the standard region metadata.
-    pub fn send_hevc420_frame(&mut self, surface_id: u16, data: &[u8], regions: &[Avc420Region], timestamp_ms: u32) -> Option<u32> {
-        self.send_420_frame(surface_id, data, regions, timestamp_ms, Codec1Type::Hevc420)
+    /// Queue a V11.2 HEVC stream including its region metadata, NAL size table, and Annex B data.
+    pub fn send_hevc420_frame(
+        &mut self,
+        surface_id: u16,
+        bitmap_data: Vec<u8>,
+        regions: &[Avc420Region],
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        self.send_420_frame(surface_id, regions, timestamp_ms, Codec1Type::Hevc420, || bitmap_data)
     }
 
-    fn send_420_frame(&mut self, surface_id: u16, data: &[u8], regions: &[Avc420Region], timestamp_ms: u32, codec_id: Codec1Type) -> Option<u32> {
+    fn send_420_frame(
+        &mut self,
+        surface_id: u16,
+        regions: &[Avc420Region],
+        timestamp_ms: u32,
+        codec_id: Codec1Type,
+        bitmap_data: impl FnOnce() -> Vec<u8>,
+    ) -> Option<u32> {
         if !self.is_ready() {
             return None;
         }
@@ -1473,7 +1547,6 @@ impl GraphicsPipelineServer {
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
 
-        let encoded_stream = encode_avc420_bitmap_stream(regions, data);
         let target_rect = Self::compute_dest_rect(regions, surface.width, surface.height);
 
         // MS-RDPEGFX requires three-PDU sequence per frame
@@ -1485,7 +1558,7 @@ impl GraphicsPipelineServer {
             codec_id,
             pixel_format: surface.pixel_format,
             destination_rectangle: target_rect,
-            bitmap_data: encoded_stream,
+            bitmap_data: bitmap_data(),
         }));
 
         self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
@@ -1974,6 +2047,13 @@ impl GraphicsPipelineServer {
     #[expect(clippy::as_conversions, reason = "Box<T> to Box<dyn Trait> coercion")]
     pub fn drain_output(&mut self) -> Vec<DvcMessage> {
         let mode = self.compression_mode;
+        if matches!(mode, CompressionMode::Never) {
+            return self
+                .output_queue
+                .drain(..)
+                .map(|pdu| Box::new(ZgfxUncompressedPdu(pdu)) as DvcMessage)
+                .collect();
+        }
         let pdus: Vec<_> = self.output_queue.drain(..).collect();
 
         // D2: ZGFX compression timing. drain_output runs synchronously on the
@@ -1997,11 +2077,8 @@ impl GraphicsPipelineServer {
                 pdu.encode(&mut cursor).expect("GfxPdu encoding should not fail");
                 total_uncompressed += pdu_size;
 
-                let wrapped = match mode {
-                    CompressionMode::Never => wrap_uncompressed(&pdu_bytes),
-                    _ => compress_and_wrap_egfx(&pdu_bytes, &mut self.zgfx_compressor, mode)
-                        .unwrap_or_else(|_| wrap_uncompressed(&pdu_bytes)),
-                };
+                let wrapped = compress_and_wrap_egfx(&pdu_bytes, &mut self.zgfx_compressor, mode)
+                    .unwrap_or_else(|_| wrap_uncompressed(&pdu_bytes));
                 total_compressed += wrapped.len();
                 trace!(pdu_name, pdu_size, wrapped = wrapped.len(), mode = ?mode, "ZGFX output");
 
@@ -2444,6 +2521,35 @@ mod capability_negotiation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_uncompressed_output_matches_zgfx_wrapper() {
+        use ironrdp_core::encode_vec;
+
+        let mut server = GraphicsPipelineServer::new(Box::new(DefaultsHandler));
+        for codec_id in [Codec1Type::Avc420, Codec1Type::Hevc420] {
+            for payload_size in [0, 25, 65_510, 65_511, 131_045, 131_046, 2_500_000] {
+                let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                    surface_id: 0,
+                    codec_id,
+                    pixel_format: PixelFormat::XRgb,
+                    destination_rectangle: ExclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: 3840,
+                        bottom: 2160,
+                    },
+                    bitmap_data: (0..payload_size).map(|index| (index % 251) as u8).collect(),
+                });
+                let expected = wrap_uncompressed(&encode_vec(&pdu).unwrap());
+                server.output_queue.push_back(pdu);
+                let messages = server.drain_output();
+                assert!(!server.has_pending_output());
+                assert_eq!(messages.len(), 1);
+                assert_eq!(encode_vec(messages[0].as_ref()).unwrap(), expected);
+            }
+        }
+    }
 
     #[test]
     fn was_issued_separates_stale_resume_acks_from_never_sent_ids() {

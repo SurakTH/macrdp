@@ -11,6 +11,13 @@ The capture loop also **self-heals a dead SCK audio stream**: over a long sessio
 
 **Mute on minimize** (default-on, opt out with `--no-mute-on-minimize`). When the client minimizes its window it sends the standard `SuppressOutput { None }` PDU; the server stops emitting both EGFX video frames and RDPSND waves until the client refocuses (`RefreshRectangle` / `SuppressOutput { Some(rect) }`). Without this, mstsc accumulates a backlog of video frames + audio waves during a long minimize that has to chew through on refocus, producing several seconds of input lockout, audio drift, and a video catch-up storm. With it, you get a brief audio gap on refocus and audio + video resume in sync. Both gates are debounced (1 s) so transient `SuppressOutput` flaps mstsc emits under wire pressure (e.g., during a heavy local `cargo build`) don't oscillate the mute and cause stutter. Pass `--no-mute-on-minimize` if you specifically want audio to keep playing while the client window is minimized — accepting that audio will drift by however long was spent minimized.
 
+**PCM queue during video stalls.** PCM is sent in 10 ms waves as soon as the
+writer is available. With `--audio-core-tap`, up to 12 waves (120 ms of PCM)
+can wait in the send queue so a brief TCP write stall is less likely to cut
+out audio. ScreenCaptureKit uses an eight-wave (80 ms) limit. These limits are
+queue capacities. Audio playback delay also depends on the client and the
+network. When the queue fills, the server drops new waves and logs the count.
+
 ## Microphone redirection (experimental)
 
 The other direction: **the client's microphone becomes a real input device on

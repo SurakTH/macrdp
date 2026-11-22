@@ -10,11 +10,20 @@ pub(crate) struct FrameFlush {
     refresh_at: Option<Instant>,
     trailing_after_refresh: u32,
     retry_until: Option<Instant>,
+    deferred_capture: bool,
 }
 
 impl FrameFlush {
-    pub(crate) fn arm(&mut self, count: u32, submitted: bool, now: Instant, interval: Duration) {
+    pub(crate) fn arm(
+        &mut self,
+        count: u32,
+        submitted: bool,
+        now: Instant,
+        interval: Duration,
+        trailing_delay: Duration,
+    ) {
         self.retry_until = None;
+        self.deferred_capture = !submitted;
         // Start ordinary trailing pictures at frame cadence. Waiting for the
         // quiet-period IDR first leaves sparse typing in the client's
         // presentation buffer for at least 100 ms.
@@ -25,12 +34,18 @@ impl FrameFlush {
         // A deferred picture still needs its first submission in addition
         // to the pictures that push it through the presentation buffer.
         self.remaining = count.saturating_add(u32::from(!submitted));
-        self.next = (self.remaining > 0).then_some(now + interval);
+        let first_delay = if submitted {
+            interval.max(trailing_delay)
+        } else {
+            interval
+        };
+        self.next = (self.remaining > 0).then_some(now + first_delay);
     }
 
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn repaint_now(&mut self, count: u32, now: Instant) {
         self.retry_until = None;
+        self.deferred_capture = false;
         self.remaining = 0;
         self.next = Some(now);
         self.refresh_at = Some(now);
@@ -45,9 +60,22 @@ impl FrameFlush {
         self.next
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn has_deferred_capture(&self) -> bool {
+        self.deferred_capture
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn retry_deferred_now(&mut self, now: Instant) {
+        if self.deferred_capture {
+            self.next = Some(now);
+        }
+    }
+
     pub(crate) fn attempted(&mut self, submitted: bool, now: Instant, interval: Duration) {
         if submitted {
             self.retry_until = None;
+            self.deferred_capture = false;
             if self.remaining > 0 {
                 self.remaining -= 1;
             } else if self.refresh_at.take().is_some() {
@@ -82,6 +110,36 @@ mod tests {
     const QUIET: Duration = Duration::from_millis(100);
 
     #[test]
+    fn writer_recovery_advances_only_an_unsent_capture() {
+        let now = Instant::now();
+        let mut flush = FrameFlush::default();
+        flush.arm(2, false, now, INTERVAL, Duration::ZERO);
+        assert!(flush.has_deferred_capture());
+        flush.retry_deferred_now(now);
+        assert_eq!(flush.deadline(), Some(now));
+        flush.attempted(true, now, INTERVAL);
+        assert!(!flush.has_deferred_capture());
+        flush.retry_deferred_now(now);
+        assert_eq!(flush.deadline(), Some(now + INTERVAL));
+        assert!(!flush.force_keyframe());
+    }
+
+    #[test]
+    fn waiting_for_fresh_capture_only_delays_duplicate_pictures() {
+        let now = Instant::now();
+        let grace = INTERVAL + INTERVAL / 2;
+        let mut flush = FrameFlush::default();
+        flush.arm(2, true, now, INTERVAL, grace);
+        assert_eq!(flush.deadline(), Some(now + grace));
+
+        // A new capture re-arms the duplicate delay. If it could not be
+        // submitted, retry the new picture at the original cadence instead.
+        let next = now + INTERVAL;
+        flush.arm(2, false, next, INTERVAL, grace);
+        assert_eq!(flush.deadline(), Some(next + INTERVAL));
+    }
+
+    #[test]
     fn manual_repaint_is_immediate_retries_and_sends_trailing_frames() {
         let now = Instant::now();
         let mut flush = FrameFlush::default();
@@ -106,7 +164,7 @@ mod tests {
     fn stalled_encoder_does_not_retry_forever() {
         let now = Instant::now();
         let mut flush = FrameFlush::default();
-        flush.arm(2, false, now, INTERVAL);
+        flush.arm(2, false, now, INTERVAL, Duration::ZERO);
         let first_attempt = now + INTERVAL;
         flush.attempted(false, first_attempt, INTERVAL);
         flush.attempted(false, first_attempt + RETRY_WINDOW, INTERVAL);
@@ -118,8 +176,8 @@ mod tests {
     fn sparse_typing_gets_immediate_trailing_pictures_before_quiet_refresh() {
         let now = Instant::now();
         let mut flush = FrameFlush::default();
-        flush.arm(2, true, now, INTERVAL); // l
-        flush.arm(2, true, now + INTERVAL, INTERVAL); // ls supersedes l
+        flush.arm(2, true, now, INTERVAL, Duration::ZERO); // l
+        flush.arm(2, true, now + INTERVAL, INTERVAL, Duration::ZERO); // ls supersedes l
         let last_change = now + INTERVAL;
         // Push the latest capture through presentation buffering without first
         // waiting 100 ms or forcing a keyframe for every keystroke.
@@ -143,7 +201,7 @@ mod tests {
     fn backpressure_preserves_both_bursts_and_retries_quiet_refresh() {
         let now = Instant::now();
         let mut flush = FrameFlush::default();
-        flush.arm(2, false, now, INTERVAL);
+        flush.arm(2, false, now, INTERVAL, Duration::ZERO);
         for n in 1..=20 {
             flush.attempted(false, now + INTERVAL * n, INTERVAL);
             assert!(!flush.force_keyframe());
@@ -170,7 +228,7 @@ mod tests {
         let mut flush = FrameFlush::default();
         for n in 0..100 {
             let change = now + INTERVAL * n;
-            flush.arm(2, true, change, INTERVAL);
+            flush.arm(2, true, change, INTERVAL, Duration::ZERO);
             assert_eq!(flush.deadline(), Some(change + INTERVAL));
             assert!(!flush.force_keyframe());
             flush.attempted(true, change + INTERVAL, INTERVAL);
@@ -182,7 +240,7 @@ mod tests {
     fn idle_samples_do_not_postpone_either_deadline() {
         let now = Instant::now();
         let mut flush = FrameFlush::default();
-        flush.arm(2, true, now, INTERVAL);
+        flush.arm(2, true, now, INTERVAL, Duration::ZERO);
         for _ in 0..100 {
             assert_eq!(flush.deadline(), Some(now + INTERVAL));
         }
@@ -198,14 +256,14 @@ mod tests {
     fn disabled_trailing_frames_still_retry_a_deferred_final_capture() {
         let now = Instant::now();
         let mut flush = FrameFlush::default();
-        flush.arm(0, false, now, INTERVAL);
+        flush.arm(0, false, now, INTERVAL, Duration::ZERO);
         assert_eq!(flush.deadline(), Some(now + INTERVAL));
         assert!(!flush.force_keyframe());
         flush.attempted(false, now, INTERVAL);
         assert!(flush.deadline().is_some());
         flush.attempted(true, now, INTERVAL);
         assert!(flush.deadline().is_none());
-        flush.arm(0, true, now, INTERVAL);
+        flush.arm(0, true, now, INTERVAL, Duration::ZERO);
         assert!(flush.deadline().is_none());
     }
 
@@ -214,7 +272,7 @@ mod tests {
         let now = Instant::now();
         let interval = Duration::from_millis(8);
         let mut flush = FrameFlush::default();
-        flush.arm(2, true, now, interval);
+        flush.arm(2, true, now, interval, Duration::ZERO);
         for n in 1..=2 {
             assert_eq!(flush.deadline(), Some(now + interval * n));
             assert!(!flush.force_keyframe());
@@ -234,7 +292,7 @@ mod tests {
     #[test]
     fn resize_or_suppression_cancels_refresh() {
         let mut flush = FrameFlush::default();
-        flush.arm(4, true, Instant::now(), INTERVAL);
+        flush.arm(4, true, Instant::now(), INTERVAL, Duration::ZERO);
         flush.clear();
         flush.attempted(false, Instant::now(), INTERVAL);
         assert!(flush.deadline().is_none());
@@ -249,7 +307,7 @@ mod tests {
         flush.attempted(false, now, INTERVAL);
 
         flush.clear();
-        flush.arm(4, true, now + INTERVAL, INTERVAL);
+        flush.arm(4, true, now + INTERVAL, INTERVAL, Duration::ZERO);
 
         assert!(!flush.force_keyframe());
         assert_eq!(flush.deadline(), Some(now + INTERVAL * 2));

@@ -90,7 +90,7 @@ objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSURL", "NSString", "NSBundle", "NSError", "NSDictionary", "NSNotification", "NSFileCoordinator", "NSFilePresenter", "NSOperation", "block2"] }
 block2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSCursor", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "libc"] }
-screencapturekit = { version = "2.1", features = ["async"] }
+screencapturekit = { version = "2.1", features = ["async", "macos_13_0"] }
 
 # All ironrdp-* crates come from one source: clintcan/IronRDP, branch `macrdp`,
 # which is upstream Devolutions/IronRDP@e258f6a0 plus macrdp's divergences in

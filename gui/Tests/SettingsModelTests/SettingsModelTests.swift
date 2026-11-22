@@ -462,10 +462,52 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(model.captureResolutionChoice, "auto")
     }
 
+    func testCodecPickerStagesSelectionAndClearsLegacyFlagsForBitmap() {
+        let config = [
+            "BIND": "192.168.137.2:3390",
+            "PREFER_HEVC": "1",
+            "EXTRA_FLAGS": "--enable-h264 --avc444 --stretch",
+        ]
+        let model = SettingsModel(controller: controller, initialConfig: config)
+        XCTAssertEqual(model.videoCodecPreference, .hevc)
+        model.setVideoCodecPreference(.h264)
+        XCTAssertEqual(model.videoCodecPreference, .h264)
+        XCTAssertEqual(model.draft["PREFER_HEVC"], "0")
+        model.setVideoCodecPreference(.hevc)
+        XCTAssertEqual(model.draft["ENABLE_H264"], "1")
+        XCTAssertEqual(model.draft["PREFER_HEVC"], "1")
+        model.setVideoCodecPreference(.bitmap)
+        XCTAssertEqual(model.videoCodecPreference, .bitmap)
+        XCTAssertEqual(model.draft["ENABLE_H264"], "0")
+        XCTAssertEqual(model.draft["EXTRA_FLAGS"], "--stretch")
+        XCTAssertEqual(model.saved, config)
+    }
+
+    func test1440pHEVCProfileStagesTcpSettingsAndShowsPendingChanges() {
+        let model = SettingsModel(controller: controller, initialConfig: ["BIND": "192.168.137.2:3390"])
+        model.applyProfile(.hevc1440)
+        XCTAssertEqual(model.selectedProfile, .hevc1440)
+        XCTAssertEqual(model.videoCodecPreference, .hevc)
+        XCTAssertEqual(model.draft["CAPTURE_SIZE"], "2560x1440")
+        XCTAssertEqual(model.draft["FPS"], "60")
+        XCTAssertEqual(model.draft["BITRATE"], "60")
+        XCTAssertTrue(model.bool("CAPTURE_NV12"))
+        XCTAssertFalse(model.bool("ENABLE_UDP_MULTITRANSPORT"))
+        XCTAssertTrue(model.pendingProfileChanges.contains { $0.label == "Capture size" && $0.pending == "2560 × 1440" })
+        XCTAssertEqual(model.draft["BIND"], "192.168.137.2:3390")
+        XCTAssertNil(model.saved["CAPTURE_SIZE"])
+        model.applyProfile(.hevc4K)
+        XCTAssertTrue(model.pendingProfileChanges.contains { $0.label == "Prioritize HEVC encoding speed" && $0.pending == "On" })
+    }
+
     func testStableProfileIsTheAcceptedVideoSettingsWithFastFlushOff() {
         let model = SettingsModel(controller: controller, initialConfig: ["BIND": "0.0.0.0:3390"])
         model.setFastFlushInterval("8")
+        model.setBool("PREFER_HEVC", true)
+        model.setBool("HEVC_HIGH_SPEED", true)
         model.applyProfile(.stable)
+        XCTAssertFalse(model.bool("PREFER_HEVC"))
+        XCTAssertFalse(model.bool("HEVC_HIGH_SPEED"))
         XCTAssertEqual(model.selectedProfile, .stable)
         XCTAssertEqual(model.draft["CAPTURE_SIZE"], "1920x1080")
         XCTAssertEqual(model.frameRate, "60")

@@ -21,6 +21,10 @@ use ironrdp_server::{AudioWave, ServerEvent, ServerEventSender, SoundServerFacto
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+#[cfg(target_os = "macos")]
+#[path = "audio_tap.rs"]
+mod audio_tap;
+
 // ScreenCaptureKit only honors 8000/16000/24000/48000 Hz, so we capture at
 // 48 kHz. The advertised RDPSND format, however, is 44.1 kHz: Windows audio
 // endpoints are commonly 44.1 native, and feeding clients at that rate lets
@@ -31,6 +35,22 @@ const SCK_SAMPLE_RATE: u32 = 48000;
 const SAMPLE_RATE: u32 = 44100;
 const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
+
+#[cfg(target_os = "macos")]
+const RESAMPLE_CHUNK: usize = (SCK_SAMPLE_RATE / 100) as usize;
+#[cfg(target_os = "macos")]
+const PCM_SCREEN_PENDING_WAVES: usize = 8;
+#[cfg(target_os = "macos")]
+const PCM_TAP_PENDING_WAVES: usize = 12;
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreMedia", kind = "framework")]
+unsafe extern "C" {
+    // The camera bindings declare the same C-layout CMTime using a local type.
+    #[allow(clashing_extern_declarations)]
+    #[link_name = "CMClockGetTime"]
+    fn audio_clock_time(clock: *const std::ffi::c_void) -> screencapturekit::cm::CMTime;
+}
 
 type Sender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>;
 type AudioSender = Arc<Mutex<Option<mpsc::Sender<AudioWave>>>>;
@@ -70,6 +90,7 @@ pub struct MacRdpsnd {
     /// Target AAC bitrate in bits/sec (`--aac-bitrate`, default 128_000).
     /// Used both to size the advertised format and to configure the encoder.
     aac_bitrate: u32,
+    use_core_tap: bool,
     /// Display the audio SCStream binds its content filter to — the SAME
     /// display the video path captures. `Some(id)` for a virtual display,
     /// `None` for the primary panel. Critical for `--detach-primary` /
@@ -86,6 +107,7 @@ impl MacRdpsnd {
         mute_on_minimize: bool,
         enable_aac: bool,
         aac_bitrate: u32,
+        use_core_tap: bool,
         target_display_id: Option<u32>,
     ) -> Self {
         Self {
@@ -96,6 +118,7 @@ impl MacRdpsnd {
             mute_on_minimize,
             enable_aac,
             aac_bitrate,
+            use_core_tap,
             target_display_id,
         }
     }
@@ -122,6 +145,7 @@ impl SoundServerFactory for MacRdpsnd {
             display_suppressed: self.display_suppressed.clone(),
             mute_on_minimize: self.mute_on_minimize,
             aac_bitrate: self.aac_bitrate,
+            use_core_tap: self.use_core_tap,
             target_display_id: self.target_display_id,
         })
     }
@@ -192,6 +216,7 @@ struct MacRdpsndBackend {
     /// Target AAC bitrate (bits/sec); only consulted when the negotiated
     /// format is `WAVE_FORMAT_AAC_MS`.
     aac_bitrate: u32,
+    use_core_tap: bool,
     /// Display the audio SCStream binds to — see [`MacRdpsnd::target_display_id`].
     target_display_id: Option<u32>,
 }
@@ -243,6 +268,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let display_suppressed = self.display_suppressed.clone();
         let mute_on_minimize = self.mute_on_minimize;
         let aac_bitrate = self.aac_bitrate;
+        let use_core_tap = self.use_core_tap;
         let target_display_id = self.target_display_id;
         // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
         // capture / resample / channel-send pipeline. Tokio workers ride
@@ -277,6 +303,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
                         mute_on_minimize,
                         use_aac,
                         aac_bitrate,
+                        use_core_tap,
                         target_display_id,
                     )
                     .await
@@ -320,6 +347,81 @@ fn boost_audio_qos() {
 }
 
 #[cfg(target_os = "macos")]
+enum CaptureSource {
+    Screen {
+        stream: screencapturekit::async_api::AsyncSCStream,
+        clock: Option<screencapturekit::cm::CMClock>,
+        format_logged: bool,
+    },
+    Tap(audio_tap::CoreAudioTap),
+}
+
+#[cfg(target_os = "macos")]
+impl CaptureSource {
+    fn pcm_pending_wave_limit(&self) -> usize {
+        match self {
+            Self::Screen { .. } => PCM_SCREEN_PENDING_WAVES,
+            Self::Tap(_) => PCM_TAP_PENDING_WAVES,
+        }
+    }
+
+    fn stop(self) {
+        if let Self::Screen { stream, .. } = self {
+            let _ = stream.stop_capture();
+        }
+    }
+
+    async fn next(
+        &mut self,
+        stats: Option<&crate::stats::SessionStats>,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        match self {
+            Self::Screen {
+                stream,
+                clock,
+                format_logged,
+            } => loop {
+                let sample = stream.next().await?;
+                if let (Some(stats), Some(clock)) = (stats, clock.as_ref()) {
+                    // Read the sample and clock in the stream's time domain.
+                    let now = unsafe { audio_clock_time(clock.as_ptr()) };
+                    let pts = sample.presentation_timestamp();
+                    if pts.epoch == now.epoch {
+                        if let (Some(now), Some(pts)) = (now.as_seconds(), pts.as_seconds()) {
+                            let age = now - pts;
+                            if (0.0..=10.0).contains(&age) {
+                                stats
+                                    .audio_capture_age
+                                    .record(std::time::Duration::from_secs_f64(age));
+                            }
+                        }
+                    }
+                }
+                if !*format_logged {
+                    *format_logged = true;
+                    if let Some(fd) = sample.format_description() {
+                        let rate = fd.audio_sample_rate().unwrap_or(0.0);
+                        let channels = fd.audio_channel_count().unwrap_or(0);
+                        info!(rate, channels, "SCK audio format");
+                        if rate != 0.0 && (rate - f64::from(SCK_SAMPLE_RATE)).abs() > 1.0 {
+                            warn!(
+                                delivered = rate,
+                                requested = SCK_SAMPLE_RATE,
+                                "SCK audio rate differs from what we requested; the resampler assumes 48 kHz input"
+                            );
+                        }
+                    }
+                }
+                if let Some(list) = sample.audio_buffer_list() {
+                    return Some(float_list_to_planar_f32_stereo(&list));
+                }
+            },
+            Self::Tap(tap) => tap.next(stats).await,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 async fn capture_loop(
     sender: Sender,
@@ -330,6 +432,7 @@ async fn capture_loop(
     mute_on_minimize: bool,
     use_aac: bool,
     aac_bitrate: u32,
+    use_core_tap: bool,
     target_display_id: Option<u32>,
 ) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
@@ -378,27 +481,25 @@ async fn capture_loop(
         .with_sample_rate(SCK_SAMPLE_RATE as i32)
         .with_channel_count(CHANNELS as i32);
 
-    // SCK only delivers 8/16/24/48 kHz. We capture at 48 and resample to the
-    // advertised SAMPLE_RATE (44.1 kHz) so the client plays at its native rate
-    // without internal resampling. Chunk size matches a typical SCK audio
-    // buffer (~21 ms at 48 kHz) — input is buffered until we have a full
-    // chunk, then fed to the resampler.
-    const RESAMPLE_CHUNK: usize = 1024;
+    // Capture at 48 kHz and send 44.1 kHz. Windows App can negotiate
+    // 48 kHz AAC here but was observed playing it too slowly.
+    // A 480-frame input produces exactly 441 frames per resampling call.
+    let resample_chunk = RESAMPLE_CHUNK;
     let mut resampler = rubato::FftFixedIn::<f32>::new(
         SCK_SAMPLE_RATE as usize,
         SAMPLE_RATE as usize,
-        RESAMPLE_CHUNK,
+        resample_chunk,
         1,
         CHANNELS as usize,
     )
     .map_err(|e| anyhow!("rubato resampler init: {e}"))?;
     let mut input_buf: [Vec<f32>; 2] = [
-        Vec::with_capacity(RESAMPLE_CHUNK * 2),
-        Vec::with_capacity(RESAMPLE_CHUNK * 2),
+        Vec::with_capacity(resample_chunk * 2),
+        Vec::with_capacity(resample_chunk * 2),
     ];
     // Reused per resampler invocation so the hot path doesn't allocate two
-    // Vecs per chunk (`drain(..N).collect()` did at ~46 chunks/sec).
-    let mut chunk: [Vec<f32>; 2] = [vec![0.0; RESAMPLE_CHUNK], vec![0.0; RESAMPLE_CHUNK]];
+    // Vecs per chunk (`drain(..N).collect()` allocates twice per call).
+    let mut chunk: [Vec<f32>; 2] = [vec![0.0; resample_chunk], vec![0.0; resample_chunk]];
 
     // Sender is lazily resolved on first emit, then cached. Resolving at the
     // top of capture_loop instead breaks Microsoft Remote Desktop for Mac:
@@ -424,7 +525,11 @@ async fn capture_loop(
         None
     };
     if use_aac {
-        info!(bitrate = aac_bitrate, "AAC-LC audio encoding enabled");
+        info!(
+            bitrate = aac_bitrate,
+            sample_rate = SAMPLE_RATE,
+            "AAC-LC audio encoding enabled"
+        );
     }
 
     // Shallow queue: SCK's async buffer is a drop-oldest ring of this depth.
@@ -447,11 +552,6 @@ async fn capture_loop(
     };
 
     let start_instant = std::time::Instant::now();
-    // Set false at the top of every (re)connect so SCK's delivered format is
-    // re-logged after a restart; the first read is always dominated by that
-    // assignment.
-    let mut format_logged: bool;
-
     // Per-reader debounce for the mute-on-minimize gate (mirrors
     // `capture.rs`'s `suppressed_since`). `None` while the shared
     // SuppressOutput flag is `false`; set to `Some(Instant::now())` the
@@ -462,10 +562,7 @@ async fn capture_loop(
     const SUPPRESS_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
     let mut suppressed_since: Option<std::time::Instant> = None;
 
-    // SCK delivery-rate measurement. The vendor server's audio-lag model
-    // assumes one Wave = `WAVE_MS = 1024/48 = 21.33 ms` of real audio,
-    // which is only true if SCK actually delivers at 48 kHz. Some
-    // configurations (system audio rate ≠ requested capture rate) cause
+    // SCK delivery-rate measurement. Some configurations cause
     // SCK to deliver samples at a different effective rate while still
     // *reporting* 48 kHz in the format description, which manifests as
     // a steady-state audio-shipped-vs-wall-clock deficit that the resync
@@ -474,10 +571,7 @@ async fn capture_loop(
     // the bug. Enable with `RUST_LOG=macrdp::audio=debug`.
     let mut samples_received: u64 = 0;
     let mut last_rate_log = std::time::Instant::now();
-    // Output-side counters. If output samples don't match 44.1 kHz × elapsed
-    // (after warm-up), the resampler is producing less audio than it should.
-    // If output samples match but wave count is below 46.875/sec, average
-    // wave size is bigger than the server's hardcoded WAVE_MS expects.
+    // Output-side counters for comparing samples and waves against wall time.
     let mut output_samples: u64 = 0;
     let mut waves_emitted: u64 = 0;
     // Encoded bytes actually shipped per window. Logged as `wire_kbps` so the
@@ -485,6 +579,9 @@ async fn capture_loop(
     // roughly `--aac-bitrate` (~128). The clearest in-log proof `--enable-aac`
     // is doing what it claims.
     let mut bytes_emitted: u64 = 0;
+    let mut waves_dropped_at_latency_limit: u64 = 0;
+    let stats = crate::stats::global().map(Arc::as_ref);
+    let mut try_core_tap = use_core_tap;
 
     'reconnect: loop {
         if generation.load(Ordering::SeqCst) != my_gen {
@@ -492,25 +589,55 @@ async fn capture_loop(
             break 'reconnect;
         }
 
-        // (Re)build the audio SCStream. On a start_capture error, back off and
-        // retry rather than ending the loop — a transient failure mid-session
-        // must not silence the rest of the connection.
-        let stream = AsyncSCStream::new(&filter, &config, 2, SCStreamOutputType::Audio);
-        if let Err(e) = stream.start_capture() {
-            consecutive_failures = consecutive_failures.saturating_add(1);
-            let backoff = backoff_ms(consecutive_failures);
-            warn!(
-                attempt = consecutive_failures,
-                backoff_ms = backoff,
-                "audio start_capture failed; retrying: {e:?}"
+        let tap = if try_core_tap {
+            match audio_tap::CoreAudioTap::open() {
+                Ok(tap) => {
+                    info!("Core Audio Tap started");
+                    Some(tap)
+                }
+                Err(status) => {
+                    warn!(
+                        status,
+                        "Core Audio Tap unavailable; using ScreenCaptureKit audio"
+                    );
+                    try_core_tap = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut source = if let Some(tap) = tap {
+            CaptureSource::Tap(tap)
+        } else {
+            let stream = AsyncSCStream::new(&filter, &config, 2, SCStreamOutputType::Audio);
+            if let Err(error) = stream.start_capture() {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let backoff = backoff_ms(consecutive_failures);
+                warn!(
+                    attempt = consecutive_failures,
+                    backoff_ms = backoff,
+                    "audio start_capture failed; retrying: {error:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                continue 'reconnect;
+            }
+            debug!(my_gen, "audio capture started");
+            let clock = stats.and_then(|_| stream.inner().synchronization_clock());
+            CaptureSource::Screen {
+                stream,
+                clock,
+                format_logged: false,
+            }
+        };
+        let pcm_pending_wave_limit = source.pcm_pending_wave_limit();
+        if !use_aac {
+            info!(
+                wave_ms = 10,
+                pending_wave_limit = pcm_pending_wave_limit,
+                "PCM audio pacing"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-            continue 'reconnect;
         }
-        debug!(my_gen, "audio capture started");
-        // A fresh format line per (re)start doubles as a "stream healthy again"
-        // marker in the log.
-        format_logged = false;
         // Drop any partial pre-gap chunk so we don't stitch samples across the
         // restart discontinuity.
         input_buf[0].clear();
@@ -519,17 +646,12 @@ async fn capture_loop(
         loop {
             if generation.load(Ordering::SeqCst) != my_gen {
                 debug!(my_gen, "audio capture loop superseded; exiting");
-                let _ = stream.stop_capture();
+                source.stop();
                 break 'reconnect;
             }
-            // Manual A/V resync hotkey (Ctrl+Alt+Shift+R, set in input.rs via
-            // crate::RESYNC_AUDIO): rebuild the SCK stream now. The brief capture
-            // gap lets the client's downstream audio backlog (audiodg) drain and
-            // re-baselines the server-side wave timing — the same effect a
-            // minimize→unminimize achieves. This is a deliberate resync, not a
-            // failure, so reset the backoff and rebuild immediately.
+            // A brief capture gap lets the remote player's backlog drain.
             if crate::RESYNC_AUDIO.swap(false, Ordering::Relaxed) {
-                let _ = stream.stop_capture();
+                source.stop();
                 consecutive_failures = 0;
                 info!(
                     my_gen,
@@ -537,11 +659,16 @@ async fn capture_loop(
                 );
                 continue 'reconnect;
             }
-            let Some(sample) = stream.next().await else {
-                // SCK stopped delivering. Stop, back off, and rebuild rather
-                // than ending the loop (which would silence audio for the rest
-                // of the session).
-                let _ = stream.stop_capture();
+            let Some((in_left, in_right)) = source.next(stats).await else {
+                let tapped = matches!(source, CaptureSource::Tap(_));
+                source.stop();
+                if tapped {
+                    warn!(
+                        "Core Audio Tap stopped delivering samples; using ScreenCaptureKit audio"
+                    );
+                    try_core_tap = false;
+                    continue 'reconnect;
+                }
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let backoff = backoff_ms(consecutive_failures);
                 warn!(
@@ -552,39 +679,7 @@ async fn capture_loop(
                 tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                 continue 'reconnect;
             };
-            // Delivered a sample → the stream is healthy; reset the backoff.
             consecutive_failures = 0;
-
-            // Log the format SCK actually delivers, once per session. SCK does not
-            // always honor the requested rate/channels; a mismatch against the
-            // advertised RDPSND format makes the client play at the wrong frame
-            // rate — audible as drift and lowered pitch.
-            if !format_logged {
-                format_logged = true;
-                if let Some(fd) = sample.format_description() {
-                    let rate = fd.audio_sample_rate().unwrap_or(0.0);
-                    let channels = fd.audio_channel_count().unwrap_or(0);
-                    info!(rate, channels, "SCK audio format");
-                    if rate != 0.0 && (rate - f64::from(SCK_SAMPLE_RATE)).abs() > 1.0 {
-                        warn!(
-                            delivered = rate,
-                            requested = SCK_SAMPLE_RATE,
-                            "SCK audio rate differs from what we requested; \
-                         the 48->44.1 resampler assumes 48 kHz input"
-                        );
-                    }
-                }
-            }
-
-            let Some(list) = sample.audio_buffer_list() else {
-                continue;
-            };
-
-            // SCK delivers float32 PCM as planar (one buffer per channel) or a
-            // single interleaved buffer. Normalize to planar stereo f32 at the
-            // SCK rate, accumulate into the resampler input buffer, then emit
-            // resampled chunks as interleaved 16-bit stereo at SAMPLE_RATE.
-            let (in_left, in_right) = float_list_to_planar_f32_stereo(&list);
             if in_left.is_empty() {
                 continue;
             }
@@ -601,30 +696,33 @@ async fn capture_loop(
                 let measured_waves = waves_emitted as f64 / elapsed;
                 let expected_in = f64::from(SCK_SAMPLE_RATE);
                 let expected_out = f64::from(SAMPLE_RATE);
-                // PCM emits one wave per resampled chunk (RESAMPLE_CHUNK input
-                // samples at the SCK rate → ~46.875/s). AAC emits one wave per
+                // PCM emits one wave per 10 ms resampled chunk. AAC emits one wave per
                 // 1024-frame access unit at the *output* rate → ~43.07/s. Pick the
                 // right baseline so `waves_per_sec` vs `waves_expected` is a real
                 // health check for the active codec, not always the PCM number.
                 let expected_waves = if use_aac {
                     expected_out / crate::aac::FRAMES_PER_PACKET as f64
                 } else {
-                    expected_in / RESAMPLE_CHUNK as f64
+                    expected_in / resample_chunk as f64
                 };
                 let avg_wave_samples = if waves_emitted > 0 {
                     output_samples as f64 / waves_emitted as f64
                 } else {
                     0.0
                 };
-                // Server's vendored audio-lag model assumes each wave is exactly
-                // 1024/48 = 21.33 ms. If avg_wave_samples / SAMPLE_RATE * 1000
-                // differs from that, the model drifts.
                 let avg_wave_ms = if waves_emitted > 0 {
                     avg_wave_samples / f64::from(SAMPLE_RATE) * 1000.0
                 } else {
                     0.0
                 };
                 let wire_kbps = bytes_emitted as f64 * 8.0 / elapsed / 1000.0;
+                if waves_dropped_at_latency_limit > 0 {
+                    warn!(
+                        dropped = waves_dropped_at_latency_limit,
+                        pending_wave_limit = pcm_pending_wave_limit,
+                        "PCM send queue hit latency limit"
+                    );
+                }
                 debug!(
                     in_rate = measured_in,
                     in_expected = expected_in,
@@ -636,17 +734,17 @@ async fn capture_loop(
                     avg_wave_ms,
                     wire_kbps,
                     codec = if use_aac { "aac" } else { "pcm" },
-                    model_wave_ms = 1024.0 / 48.0,
                     "audio capture rates"
                 );
                 samples_received = 0;
                 output_samples = 0;
                 waves_emitted = 0;
                 bytes_emitted = 0;
+                waves_dropped_at_latency_limit = 0;
                 last_rate_log = std::time::Instant::now();
             }
 
-            while input_buf[0].len() >= RESAMPLE_CHUNK && input_buf[1].len() >= RESAMPLE_CHUNK {
+            while input_buf[0].len() >= resample_chunk && input_buf[1].len() >= resample_chunk {
                 // Mute-on-minimize gate (default-on; opt out with
                 // `--no-mute-on-minimize`). When the client has sent
                 // `SuppressOutput { None }` (mstsc is minimized), drop incoming
@@ -671,8 +769,8 @@ async fn capture_loop(
                             let started =
                                 *suppressed_since.get_or_insert_with(std::time::Instant::now);
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
-                                input_buf[0].drain(..RESAMPLE_CHUNK);
-                                input_buf[1].drain(..RESAMPLE_CHUNK);
+                                input_buf[0].drain(..resample_chunk);
+                                input_buf[1].drain(..resample_chunk);
                                 continue;
                             }
                         } else {
@@ -681,13 +779,13 @@ async fn capture_loop(
                     }
                 }
 
-                chunk[0].copy_from_slice(&input_buf[0][..RESAMPLE_CHUNK]);
-                chunk[1].copy_from_slice(&input_buf[1][..RESAMPLE_CHUNK]);
+                chunk[0].copy_from_slice(&input_buf[0][..resample_chunk]);
+                chunk[1].copy_from_slice(&input_buf[1][..resample_chunk]);
                 let resampled = resampler
                     .process(&chunk, None)
                     .map_err(|e| anyhow!("rubato resample: {e}"))?;
-                input_buf[0].drain(..RESAMPLE_CHUNK);
-                input_buf[1].drain(..RESAMPLE_CHUNK);
+                input_buf[0].drain(..resample_chunk);
+                input_buf[1].drain(..resample_chunk);
                 // Per-call output sample count (one channel; planar so all
                 // channels have the same len). Counted before pcm.is_empty so
                 // we capture empties too.
@@ -725,12 +823,20 @@ async fn capture_loop(
 
                     // Lazy resolve both senders on first need. If set_sender /
                     // set_audio_sender haven't populated their Mutexes yet, retry
-                    // next iteration — at 48 kHz / 1024 samples this is ~21 ms
-                    // later.
+                    // next time there is a wave to send.
                     if audio_s.is_none() {
                         audio_s = audio_sender.lock().unwrap().clone();
                     }
                     if let Some(audio_ref) = audio_s.as_ref() {
+                        // Video can hold the shared TCP writer while this
+                        // channel keeps accepting waves. The Tap can use a
+                        // slightly larger budget because it delivers audio
+                        // sooner than ScreenCaptureKit. Neither path waits
+                        // to fill this queue before sending.
+                        if !use_aac && pcm_queue_at_limit(audio_ref, pcm_pending_wave_limit) {
+                            waves_dropped_at_latency_limit += 1;
+                            continue;
+                        }
                         // Bounded channel: send().await applies backpressure if
                         // the dispatch_audio task is behind, but if we're at
                         // capacity we'd rather drop this wave at the SCK level
@@ -770,6 +876,11 @@ async fn capture_loop(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn pcm_queue_at_limit(sender: &mpsc::Sender<AudioWave>, limit: usize) -> bool {
+    sender.max_capacity() - sender.capacity() >= limit
+}
+
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 async fn capture_loop(
@@ -781,6 +892,7 @@ async fn capture_loop(
     _mute_on_minimize: bool,
     _use_aac: bool,
     _aac_bitrate: u32,
+    _use_core_tap: bool,
     _target_display_id: Option<u32>,
 ) -> anyhow::Result<()> {
     Ok(())
@@ -876,6 +988,50 @@ fn float_to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pcm_tap_queue_absorbs_a_hundred_millisecond_stall_and_stays_bounded() {
+        let (sender, mut receiver) = mpsc::channel(50);
+        for timestamp in (0..100).step_by(10) {
+            assert!(!pcm_queue_at_limit(&sender, PCM_TAP_PENDING_WAVES));
+            sender.try_send((Vec::new(), timestamp, None)).unwrap();
+        }
+        assert!(pcm_queue_at_limit(&sender, PCM_SCREEN_PENDING_WAVES));
+        for timestamp in [100, 110] {
+            assert!(!pcm_queue_at_limit(&sender, PCM_TAP_PENDING_WAVES));
+            sender.try_send((Vec::new(), timestamp, None)).unwrap();
+        }
+        assert!(pcm_queue_at_limit(&sender, PCM_TAP_PENDING_WAVES));
+        for timestamp in (0..120).step_by(10) {
+            assert_eq!(receiver.try_recv().unwrap().1, timestamp);
+        }
+        assert!(!pcm_queue_at_limit(&sender, PCM_TAP_PENDING_WAVES));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn audio_resampling_produces_ten_milliseconds_per_chunk() {
+        use rubato::{FftFixedIn, Resampler};
+
+        let mut resampler = FftFixedIn::<f32>::new(
+            SCK_SAMPLE_RATE as usize,
+            SAMPLE_RATE as usize,
+            RESAMPLE_CHUNK,
+            1,
+            CHANNELS as usize,
+        )
+        .unwrap();
+        let input = [vec![0.25; RESAMPLE_CHUNK], vec![-0.25; RESAMPLE_CHUNK]];
+        let expected = SAMPLE_RATE as usize / 100;
+        assert_eq!(resampler.output_frames_next(), expected);
+        assert_eq!(resampler.output_delay(), expected / 2);
+        for _ in 0..100 {
+            let samples = resampler.process(&input, None).unwrap();
+            assert_eq!(samples[0].len(), expected);
+            assert_eq!(samples[1].len(), expected);
+        }
+    }
 
     #[test]
     fn server_formats_prefer_aac_ahead_of_pcm() {
