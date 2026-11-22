@@ -254,7 +254,7 @@ struct SettingsView: View {
 
 private struct ConnectionTab: View {
     @ObservedObject var model: SettingsModel
-    private let commonProfiles: [PerformanceProfile] = [.stable, .fourK, .fourKText]
+    private let commonProfiles: [PerformanceProfile] = [.stable] + PerformanceProfile.hevcProfiles + [.fourK, .fourKText]
 
     var body: some View {
         Form {
@@ -282,26 +282,7 @@ private struct ConnectionTab: View {
                 Text(model.selectedProfile?.detail
                     ?? "Current settings differ from the built-in profiles.")
                     .font(.caption).foregroundColor(.secondary)
-                if let size = model.profileVirtualDisplaySize {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Virtual display is configured for \(size). The profile’s capture size applies to the physical screen.")
-                            .font(.caption).foregroundColor(.secondary)
-                        Button("Display Settings") { model.section = .display }
-                            .controlSize(.small)
-                    }
-                }
-                let changes = model.pendingProfileChanges
-                if !changes.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Changes before Apply").font(.subheadline.weight(.semibold))
-                        ForEach(changes.prefix(3), id: \.label, content: profileChangeRow)
-                        if changes.count > 3 {
-                            DisclosureGroup("More changes") {
-                                ForEach(changes.dropFirst(3), id: \.label, content: profileChangeRow)
-                            }
-                        }
-                    }
-                }
+                ProfileReview(model: model)
             }
             Section("Personal presets") {
                 Picker("Saved preset", selection: Binding(
@@ -402,8 +383,35 @@ private struct ConnectionTab: View {
         }
         .formStyle(.grouped)
     }
+}
 
-    private func profileChangeRow(_ change: SettingsModel.ProfileChange) -> some View {
+private struct ProfileReview: View {
+    @ObservedObject var model: SettingsModel
+
+    var body: some View {
+        if let size = model.profileVirtualDisplaySize {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Virtual display is configured for \(size). The profile’s capture size applies to the physical screen.")
+                    .font(.caption).foregroundColor(.secondary)
+                Button("Display Settings") { model.section = .display }
+                    .controlSize(.small)
+            }
+        }
+        let changes = model.pendingProfileChanges
+        if !changes.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Changes before Apply").font(.subheadline.weight(.semibold))
+                ForEach(changes.prefix(3), id: \.label, content: changeRow)
+                if changes.count > 3 {
+                    DisclosureGroup("More changes") {
+                        ForEach(changes.dropFirst(3), id: \.label, content: changeRow)
+                    }
+                }
+            }
+        }
+    }
+
+    private func changeRow(_ change: SettingsModel.ProfileChange) -> some View {
         LabeledContent(change.label) {
             Text("\(change.saved) → \(change.pending)")
                 .foregroundColor(.secondary)
@@ -415,32 +423,55 @@ private struct ConnectionTab: View {
 
 private struct VideoTab: View {
     @ObservedObject var model: SettingsModel
+    @State private var showAdvanced = false
+
+    private var usesVideoEncoder: Bool { model.videoCodecPreference != .bitmap }
+
+    private var selectedHEVCProfile: PerformanceProfile? {
+        model.selectedProfile.flatMap { PerformanceProfile.hevcProfiles.contains($0) ? $0 : nil }
+    }
+
     var body: some View {
         Form {
-            Section {
-                Toggle("H.264 video (EGFX / AVC420)", isOn: model.boolBinding("ENABLE_H264"))
-                Text("Streams the screen as H.264 — far less bandwidth than legacy bitmaps. "
-                    + "Recommended. Clients without an H.264 decoder fall back automatically.")
+            Section("Video codec") {
+                Picker("Preferred codec", selection: Binding(
+                    get: { model.videoCodecPreference },
+                    set: { model.setVideoCodecPreference($0) })) {
+                    ForEach(VideoCodecPreference.allCases, id: \.self) { codec in
+                        Text(codec.title).tag(codec)
+                    }
+                }
+                Text("H.265 uses HEVC with compatible clients such as Windows App and falls back to H.264 when available. See Performance for the codec in use.")
                     .font(.caption).foregroundColor(.secondary)
+            }
+            Section("HEVC profiles") {
+                Picker("Profile", selection: Binding(
+                    get: { selectedHEVCProfile },
+                    set: { if let profile = $0 { model.applyProfile(profile) } })) {
+                    Text("Choose a profile…").tag(Optional<PerformanceProfile>.none)
+                    ForEach(PerformanceProfile.hevcProfiles) { profile in
+                        Text(profile.title).tag(Optional(profile))
+                    }
+                }
+                if let profile = selectedHEVCProfile {
+                    Text(profile.detail).font(.caption).foregroundColor(.secondary)
+                }
+                ProfileReview(model: model)
             }
             Section("Frame rate") {
                 TextField("FPS", text: Binding(get: { model.frameRate }, set: { model.setFrameRate($0) }),
                           prompt: Text("Automatic"))
-                Text("Leave empty for automatic: 60 FPS with H.264, 15 FPS with bitmap video.")
+                Text("Automatic uses 60 FPS for H.264 and H.265, or 15 FPS for bitmap video.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Bitrate") {
                 TextField("Bitrate ceiling (Mbps)", text: Binding(
                     get: { model.bitrateInput },
                     set: { model.setBitrate($0) }), prompt: Text("6"))
-                .disabled(!model.bool("ENABLE_H264"))
+                .disabled(!usesVideoEncoder)
                 Toggle("Adaptive bitrate (lower under congestion)", isOn: model.boolBinding("ADAPTIVE_BITRATE"))
-                    .disabled(!model.bool("ENABLE_H264"))
-                Text("Enter whole-number Mbps, e.g. 75, 100 or 200. The 50 Mbps limit is removed. "
-                    + "Leave empty for the default 6 Mbps. VideoToolbox's numeric range supports up to 2147 Mbps. "
-                    + "The ceiling is the maximum target. With Adaptive on, the server drops below it "
-                    + "under congestion (thin/lossy link) and climbs back when it clears; on a "
-                    + "clean link it stays at the ceiling. H.264 only.")
+                    .disabled(!usesVideoEncoder)
+                Text("Enter 1–2147 Mbps or leave empty for 6 Mbps. Adaptive bitrate lowers the target under congestion for H.264 and H.265.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Capture resolution") {
@@ -471,57 +502,64 @@ private struct VideoTab: View {
                     get: { model.tcpPacingEnabled }, set: { model.setTCPPacingEnabled($0) }))
                 TextField("Unacknowledged frame limit", text: Binding(
                     get: { model.tcpPacingLimit }, set: { model.setTCPPacingLimit($0) }), prompt: Text("0"))
-                Text("0 turns pacing off. Start at 3 for 4K over TCP. When the client falls behind, the server skips some captures before encoding.")
+                Text("0 turns pacing off. The 4K/60 HEVC profile uses 2. When the client falls behind, the server skips some captures before encoding.")
                     .font(.caption).foregroundColor(.secondary)
             }
-            .disabled(!model.bool("ENABLE_H264"))
-            Section("Experimental") {
-                TextField("H.264 encoder queue depth", text: Binding(
-                    get: { model.encoderQueueDepth },
-                    set: { model.setEncoderQueueDepth($0) }), prompt: Text("2"))
-                    .disabled(!model.bool("ENABLE_H264"))
-                Text("Leave empty for 2. A depth of 2 lets 4K capture submit another frame while the encoder is busy. A depth of 1 keeps the queue shorter.")
-                    .font(.caption).foregroundColor(.secondary)
-                Toggle("Responsive capture", isOn: model.boolBinding("RESPONSIVE_CAPTURE"))
-                    .disabled(!model.bool("ENABLE_H264"))
-                Text("Gives fresh desktop updates priority over duplicate frames and keeps less video queued. May skip intermediate motion under load. Try with Fast flush off first.")
-                    .font(.caption).foregroundColor(.secondary)
-                Toggle("Fast flush (optional)", isOn: Binding(
-                    get: { model.fastFlushEnabled },
-                    set: { model.setFastFlushEnabled($0) }))
-                    .disabled(!model.bool("ENABLE_H264"))
-                if model.fastFlushEnabled {
-                    TextField("Interval (ms)", text: Binding(
-                        get: { model.fastFlushInterval },
-                        set: { model.setFastFlushInterval($0) }), prompt: Text("10"))
-                        .disabled(!model.bool("ENABLE_H264"))
-                    HStack {
-                        Text("Try:").foregroundColor(.secondary)
-                        ForEach([8, 10, 12, 16], id: \.self) { interval in
-                            Button("\(interval) ms") { model.setFastFlushInterval(String(interval)) }
-                                .controlSize(.small)
-                                .disabled(!model.bool("ENABLE_H264"))
-                        }
-                    }
-                    Text("8–1000 ms. Lower values send trailing pictures closer together.")
-                        .font(.caption).foregroundColor(.secondary)
+            .disabled(!usesVideoEncoder)
+            Section {
+                DisclosureGroup("Advanced Video", isExpanded: $showAdvanced) {
+                    advancedVideoSettings.disabled(!usesVideoEncoder)
                 }
-                Text("Off uses the standard capture cadence. Faster intervals may make typing feel more responsive and can show transient image artifacts.")
-                    .font(.caption).foregroundColor(.secondary)
-                Toggle("NV12 capture for AVC420", isOn: model.boolBinding("CAPTURE_NV12"))
-                    .disabled(!model.bool("ENABLE_H264") || model.bool("AVC444"))
-                Text(model.bool("AVC444") || !model.bool("ENABLE_H264")
-                    ? "NV12 requires H.264 AVC420. Your preference is retained."
-                    : "Can reduce capture CPU use at high resolutions. Off uses the standard BGRA capture path.")
-                    .font(.caption).foregroundColor(.secondary)
-                Toggle("AVC444 diagnostics", isOn: model.boolBinding("AVC444"))
-                    .disabled(!model.bool("ENABLE_H264"))
-                Text("Known issue: tested mstsc clients render severe gray/pink color corruption. "
-                    + "Use Ultimate or LAN Max for real work.")
-                    .font(.caption).foregroundColor(.orange)
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var advancedVideoSettings: some View {
+        Group {
+            TextField("Encoder queue depth", text: Binding(
+                get: { model.encoderQueueDepth },
+                set: { model.setEncoderQueueDepth($0) }), prompt: Text("2"))
+            Text("Leave empty for 2. A depth of 2 lets 4K capture submit another frame while the encoder is busy. A depth of 1 keeps the queue shorter.")
+                .font(.caption).foregroundColor(.secondary)
+            Toggle("Responsive capture", isOn: model.boolBinding("RESPONSIVE_CAPTURE"))
+            Text("Gives fresh desktop updates priority over duplicate frames and keeps less video queued. May skip intermediate motion under load. Try with Fast flush off first.")
+                .font(.caption).foregroundColor(.secondary)
+            Toggle("Fast flush (optional)", isOn: Binding(
+                get: { model.fastFlushEnabled },
+                set: { model.setFastFlushEnabled($0) }))
+            if model.fastFlushEnabled {
+                TextField("Interval (ms)", text: Binding(
+                    get: { model.fastFlushInterval },
+                    set: { model.setFastFlushInterval($0) }), prompt: Text("10"))
+                HStack {
+                    Text("Try:").foregroundColor(.secondary)
+                    ForEach([8, 10, 12, 16], id: \.self) { interval in
+                        Button("\(interval) ms") { model.setFastFlushInterval(String(interval)) }
+                            .controlSize(.small)
+                    }
+                }
+                Text("8–1000 ms. Lower values send trailing pictures closer together.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Text("Off uses the standard capture cadence. Faster intervals may make typing feel more responsive and can show transient image artifacts.")
+                .font(.caption).foregroundColor(.secondary)
+            if model.videoCodecPreference == .hevc {
+                Toggle("Prioritize HEVC encoding speed", isOn: model.boolBinding("HEVC_HIGH_SPEED"))
+                Text("Can reduce encoding delay at 4K. Fine detail may look softer at the same bitrate.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Toggle("NV12 capture for AVC420 and HEVC", isOn: model.boolBinding("CAPTURE_NV12"))
+                .disabled(model.bool("AVC444"))
+            Text(model.bool("AVC444") || !usesVideoEncoder
+                ? "NV12 requires AVC420 or HEVC with AVC444 disabled. Your preference is retained."
+                : "Can reduce capture CPU use at high resolutions. Off uses the standard BGRA capture path.")
+                .font(.caption).foregroundColor(.secondary)
+            Toggle("AVC444 diagnostics", isOn: model.boolBinding("AVC444"))
+            Text("Known issue: tested mstsc clients render severe gray/pink color corruption. "
+                + "Use Ultimate or LAN Max for real work.")
+                .font(.caption).foregroundColor(.orange)
+        }
     }
 }
 

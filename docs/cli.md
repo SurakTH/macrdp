@@ -279,6 +279,9 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   automatic for clients without AAC decode. Adds ~40-50 ms
                           #   latency, so off by default.
 --aac-bitrate BPS         # AAC target bitrate (default 128000; only with --enable-aac)
+--audio-core-tap          # Experimental system audio capture on macOS 14.2+.
+                          #   Falls back to ScreenCaptureKit if the tap is unavailable.
+                          #   Config key: AUDIO_CORE_TAP.
 --enable-drive-redirection # RDPDR drive redirection (opt-in, read-write): the
                           #   client redirects its local drive and the Mac mounts
                           #   each as a real NFS volume in Finder. The client must

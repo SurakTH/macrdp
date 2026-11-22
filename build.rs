@@ -25,6 +25,13 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=IOUSBHost");
     println!("cargo:rustc-link-lib=framework=Foundation");
 
+    println!("cargo:rerun-if-changed=src/audio_tap.m");
+    cc::Build::new()
+        .file("src/audio_tap.m")
+        .flag("-fobjc-arc")
+        .compile("macrdp_audio_tap");
+    println!("cargo:rustc-link-lib=framework=CoreAudio");
+
     // /usr/lib/swift holds most of Swift's stdlib on modern macOS — cheap to
     // include even though libswift_Concurrency.dylib lives only in the Xcode
     // toolchain on this version of macOS.

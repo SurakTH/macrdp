@@ -52,8 +52,9 @@ def summary(samples):
     retained = ""
     if all("encode_retained_submitted" in sample for sample in samples):
         retained_rate = delta("encode_retained_submitted") / seconds
-        total_rate = delta("encode_submitted") / seconds
-        retained = f" | encode submits/s {retained_rate:.1f} retained of {total_rate:.1f} total"
+        direct_rate = delta("encode_submitted") / seconds - retained_rate
+        retained = (f" | encoder submits/s {direct_rate:.1f} directly from capture, "
+                    f"{retained_rate:.1f} retained (including retries)")
 
     fps = delta("video_frames_queued") / seconds
     rate = delta("video_payload_bytes") * 8 / seconds / 1_000_000
@@ -64,10 +65,12 @@ def summary(samples):
         prepared = delta("encode_prepared")
         prepare_us = delta("encode_prepare_total_us")
         if prepared > 0 and prepare_us >= 0:
-            preparation = f" | mean AVC420 buffer preparation {prepare_us / prepared / 1000:.2f} ms"
+            preparation = f" | mean encoder buffer preparation {prepare_us / prepared / 1000:.2f} ms"
     timings = ""
     for name, label in (
         ("capture_to_submit", "capture callback to encoder submit"),
+        ("audio_capture_age", "audio sample age at capture receipt"),
+        ("video_packetize", "encoded picture to DVC packets"),
         ("tcp_dispatch", "queue to TCP write completion"),
     ):
         count_key, total_key = f"{name}_samples", f"{name}_total_us"
@@ -76,14 +79,34 @@ def summary(samples):
             if completed > 0 and total_us >= 0:
                 timings += f" | mean {label} {total_us / completed / 1000:.2f} ms (n={completed})"
     tcp_pacing = ""
+    client_qoe = ""
+    if all("client_qoe_reports" in sample for sample in samples):
+        reports = delta("client_qoe_reports")
+        client_qoe = f" | client QoE reports {reports}"
+        for name, label in (
+            ("client_frame_parse", "client StartFrame to EndFrame decode"),
+            ("client_render_completion", "client EndFrame decode to render completion"),
+        ):
+            count_key, total_key = f"{name}_samples", f"{name}_total_us"
+            if all(count_key in sample and total_key in sample for sample in samples):
+                count, total_us = delta(count_key), delta(total_key)
+                if 0 < count <= reports and total_us > 0:
+                    client_qoe += (
+                        f" | mean {label} {total_us / count / 1000:.2f} ms "
+                        f"({count}/{reports} nonzero reports)"
+                    )
     if all("encode_tcp_backpressure" in sample for sample in samples):
         tcp_pacing = f" | TCP-paced submissions deferred {delta('encode_tcp_backpressure')}"
+        if all("encode_tcp_write_stall" in sample for sample in samples):
+            tcp_pacing += f" ({delta('encode_tcp_write_stall')} during local TCP write stalls)"
+        if all("tcp_resume_wakes" in sample for sample in samples):
+            tcp_pacing += f" | capture wakeups after TCP resumed {delta('tcp_resume_wakes')}"
     submit_errors = ""
     if all("encode_submit_errors" in sample for sample in samples):
         submit_errors = f" | encoder submission errors {delta('encode_submit_errors')}"
     ship_errors = ""
     if all("video_ship_errors" in sample for sample in samples):
-        ship_errors = f" | AVC420 shipping errors {delta('video_ship_errors')}"
+        ship_errors = f" | video dispatch errors {delta('video_ship_errors')}"
     superseded = ""
     if all("capture_superseded" in sample for sample in samples):
         superseded = f" | superseded capture samples {delta('capture_superseded')}"
@@ -105,7 +128,7 @@ def summary(samples):
             f"mean encoder completion {encode} | sampled ACK queue {ack_delay} | "
             f"encoder errors {delta('encode_output_errors')} | "
             f"keyboard events {delta('keyboard_events')}{retained}{preparation}{tcp_pacing}"
-            f"{submit_errors}{ship_errors}{superseded}{timings}")
+            f"{submit_errors}{ship_errors}{superseded}{timings}{client_qoe}")
 
 
 def main():

@@ -29,12 +29,29 @@ struct PerformanceTab: View {
                     Spacer()
                     Button("Refresh", action: refresh).disabled(pending)
                 }
-                if let live, availability == .streaming {
-                    HStack {
-                        Label("\(live.width) × \(live.height)", systemImage: "display")
-                        Spacer()
-                        Text("Capture limit: \(live.fps) FPS").foregroundColor(.secondary)
+                if let live {
+                    let preference = VideoCodecPreference(config: model.saved)
+                    GroupBox {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Session video").font(.caption).foregroundColor(.secondary)
+                                Label(live.sessionCodecLabel(preference: preference), systemImage: "display")
+                                    .font(.headline)
+                                    .help(live.videoCodecLabel)
+                            }
+                            Spacer()
+                            if availability == .streaming {
+                                VStack(alignment: .trailing, spacing: 4) {
+                                    Text("\(live.width) × \(live.height)").monospacedDigit()
+                                    Text("Capture limit: \(live.fps) FPS")
+                                        .font(.caption).foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        .padding(4)
                     }
+                }
+                if let live, availability == .streaming {
                     if live.queuedFrames == nil {
                         Text("This server provides older telemetry. Update the server to see measured rates and encode time.")
                             .foregroundColor(.secondary)
@@ -103,7 +120,7 @@ struct PerformanceTab: View {
                                         .help("Sampled average for TCP graphics, including dispatch queue and local write. No value when there is no fresh sample.")
                                 }
                                 if live.encodePrepared != nil {
-                                    row("AVC420 buffer preparation", value(history.latest?.prepareMs, unit: "ms"))
+                                    row("Encoder buffer preparation", value(history.latest?.prepareMs, unit: "ms"))
                                 }
                                 if live.captureSuperseded != nil {
                                     row("Older captures replaced", count(history.latest?.captureSuperseded))
@@ -115,12 +132,12 @@ struct PerformanceTab: View {
                                     row("Encoder submission errors", count(history.latest?.encoderSubmissionErrors))
                                 }
                                 if live.videoShippingErrors != nil {
-                                    row("AVC420 frame dispatch errors", count(history.latest?.videoShippingErrors))
+                                    row("Video frame dispatch errors", count(history.latest?.videoShippingErrors))
                                 }
                             }.padding(.top, 8)
                         }
                     }
-                    Text("Rates are measured between samples. Queued FPS counts logical H.264 frames handed to the transport, including trailing flush pictures; it does not measure client presentation. Payload rate excludes network headers, audio and retransmits. Encoder time runs from submission to callback. ACK timing is not key-to-screen latency. An idle desktop may report 0 FPS.")
+                    Text("Rates are measured between samples. Queued FPS counts encoded video frames handed to the transport, including trailing flush pictures; it does not measure client presentation. Payload rate excludes network headers, audio and retransmits. Encoder time runs from submission to callback. ACK timing is not key-to-screen latency. An idle desktop may report 0 FPS.")
                         .font(.caption).foregroundColor(.secondary)
                 } else {
                     Label(availability.message, systemImage: "chart.xyaxis.line")

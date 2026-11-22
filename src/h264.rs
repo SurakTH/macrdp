@@ -56,9 +56,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use ironrdp_dvc::encode_dvc_messages;
 use ironrdp_egfx::pdu::{
-    Avc420Region, CacheImportOfferPdu, CapabilitiesAdvertisePdu, CapabilitiesV103Flags,
-    CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags,
-    CapabilitySet, PixelFormat,
+    encode_avc420_bitmap_stream, Avc420Region, CacheImportOfferPdu, CapabilitiesAdvertisePdu,
+    CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV10Flags,
+    CapabilitiesV81Flags, CapabilitySet, PixelFormat,
 };
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
@@ -79,6 +79,7 @@ use crate::videotoolbox::{Avc444Encoder, EncodeOutput, EncodedFrame, Encoder};
 /// full 60 fps so the client's decode queue drains net. See the gate in
 /// `submit_pixel_buffer` and `ConnectionContext::last_throttle_ship`.
 const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
+const TCP_DISPATCH_STALL: Duration = Duration::from_millis(50);
 
 /// P3 cold-start guard: how long after the first frame-ack the adaptive controller
 /// ignores the ack-lag congestion signal. At connect the encoder ships an initial
@@ -238,6 +239,7 @@ struct ConnectionContext {
     /// ERROR_NOT_SUPPORTED and a dead graphics channel).
     client_supports_avc: bool,
     client_supports_avc444: bool,
+    hevc420: bool,
     /// The client advertised an EGFX capability set newer than Windows App for
     /// macOS does, so its zero decode+render time doesn't mean "not presenting"
     /// and blank recovery stays off for this connection ([`advertises_egfx_beyond_mac_client`]).
@@ -265,6 +267,8 @@ struct ConnectionContext {
     /// `shipped`.
     submitted: Arc<AtomicU64>,
     shipped: Arc<AtomicU64>,
+    tcp_dispatch: Option<TcpDispatchPending>,
+    tcp_dispatch_resumed: Arc<tokio::sync::Notify>,
     /// Dimensions the surface + encoder were created with (in
     /// `setup_locked`, from the live `SharedDesktopSize`). `ship_frames`
     /// builds its AVC420 regions from these — not from a fresh
@@ -1819,6 +1823,24 @@ pub(crate) enum FrameSubmission {
 }
 
 impl Gfx {
+    pub(crate) async fn wait_for_tcp_dispatch_resume(&self) {
+        if self.tcp_max_frame_lag == 0 || self.egfx_on_udp.load(Ordering::Relaxed) {
+            return std::future::pending().await;
+        }
+        let wake = self
+            .ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|ctx| ctx.hevc420)
+            .map(|ctx| Arc::clone(&ctx.tcp_dispatch_resumed));
+        if let Some(wake) = wake {
+            wake.notified().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+
     pub fn with_avc444(mut self, enabled: bool) -> Self {
         self.avc444_enabled = enabled;
         self
@@ -2300,8 +2322,8 @@ impl Gfx {
             }
             // Lazy one-time setup on the first ready frame (creates the encoder
             // and spawns the ship thread).
-            if ctx.surface_id.is_none() || ctx.encoder.is_none() {
-                self.setup_locked(ctx)?;
+            if (ctx.surface_id.is_none() || ctx.encoder.is_none()) && !self.setup_locked(ctx)? {
+                return Ok(Deferred);
             }
             // Blank-presentation detector (the mstsc reconnect-blank): the client
             // is decoding + acking every frame (QoE reports flowing) but its
@@ -2565,6 +2587,26 @@ impl Gfx {
                     ctx.last_floor_fps_pass = now;
                     debug!("EGFX frame-rate floor active — capping fps (let a capture through)");
                 }
+            }
+            // A local write stall cannot be drained by submitting more
+            // pictures. Apply this gate to retained pictures too. The capture
+            // loop keeps the latest pixels and retries once the writer clears.
+            let watch_tcp = ctx.hevc420
+                && self.tcp_max_frame_lag > 0
+                && !self.egfx_on_udp.load(Ordering::Relaxed);
+            if let Some(pending) = ctx
+                .tcp_dispatch
+                .as_mut()
+                .filter(|pending| watch_tcp && pending.started.elapsed() >= TCP_DISPATCH_STALL)
+            {
+                pending.capture_deferred = true;
+                if let Some(stats) = crate::stats::global() {
+                    stats.encode_tcp_write_stall.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .encode_tcp_backpressure
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(Deferred);
             }
             // Drop-to-latest throttle: if too many frames are still in the
             // VT/ship pipeline, skip this capture entirely. This bounds latency
@@ -3061,13 +3103,19 @@ impl Gfx {
     }
 
     /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
-    fn setup_locked(&self, ctx: &mut ConnectionContext) -> Result<()> {
+    fn setup_locked(&self, ctx: &mut ConnectionContext) -> Result<bool> {
         // Read the live session size once and pin it for this connection's
         // surface + encoder + ship-side regions.
         let (width, height) = self.desktop_size.get();
         if ctx.surface_id.is_none() {
             ctx.dims = (width, height);
-            let mut server = ctx.server_handle.lock().unwrap();
+            // Inbound EGFX callbacks hold the server mutex before taking ctx.
+            // Retry on the next capture rather than waiting in the opposite order.
+            let mut server = match ctx.server_handle.try_lock() {
+                Ok(server) => server,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+                Err(error) => return Err(anyhow!("EGFX setup lock: {error}")),
+            };
             server.set_output_dimensions(width, height);
             // Emit RESET_GRAPHICS with an explicit single-monitor layout
             // covering the full desktop, BEFORE create_surface. The auto-reset
@@ -3121,7 +3169,7 @@ impl Gfx {
             // ceiling: equal to the ceiling unless the RTT seed lowered it
             // (slow link) or the controller already adjusted it (encoder
             // rebuild mid-connection).
-            let use_avc444 = self.avc444_enabled && ctx.client_supports_avc444;
+            let use_avc444 = !ctx.hevc420 && self.avc444_enabled && ctx.client_supports_avc444;
             let mut encoder = if use_avc444 {
                 let encoder = Avc444Encoder::new(
                     width,
@@ -3136,12 +3184,17 @@ impl Gfx {
                 );
                 VideoEncoder::Avc444(Box::new(encoder))
             } else {
-                VideoEncoder::Avc420(Encoder::new(
+                VideoEncoder::Avc420(Encoder::new_with_codec(
                     width,
                     height,
                     self.fps,
                     ctx.adaptive_target_bps,
                     self.keyframe_secs,
+                    if ctx.hevc420 {
+                        crate::videotoolbox::PictureCodec::Hevc420
+                    } else {
+                        crate::videotoolbox::PictureCodec::Avc420
+                    },
                 )?)
             };
             // Hand VT's output channel to a dedicated ship thread (push model),
@@ -3155,12 +3208,16 @@ impl Gfx {
             // Fresh throttle counters for this connection.
             ctx.submitted.store(0, Ordering::Relaxed);
             ctx.shipped = Arc::new(AtomicU64::new(0));
+            ctx.tcp_dispatch = None;
+            ctx.tcp_dispatch_resumed = Arc::default();
             let gfx = self.clone();
             let shipped = ctx.shipped.clone();
-            let tcp_probe = crate::stats::global().and_then(|stats| {
-                let runtime = tokio::runtime::Handle::try_current().ok()?;
-                Some(TcpDispatchProbe::new(runtime, stats.clone()))
-            });
+            let stats = crate::stats::global().cloned();
+            let watch_tcp = ctx.hevc420 && self.tcp_max_frame_lag > 0;
+            let tcp_probe = (stats.is_some() || watch_tcp)
+                .then(tokio::runtime::Handle::try_current)
+                .and_then(Result::ok)
+                .map(|runtime| TcpDispatchProbe::new(runtime, stats, watch_tcp));
             std::thread::Builder::new()
                 .name("egfx-ship".into())
                 .spawn(move || gfx.ship_loop(rx, shipped, use_avc444, tcp_probe))
@@ -3170,6 +3227,14 @@ impl Gfx {
         // stats: publish the per-connection baseline (no-op unless --stats-endpoint).
         if let Some(s) = crate::stats::global() {
             let (w, h) = ctx.dims;
+            use crate::stats::VideoCodec;
+            let codec = match ctx.encoder.as_ref() {
+                Some(VideoEncoder::Avc444(_)) => VideoCodec::Avc444,
+                Some(VideoEncoder::Avc420(_)) if ctx.hevc420 => VideoCodec::Hevc420,
+                Some(VideoEncoder::Avc420(_)) => VideoCodec::Avc420,
+                None => VideoCodec::None,
+            };
+            s.set_video_codec(codec);
             s.ack_samples.store(0, Ordering::Relaxed);
             s.video_generation.fetch_add(1, Ordering::Relaxed);
             s.connected.store(true, Ordering::Relaxed);
@@ -3180,7 +3245,7 @@ impl Gfx {
             s.fps.store(self.fps, Ordering::Relaxed);
             s.adaptive.store(self.adaptive_enabled, Ordering::Relaxed);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Blank-recovery attempt A — remap the graphics output to a FRESH surface
@@ -3314,10 +3379,16 @@ impl Gfx {
             // `submit_pixel_buffer` run `setup_locked` (which also rebuilds the
             // encoder and resets the throttle counters).
             ctx.shipped = Arc::new(AtomicU64::new(0));
+            ctx.tcp_dispatch = None;
             ctx.encoder = None;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
-            info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
+            if let Some(stats) = crate::stats::global() {
+                stats.end_video_session();
+            }
+            info!(
+                "EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size"
+            );
         }
     }
 
@@ -3443,6 +3514,8 @@ impl Gfx {
         shipped: &Arc<AtomicU64>,
         tcp_probe: Option<&mut TcpDispatchProbe>,
     ) -> Result<()> {
+        let stats = crate::stats::global();
+        let packetize_started = stats.map(|_| Instant::now());
         let (dvc_messages, egfx_channel_id, payload_len) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -3504,13 +3577,6 @@ impl Gfx {
                     quantization_parameter: 22,
                     quality: 100,
                 };
-                let (payload, chroma) = match auxiliary {
-                    Some(aux) => (
-                        self.frame_payload_avc444(f),
-                        Some(self.frame_payload_avc444(aux)),
-                    ),
-                    None => (self.frame_payload(f), None),
-                };
                 let ts_ms =
                     u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
                 // Diagnostic for the reconnect-blank investigation: keyframes
@@ -3523,16 +3589,41 @@ impl Gfx {
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
                 let regions = [region];
-                let sent = match chroma.as_deref() {
-                    Some(chroma) => server.send_avc444_frame(
-                        surface_id,
-                        &payload,
-                        &regions,
-                        Some(chroma),
-                        Some(&regions),
-                        ts_ms,
-                    ),
-                    None => server.send_avc420_frame(surface_id, &payload, &regions, ts_ms),
+                let (sent, payload_len) = match auxiliary {
+                    Some(aux) => {
+                        let payload = self.frame_payload_avc444(f);
+                        let chroma = self.frame_payload_avc444(aux);
+                        let sent = server.send_avc444_frame(
+                            surface_id,
+                            &payload,
+                            &regions,
+                            Some(&chroma),
+                            Some(&regions),
+                            ts_ms,
+                        );
+                        (sent, payload.len() + chroma.len())
+                    }
+                    None if matches!(
+                        server.negotiated_capabilities(),
+                        Some(CapabilitySet::Hevc420V112)
+                    ) =>
+                    {
+                        let metadata = encode_avc420_bitmap_stream(&regions, &[]);
+                        let metadata_len = metadata.len();
+                        let stream = hevc_v112_payload(f, metadata)?;
+                        let payload_len = stream.len() - metadata_len;
+                        (
+                            server.send_hevc420_frame(surface_id, stream, &regions, ts_ms),
+                            payload_len,
+                        )
+                    }
+                    None => {
+                        let payload = self.frame_payload(f);
+                        (
+                            server.send_avc420_frame(surface_id, &payload, &regions, ts_ms),
+                            payload.len(),
+                        )
+                    }
                 };
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_pixel_buffer`), and stamp the ship time
@@ -3553,18 +3644,18 @@ impl Gfx {
                         ?self.wire_format,
                         param_sets = ps_count,
                         param_bytes = ps_bytes,
-                        payload_bytes = payload.len(),
+                        payload_bytes = payload_len,
                         "EGFX shipped keyframe (IDR)"
                     ),
                     Some(frame_id) => trace!(
                         frame_id,
                         keyframe = false,
-                        payload_bytes = payload.len(),
+                        payload_bytes = payload_len,
                         "EGFX shipped frame"
                     ),
                     None => return Err(anyhow!("EGFX rejected encoded frame")),
                 }
-                (payload.len() + chroma.as_ref().map_or(0, Vec::len)) as u64
+                payload_len as u64
             };
             (server.drain_output(), egfx_channel_id, payload_len)
         };
@@ -3577,6 +3668,9 @@ impl Gfx {
         let svc_messages =
             encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
                 .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
+        if let (Some(stats), Some(started)) = (stats, packetize_started) {
+            stats.video_packetize.record(started.elapsed());
+        }
         let sender = self
             .sender
             .lock()
@@ -3594,7 +3688,7 @@ impl Gfx {
         if let (Some(probe), Some(start)) = (tcp_probe, sample_at) {
             probe.enqueue(&sender, self.clone(), shipped.clone(), start);
         }
-        if let Some(stats) = crate::stats::global() {
+        if let Some(stats) = stats {
             stats.record_video_queued(1, payload_len);
         }
         Ok(())
@@ -3634,16 +3728,27 @@ impl Gfx {
 /// the event dispatcher awaits EGFX writes before answering the next marker.
 struct TcpDispatchProbe {
     runtime: tokio::runtime::Handle,
-    stats: Arc<crate::stats::SessionStats>,
+    stats: Option<Arc<crate::stats::SessionStats>>,
+    watch_tcp: bool,
     next_sample: Option<Instant>,
     pending: Option<tokio::task::JoinHandle<()>>,
 }
 
+struct TcpDispatchPending {
+    started: Instant,
+    capture_deferred: bool,
+}
+
 impl TcpDispatchProbe {
-    fn new(runtime: tokio::runtime::Handle, stats: Arc<crate::stats::SessionStats>) -> Self {
+    fn new(
+        runtime: tokio::runtime::Handle,
+        stats: Option<Arc<crate::stats::SessionStats>>,
+        watch_tcp: bool,
+    ) -> Self {
         Self {
             runtime,
             stats,
+            watch_tcp,
             next_sample: None,
             pending: None,
         }
@@ -3659,9 +3764,9 @@ impl TcpDispatchProbe {
             return None;
         }
         let now = Instant::now();
-        self.next_sample
-            .is_none_or(|deadline| now >= deadline)
-            .then_some(now)
+        // 100 ms is fine for diagnostics alone, but would miss writes that
+        // start between samples when the 50 ms backpressure gate is active.
+        (self.watch_tcp || self.next_sample.is_none_or(|deadline| now >= deadline)).then_some(now)
     }
 
     fn enqueue(
@@ -3676,18 +3781,37 @@ impl TcpDispatchProbe {
         if sender.send(ServerEvent::GetLocalAddr(reply)).is_err() {
             return;
         }
+        {
+            let mut guard = gfx.ctx.lock().unwrap();
+            if let Some(ctx) = guard
+                .as_mut()
+                .filter(|ctx| Arc::ptr_eq(&ctx.shipped, &shipped))
+            {
+                ctx.tcp_dispatch = Some(TcpDispatchPending {
+                    started: start,
+                    capture_deferred: false,
+                });
+            }
+        }
         let stats = self.stats.clone();
         self.pending = Some(self.runtime.spawn(async move {
-            if response.await.is_err() {
-                return;
-            }
+            let dispatched = response.await.is_ok();
             let elapsed = start.elapsed();
-            let guard = gfx.ctx.lock().unwrap();
-            let current = guard
-                .as_ref()
-                .is_some_and(|ctx| ctx.is_ready && Arc::ptr_eq(&ctx.shipped, &shipped));
-            if current && !gfx.egfx_on_udp.load(Ordering::Relaxed) {
-                stats.tcp_dispatch.record(elapsed);
+            let mut guard = gfx.ctx.lock().unwrap();
+            let Some(ctx) = guard
+                .as_mut()
+                .filter(|ctx| Arc::ptr_eq(&ctx.shipped, &shipped))
+            else {
+                return;
+            };
+            let pending = ctx.tcp_dispatch.take();
+            if dispatched && ctx.is_ready && !gfx.egfx_on_udp.load(Ordering::Relaxed) {
+                if let Some(stats) = stats {
+                    stats.tcp_dispatch.record(elapsed);
+                }
+                if pending.is_some_and(|pending| pending.capture_deferred) {
+                    ctx.tcp_dispatch_resumed.notify_one();
+                }
             }
         }));
     }
@@ -3776,7 +3900,9 @@ impl GfxServerFactory for Gfx {
         // still-running macrdp, the id-0 `CreateSurface` no-ops against the
         // surface mstsc retained from the prior session → the reconnect-blank.
         // See the H.264 reconnect quirk note + `on_close` instrumentation below.
-        debug!("EGFX: building fresh GraphicsPipelineServer for new connection (surface-id counter resets to 0)");
+        debug!(
+            "EGFX: building fresh GraphicsPipelineServer for new connection (surface-id counter resets to 0)"
+        );
         let server = GraphicsPipelineServer::new(handler);
         let handle: GfxServerHandle = Arc::new(Mutex::new(server));
         // Channel-level decline flag, shared between this connection's ctx
@@ -3817,10 +3943,13 @@ impl GfxServerFactory for Gfx {
             need_keyframe: true,
             client_supports_avc: false,
             client_supports_avc444: false,
+            hevc420: false,
             newer_egfx_client: false,
             egfx_declined: egfx_declined.clone(),
             submitted: Arc::new(AtomicU64::new(0)),
             shipped: Arc::new(AtomicU64::new(0)),
+            tcp_dispatch: None,
+            tcp_dispatch_resumed: Arc::default(),
             dims: (0, 0),
             last_ack_at: Instant::now(),
             last_ack_advance_at: Instant::now(),
@@ -3893,7 +4022,7 @@ fn caps_indicate_avc(caps: &[CapabilitySet]) -> bool {
         | CapabilitySet::V10_6Err { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
         CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
         // Bare V8 / V10_1 carry no AVC flag — no positive AVC signal.
-        CapabilitySet::V8 { .. } | CapabilitySet::V10_1 => false,
+        CapabilitySet::Hevc420V112 | CapabilitySet::V8 { .. } | CapabilitySet::V10_1 => false,
     })
 }
 
@@ -3926,7 +4055,10 @@ fn caps_indicate_avc444(caps: &[CapabilitySet]) -> bool {
         | CapabilitySet::V10_6 { flags }
         | CapabilitySet::V10_6Err { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
         CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-        CapabilitySet::V8 { .. } | CapabilitySet::V8_1 { .. } | CapabilitySet::V10_1 => false,
+        CapabilitySet::Hevc420V112
+        | CapabilitySet::V8 { .. }
+        | CapabilitySet::V8_1 { .. }
+        | CapabilitySet::V10_1 => false,
     })
 }
 
@@ -3937,6 +4069,10 @@ struct GfxHandler {
 }
 
 impl GraphicsPipelineHandler for GfxHandler {
+    fn enable_hevc420(&self) -> bool {
+        std::env::var("MACRDP_EXPERIMENTAL_HEVC").as_deref() == Ok("1")
+    }
+
     /// Effectively unlimited, so the vendored `send_avc420_frame` NEVER drops an
     /// encoded frame on its ack-based backpressure. Dropping an encoded H.264
     /// frame — a P-frame, or worse a keyframe — breaks the decode reference
@@ -3999,7 +4135,16 @@ impl GraphicsPipelineHandler for GfxHandler {
             // Ok(false) → capture.rs uses legacy BitmapUpdate. Shipping AVC420
             // to a non-AVC client gets it rejected (ERROR_NOT_SUPPORTED) and
             // kills the graphics channel.
-            if ctx.client_supports_avc {
+            let hevc420 = matches!(negotiated, CapabilitySet::Hevc420V112);
+            // A new CapsAdvertise clears the client's EGFX surfaces even if
+            // it still wants HEVC. Recreate and start with a new keyframe.
+            if (ctx.hevc420 || hevc420) && ctx.surface_id.is_some() {
+                ctx.encoder = None;
+                ctx.surface_id = None;
+                ctx.shipped = Arc::new(AtomicU64::new(0));
+            }
+            ctx.hevc420 = hevc420;
+            if ctx.client_supports_avc || ctx.hevc420 {
                 // Only on the first ready: a mid-session capabilities
                 // re-advertise must not push detection back by an arm delay.
                 if !ctx.is_ready {
@@ -4008,7 +4153,11 @@ impl GraphicsPipelineHandler for GfxHandler {
                 ctx.is_ready = true;
                 ctx.egfx_ever_ready = true;
                 ctx.need_keyframe = true;
-                info!(?negotiated, "EGFX channel ready (H.264 active)");
+                info!(
+                    ?negotiated,
+                    codec = if ctx.hevc420 { "HEVC420" } else { "H.264" },
+                    "EGFX channel ready"
+                );
             } else {
                 ctx.is_ready = false;
                 // Decline at the CHANNEL level, not just skip-using-it: flag
@@ -4128,8 +4277,8 @@ impl GraphicsPipelineHandler for GfxHandler {
     }
 
     /// Inbound client QoE frame-acknowledge. Feeds the blank-presentation
-    /// detector (see [`should_blank_recover`]): `time_diff_dr` is the client's own
-    /// decode+render time for the frame — a blank (stale-surface) mstsc session
+    /// detector (see [`should_blank_recover`]): `time_diff_dr` is the client time
+    /// from EndFrame decode to render completion. A blank (stale-surface) mstsc session
     /// reports it as 0 on EVERY frame while still decoding/acking normally,
     /// whereas a rendering session shows nonzero values within ~60 ms of the
     /// first frame (pcap-proven 2026-07-02). Runs with the server mutex held
@@ -4196,6 +4345,9 @@ impl GraphicsPipelineHandler for GfxHandler {
             // --adaptive-bitrate (no-op unless --stats-endpoint). ~8/s.
             if let Some(s) = crate::stats::global() {
                 s.rtt_ms.store(ctx.link_rtt_ms, Ordering::Relaxed);
+                if ctx.is_ready && ctx.surface_id.is_some() {
+                    s.record_client_qoe(metrics.time_diff_se, metrics.time_diff_dr);
+                }
             }
         }
     }
@@ -4218,7 +4370,11 @@ impl GraphicsPipelineHandler for GfxHandler {
                 "EGFX on_close: graphics channel closed (client disconnect/teardown)"
             );
             ctx.is_ready = false;
+            if let Some(stats) = crate::stats::global() {
+                stats.end_video_session();
+            }
             ctx.shipped = Arc::new(AtomicU64::new(0));
+            ctx.tcp_dispatch = None;
             ctx.encoder = None;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
@@ -4237,6 +4393,55 @@ impl GraphicsPipelineHandler for StubHandler {
     fn on_ready(&mut self, _negotiated: &CapabilitySet) {
         warn!("EGFX StubHandler::on_ready — build_server_with_handle should have replaced this");
     }
+}
+
+/// Frame body after the region metablock for negotiated EGFX 11.2 HEVC420.
+fn hevc_v112_payload(frame: &EncodedFrame, mut payload: Vec<u8>) -> Result<Vec<u8>> {
+    // The common inter frame is one length-prefixed slice. Write its EGFX
+    // table and Annex B start code directly into the final allocation.
+    if frame.parameter_sets.is_empty() {
+        if let Some((length, unit)) = frame.data.split_first_chunk::<4>() {
+            if unit.len() >= 2 && unit.len() == u32::from_be_bytes(*length) as usize {
+                let nal_size = u32::try_from(frame.data.len())?;
+                payload.reserve_exact(8 + frame.data.len());
+                payload.extend_from_slice(&4u32.to_le_bytes());
+                payload.extend_from_slice(&nal_size.to_le_bytes());
+                payload.extend_from_slice(&[0, 0, 0, 1]);
+                payload.extend_from_slice(unit);
+                return Ok(payload);
+            }
+        }
+    }
+    let mut units: Vec<&[u8]> = frame.parameter_sets.iter().map(Vec::as_slice).collect();
+    let mut data = frame.data.as_slice();
+    while !data.is_empty() {
+        let (length, rest) = data
+            .split_first_chunk::<4>()
+            .ok_or_else(|| anyhow!("short HEVC NAL length"))?;
+        let (unit, tail) = rest
+            .split_at_checked(u32::from_be_bytes(*length) as usize)
+            .ok_or_else(|| anyhow!("short HEVC NAL"))?;
+        units.push(unit);
+        anyhow::ensure!(units.len() <= 512, "too many HEVC NAL units");
+        data = tail;
+    }
+    anyhow::ensure!(
+        !units.is_empty() && units.len() <= 512,
+        "invalid HEVC NAL count"
+    );
+    let table_bytes = units.len() * 4;
+    let parameter_bytes: usize = frame.parameter_sets.iter().map(|unit| 4 + unit.len()).sum();
+    payload.reserve_exact(4 + table_bytes + parameter_bytes + frame.data.len());
+    payload.extend_from_slice(&u32::try_from(table_bytes)?.to_le_bytes());
+    for unit in &units {
+        anyhow::ensure!(unit.len() >= 2, "short HEVC NAL header");
+        payload.extend_from_slice(&u32::try_from(unit.len() + 4)?.to_le_bytes());
+    }
+    for unit in units {
+        payload.extend_from_slice(&[0, 0, 0, 1]);
+        payload.extend_from_slice(unit);
+    }
+    Ok(payload)
 }
 
 /// Rewrite AVCC (4-byte length-prefixed NALs) to Annex-B (`00 00 00 01` start
@@ -4275,6 +4480,71 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hevc_inter_frame_uses_one_annex_b_nal_and_its_full_size() {
+        let mut frame = super::EncodedFrame {
+            data: vec![0, 0, 0, 3, 0x02, 0x01, 0xaa],
+            parameter_sets: vec![],
+            is_keyframe: false,
+            pts: 1,
+        };
+        assert_eq!(
+            super::hevc_v112_payload(&frame, Vec::new()).unwrap(),
+            [4, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 1, 0x02, 0x01, 0xaa]
+        );
+        let region = super::Avc420Region {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+            quantization_parameter: 22,
+            quality: 100,
+        };
+        let regions = [region];
+        let body = super::hevc_v112_payload(&frame, Vec::new()).unwrap();
+        let old = super::encode_avc420_bitmap_stream(&regions, &body);
+        let metadata = super::encode_avc420_bitmap_stream(&regions, &[]);
+        assert_eq!(super::hevc_v112_payload(&frame, metadata).unwrap(), old);
+
+        frame.data.pop();
+        assert!(super::hevc_v112_payload(&frame, Vec::new()).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires a VideoToolbox HEVC encoder"]
+    fn hardware_hevc_keyframe_has_v112_nal_size_table() -> anyhow::Result<()> {
+        let mut encoder = super::Encoder::new_with_codec(
+            320,
+            240,
+            60,
+            4_000_000,
+            2.0,
+            crate::videotoolbox::PictureCodec::Hevc420,
+        )?;
+        encoder.encode_bgra(&vec![127; 320 * 240 * 4], 320 * 4, true)?;
+        let frames = encoder.flush()?;
+        let frame = frames.first().expect("HEVC picture");
+        assert!(frame.is_keyframe);
+        let payload = super::hevc_v112_payload(frame, Vec::new())?;
+        let table_len = u32::from_le_bytes(payload[..4].try_into()?) as usize;
+        let mut remaining = &payload[4 + table_len..];
+        let mut types = Vec::new();
+        for entry in payload[4..4 + table_len].chunks_exact(4) {
+            let size = u32::from_le_bytes(entry.try_into()?) as usize;
+            let (nal, rest) = remaining.split_at(size);
+            assert_eq!(&nal[..4], &[0, 0, 0, 1]);
+            types.push((nal[4] >> 1) & 63);
+            remaining = rest;
+        }
+        assert!(remaining.is_empty());
+        for required in [32, 33, 34] {
+            assert!(types.contains(&required));
+        }
+        assert!(types.iter().any(|kind| (16..=21).contains(kind)));
+        Ok(())
+    }
+
     #[test]
     fn ack_lag_limit_tcp_is_off_unless_configured() {
         // TCP with N = 0 never drops, flush or not.
@@ -6960,7 +7230,8 @@ mod tests {
         let stats = Arc::new(crate::stats::SessionStats::default());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         for retire_surface in [false, true] {
-            let mut probe = TcpDispatchProbe::new(tokio::runtime::Handle::current(), stats.clone());
+            let mut probe =
+                TcpDispatchProbe::new(tokio::runtime::Handle::current(), Some(stats.clone()), true);
             let start = probe.sample_start(&gfx.egfx_on_udp).unwrap();
             probe.enqueue(&tx, gfx.clone(), shipped.clone(), start);
             let Some(ironrdp_server::ServerEvent::GetLocalAddr(reply)) = rx.recv().await else {
@@ -6968,13 +7239,123 @@ mod tests {
             };
             assert_eq!(stats.tcp_dispatch.sample_count(), u64::from(retire_surface));
             assert!(probe.sample_start(&gfx.egfx_on_udp).is_none());
+            assert_eq!(
+                gfx.ctx
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .tcp_dispatch
+                    .as_ref()
+                    .map(|pending| pending.started),
+                Some(start)
+            );
             if retire_surface {
                 gfx.reset_for_live_resize();
             }
             reply.send(None).unwrap();
             probe.pending.take().unwrap().await.unwrap();
             assert_eq!(stats.tcp_dispatch.sample_count(), 1);
+            if !retire_surface {
+                probe.next_sample = Some(Instant::now() + Duration::from_secs(1));
+                assert!(probe.sample_start(&gfx.egfx_on_udp).is_some());
+                probe.watch_tcp = false;
+                assert!(probe.sample_start(&gfx.egfx_on_udp).is_none());
+                assert!(gfx
+                    .ctx
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .tcp_dispatch
+                    .is_none());
+            }
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a VideoToolbox HEVC encoder"]
+    async fn stalled_tcp_hevc_resumes_capture_after_dispatch() -> anyhow::Result<()> {
+        use super::{FrameSubmission, TcpDispatchProbe, VideoEncoder, TCP_DISPATCH_STALL};
+        use screencapturekit::cv::CVPixelBuffer;
+
+        let mut gfx = gfx_with_context();
+        gfx.tcp_max_frame_lag = 2;
+        let encoder = super::Encoder::new_with_codec(
+            320,
+            240,
+            60,
+            4_000_000,
+            2.0,
+            crate::videotoolbox::PictureCodec::Hevc420,
+        )?;
+        let shipped = {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.is_ready = true;
+            ctx.hevc420 = true;
+            ctx.need_keyframe = false;
+            ctx.surface_id = Some(0);
+            ctx.dims = (320, 240);
+            ctx.encoder = Some(VideoEncoder::Avc420(encoder));
+            ctx.shipped.clone()
+        };
+        let pixel = CVPixelBuffer::create(320, 240, u32::from_be_bytes(*b"BGRA"))
+            .map_err(|status| anyhow::anyhow!("create BGRA pixel buffer: {status}"))?;
+        pixel
+            .lock_read_write()
+            .map_err(|status| anyhow::anyhow!("lock BGRA pixel buffer: {status}"))?
+            .as_slice_mut()
+            .expect("writable BGRA pixels")
+            .fill(127);
+
+        let mut probe = TcpDispatchProbe::new(tokio::runtime::Handle::current(), None, true);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        probe.enqueue(
+            &tx,
+            gfx.clone(),
+            shipped,
+            Instant::now() - TCP_DISPATCH_STALL,
+        );
+        let Some(ironrdp_server::ServerEvent::GetLocalAddr(reply)) = rx.recv().await else {
+            panic!("expected local dispatch marker");
+        };
+        assert!(matches!(
+            gfx.submit_pixel_buffer(&pixel, false, true, false)?,
+            FrameSubmission::Deferred
+        ));
+        assert!(matches!(
+            gfx.submit_pixel_buffer(&pixel, false, false, true)?,
+            FrameSubmission::Deferred
+        ));
+        {
+            let guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_ref().unwrap();
+            assert_eq!(ctx.submitted.load(Ordering::Relaxed), 0);
+            assert!(ctx.need_keyframe);
+        }
+        reply.send(None).unwrap();
+        probe.pending.take().unwrap().await?;
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            gfx.wait_for_tcp_dispatch_resume(),
+        )
+        .await?;
+        assert!(matches!(
+            gfx.submit_pixel_buffer(&pixel, false, false, true)?,
+            FrameSubmission::Submitted
+        ));
+        let mut guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_mut().unwrap();
+        assert_eq!(ctx.submitted.load(Ordering::Relaxed), 1);
+        assert!(!ctx.need_keyframe);
+        let Some(VideoEncoder::Avc420(encoder)) = ctx.encoder.as_mut() else {
+            panic!("expected HEVC encoder");
+        };
+        let frames = encoder.flush()?;
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_keyframe);
+        Ok(())
     }
 
     #[test]

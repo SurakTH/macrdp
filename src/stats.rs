@@ -46,6 +46,15 @@ impl StageTiming {
 /// lock-free; the listener reads it under no lock either. Values are best-effort
 /// and eventually-consistent. Video activity tracks the encoder session, not
 /// whether a client is authenticated or using bitmap graphics.
+#[derive(Clone, Copy)]
+pub enum VideoCodec {
+    None,
+    Bitmap,
+    Avc420,
+    Avc444,
+    Hevc420,
+}
+
 #[derive(Default)]
 pub struct SessionStats {
     pub connected: AtomicBool,
@@ -77,6 +86,10 @@ pub struct SessionStats {
     pub encode_retained_submitted: AtomicU64,
     pub encode_deferred: AtomicU64,
     pub encode_tcp_backpressure: AtomicU64,
+    /// Subset of TCP deferrals specifically caused by a pending local write.
+    pub encode_tcp_write_stall: AtomicU64,
+    /// Capture-loop wakeups that advanced a still-unsent picture.
+    pub tcp_resume_wakes: AtomicU64,
     pub encoded_pictures: AtomicU64,
     pub encode_output_errors: AtomicU64,
     pub encode_submit_errors: AtomicU64,
@@ -86,6 +99,7 @@ pub struct SessionStats {
     pub video_frames_queued: AtomicU64,
     pub video_ship_errors: AtomicU64,
     pub video_payload_bytes: AtomicU64,
+    video_codec: AtomicU32,
     pub video_generation: AtomicU64,
     pub encode_completed: AtomicU64,
     pub encode_total_us: AtomicU64,
@@ -93,7 +107,14 @@ pub struct SessionStats {
     pub encode_prepared: AtomicU64,
     pub encode_prepare_total_us: AtomicU64,
     pub capture_to_submit: StageTiming,
+    /// First sample timestamp to receipt by the system-audio capture loop.
+    pub audio_capture_age: StageTiming,
+    /// Encoded picture to DVC messages, including graphics lock waits.
+    pub video_packetize: StageTiming,
     pub tcp_dispatch: StageTiming,
+    pub client_qoe_reports: AtomicU64,
+    pub client_frame_parse: StageTiming,
+    pub client_render_completion: StageTiming,
     pub ack_samples: AtomicU64,
     pub ack_sample_uptime_ms: AtomicU64,
     pub ack_rtt_ms: AtomicU32,
@@ -120,7 +141,22 @@ impl SessionStats {
         self.adaptive.store(false, Ordering::Relaxed);
     }
 
+    pub fn set_video_codec(&self, codec: VideoCodec) {
+        self.video_codec.store(codec as u32, Ordering::Relaxed);
+    }
+
+    fn video_codec(&self) -> &'static str {
+        match self.video_codec.load(Ordering::Relaxed) {
+            value if value == VideoCodec::Bitmap as u32 => "bitmap",
+            value if value == VideoCodec::Avc420 as u32 => "avc420",
+            value if value == VideoCodec::Avc444 as u32 => "avc444",
+            value if value == VideoCodec::Hevc420 as u32 => "hevc420",
+            _ => "none",
+        }
+    }
+
     pub fn end_video_session(&self) {
+        self.set_video_codec(VideoCodec::None);
         self.connected.store(false, Ordering::Relaxed);
         self.ack_samples.store(0, Ordering::Relaxed);
     }
@@ -150,6 +186,23 @@ impl SessionStats {
             .fetch_add(payload_bytes, Ordering::Relaxed);
         self.video_frames_queued
             .fetch_add(frames, Ordering::Relaxed);
+    }
+
+    pub fn record_client_qoe(&self, start_to_end_ms: u16, end_to_render_ms: u16) {
+        use std::time::Duration;
+
+        // Zero can mean sub-millisecond, unavailable, or an overflow reported
+        // as zero by the client. Preserve the report count and time only
+        // nonzero samples so missing render timings do not look instantaneous.
+        if start_to_end_ms != 0 {
+            self.client_frame_parse
+                .record(Duration::from_millis(u64::from(start_to_end_ms)));
+        }
+        if end_to_render_ms != 0 {
+            self.client_render_completion
+                .record(Duration::from_millis(u64::from(end_to_render_ms)));
+        }
+        self.client_qoe_reports.fetch_add(1, Ordering::Relaxed);
     }
 
     fn to_json(&self) -> String {
@@ -209,6 +262,14 @@ impl SessionStats {
             self.encode_tcp_backpressure.load(Ordering::Relaxed)
         ));
         json.push_str(&format!(
+            ",\"encode_tcp_write_stall\":{}",
+            self.encode_tcp_write_stall.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
+            ",\"tcp_resume_wakes\":{}",
+            self.tcp_resume_wakes.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
             ",\"encoded_pictures\":{}",
             self.encoded_pictures.load(Ordering::Relaxed)
         ));
@@ -229,9 +290,10 @@ impl SessionStats {
             self.transport_retired.load(Ordering::Relaxed)
         ));
         json.push_str(&format!(
-            ",\"diagnostics_version\":1,\"process_id\":{},\"video_active\":{}",
+            ",\"diagnostics_version\":1,\"process_id\":{},\"video_active\":{},\"video_codec\":\"{}\"",
             std::process::id(),
-            self.connected.load(Ordering::Relaxed)
+            self.connected.load(Ordering::Relaxed),
+            self.video_codec()
         ));
         json.push_str(&format!(
             concat!(",\"uptime_ms\":{},\"video_generation\":{},\"video_frames_queued\":{},",
@@ -245,9 +307,17 @@ impl SessionStats {
             self.ack_samples.load(Ordering::Relaxed), self.ack_sample_uptime_ms.load(Ordering::Relaxed),
             self.ack_rtt_ms.load(Ordering::Relaxed), self.ack_queue_ms.load(Ordering::Relaxed),
         ));
+        json.push_str(&format!(
+            ",\"client_qoe_reports\":{}",
+            self.client_qoe_reports.load(Ordering::Relaxed)
+        ));
         for (name, stage) in [
             ("capture_to_submit", &self.capture_to_submit),
+            ("audio_capture_age", &self.audio_capture_age),
+            ("video_packetize", &self.video_packetize),
             ("tcp_dispatch", &self.tcp_dispatch),
+            ("client_frame_parse", &self.client_frame_parse),
+            ("client_render_completion", &self.client_render_completion),
         ] {
             use std::fmt::Write as _;
             let samples = stage.sample_count();
@@ -348,12 +418,15 @@ mod tests {
     fn video_end_hides_activity_and_invalidates_acks_without_resetting_counters() {
         let s = SessionStats::default();
         s.connected.store(true, Ordering::Relaxed);
+        s.set_video_codec(VideoCodec::Hevc420);
+        assert!(s.to_json().contains("\"video_codec\":\"hevc420\""));
         s.ack_samples.store(5, Ordering::Relaxed);
         s.video_frames_queued.store(12, Ordering::Relaxed);
         assert!(s.to_json().contains("\"video_active\":true"));
         s.end_video_session();
         let json = s.to_json();
         assert!(json.contains("\"video_active\":false"));
+        assert!(json.contains("\"video_codec\":\"none\""));
         assert!(json.contains("\"ack_samples\":0"));
         assert!(json.contains("\"video_frames_queued\":12"));
     }
@@ -414,5 +487,23 @@ mod tests {
             assert!(json.contains(field), "missing {field}");
         }
         assert!(json.contains("\"uptime_ms\":"));
+    }
+
+    #[test]
+    fn client_qoe_keeps_zero_reports_out_of_duration_averages() {
+        let s = SessionStats::default();
+        s.record_client_qoe(2, 0);
+        s.record_client_qoe(0, 4);
+        s.record_client_qoe(1, 7);
+        let json = s.to_json();
+        for field in [
+            "\"client_qoe_reports\":3",
+            "\"client_frame_parse_samples\":2",
+            "\"client_frame_parse_total_us\":3000",
+            "\"client_render_completion_samples\":2",
+            "\"client_render_completion_total_us\":11000",
+        ] {
+            assert!(json.contains(field), "missing {field}");
+        }
     }
 }

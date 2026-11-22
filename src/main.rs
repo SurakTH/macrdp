@@ -168,21 +168,36 @@ fn primary_screen_geometry() -> ((f64, f64), (f64, f64)) {
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_screen_recording_access() {
+async fn ensure_screen_recording_access() -> Result<()> {
     use core_graphics::access::ScreenCaptureAccess;
     let tcc = ScreenCaptureAccess;
-    if tcc.preflight() {
-        info!("Screen Recording permission already granted");
-        return;
+    if !tcc.preflight() {
+        // Request once. Checking again does not open another dialog.
+        let granted = tcc.request();
+        if !granted {
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if tcc.preflight() {
+                    info!("Screen Recording permission already granted");
+                    return Ok(());
+                }
+            }
+
+            warn!(
+                "Screen Recording permission NOT granted. Enable it for macrdp.app in \
+                 System Settings → Privacy & Security, then restart macrdp."
+            );
+            if !std::io::stdout().is_terminal() {
+                // KeepAlive would relaunch an exited process and show another
+                // permission prompt. Wait for an explicit restart without
+                // starting capture or accepting RDP connections.
+                std::future::pending::<()>().await;
+            }
+            anyhow::bail!("Screen Recording permission is required");
+        }
     }
-    warn!(
-        "Screen Recording permission NOT granted. macrdp will appear in \
-         System Settings → Privacy & Security → Screen Recording. Enable it, \
-         then RESTART macrdp (TCC grants only take effect on next launch)."
-    );
-    // request() registers the binary with TCC and opens the prompt; the
-    // returned bool reflects current state, which is still false on first run.
-    let _ = tcc.request();
+    info!("Screen Recording permission already granted");
+    Ok(())
 }
 
 #[derive(Parser, Debug)]
@@ -646,6 +661,11 @@ struct Args {
     /// the encoder.
     #[arg(long, default_value_t = 128_000)]
     aac_bitrate: u32,
+
+    /// Try Core Audio Tap for lower system audio capture latency (macOS 14.2+).
+    /// Falls back to ScreenCaptureKit if the tap cannot deliver samples.
+    #[arg(long)]
+    audio_core_tap: bool,
 
     /// Enable RDPDR drive redirection (MS-RDPEFS): the connecting client
     /// redirects its local drive(s) and the Mac mounts each as a real
@@ -2591,6 +2611,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
             false,
         ),
         ("ENABLE_LOSSY_AUDIO", "--enable-lossy-audio", false),
+        ("AUDIO_CORE_TAP", "--audio-core-tap", false),
     ] {
         if cfg.contains_key(key) {
             configured_switch_flags.push(flag);
@@ -2924,6 +2945,8 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // Loopback live-telemetry endpoint port (--stats-endpoint). Read via
         // getenv() in stats::default_port(); bridged like the USB/camera knobs
         // above so STATS_PORT can be set from config.env.
+        ("PREFER_HEVC", "MACRDP_EXPERIMENTAL_HEVC"),
+        ("HEVC_HIGH_SPEED", "MACRDP_HEVC_HIGH_SPEED"),
         ("RESPONSIVE_CAPTURE", "MACRDP_RESPONSIVE_CAPTURE"),
         ("STATS_PORT", "MACRDP_STATS_PORT"),
         ("AVC444_ALL_INTRA", "MACRDP_AVC444_ALL_INTRA"),
@@ -3400,10 +3423,10 @@ async fn async_main() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
+        ensure_screen_recording_access().await?;
         if !args.allow_sleep {
             prevent_sleep();
         }
-        ensure_screen_recording_access();
         if !ensure_accessibility_access() {
             warn!(
                 "Accessibility permission NOT granted. macrdp will appear in \
@@ -3935,6 +3958,7 @@ async fn async_main() -> Result<()> {
         !args.no_mute_on_minimize,
         args.enable_aac,
         args.aac_bitrate,
+        args.audio_core_tap,
         // Bind audio to the same display the video captures so --detach-primary
         // / --capture-primary (which disable/capture the physical panel) don't
         // kill the audio stream's content source.
@@ -4505,6 +4529,16 @@ mod config_tests {
         assert!(!args.alt_space_spotlight && !args.enable_lossy_audio);
         assert!(matches!(args.virtual_display_hidpi, Some(VdHidpiArg::On)));
         assert_eq!(args.fps, Some(60));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn core_audio_tap_requires_an_explicit_opt_in() {
+        assert!(!Args::try_parse_from(["macrdp"]).unwrap().audio_core_tap);
+        let path = write_temp("core-audio-tap", "AUDIO_CORE_TAP=1\n");
+        assert!(args_from_config(&path).unwrap().audio_core_tap);
+        fs::write(&path, "AUDIO_CORE_TAP=0\nEXTRA_FLAGS=--audio-core-tap\n").unwrap();
+        assert!(!args_from_config(&path).unwrap().audio_core_tap);
         fs::remove_file(path).unwrap();
     }
 
