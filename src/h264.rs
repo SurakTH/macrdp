@@ -3292,8 +3292,7 @@ impl Gfx {
     /// expects (real RDS servers send a deactivation-reactivation + graphics
     /// reset). Dropping `ctx.encoder` here synchronously invalidates the old
     /// VT session and closes its channel, so the old ship thread exits
-    /// cleanly; frames it still holds fail the `surface_id` lookup and are
-    /// dropped harmlessly.
+    /// cleanly. The retired pipe's remaining frames are discarded.
     ///
     /// History: a channel-level non-destructive surface swap (CreateSurface
     /// then MapSurfaceToOutput over the live session, NO core reactivation,
@@ -3313,6 +3312,7 @@ impl Gfx {
             // session + ship thread now; surface_id=None makes the next
             // `submit_bgra` run `setup_locked` (which also rebuilds the
             // encoder and resets the throttle counters).
+            ctx.shipped = Arc::new(AtomicU64::new(0));
             ctx.encoder = None;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
@@ -3456,10 +3456,12 @@ impl Gfx {
             // lock order consistent (server_handle is never nested under ctx).
             let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
                 let mut guard = self.ctx.lock().unwrap();
-                let ctx = guard
+                let Some(ctx) = guard
                     .as_mut()
                     .filter(|ctx| Arc::ptr_eq(&ctx.shipped, shipped))
-                    .ok_or_else(|| anyhow!("EGFX: encoder belongs to an inactive connection"))?;
+                else {
+                    return Ok(());
+                };
                 let surface_id = ctx
                     .surface_id
                     .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
@@ -4136,6 +4138,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                 "EGFX on_close: graphics channel closed (client disconnect/teardown)"
             );
             ctx.is_ready = false;
+            ctx.shipped = Arc::new(AtomicU64::new(0));
             ctx.encoder = None;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
@@ -6862,6 +6865,23 @@ mod tests {
         );
         assert!(gfx.build_server_with_handle().is_some());
         gfx
+    }
+
+    #[test]
+    fn resize_discards_output_from_the_retired_encoder() {
+        let gfx = gfx_with_context();
+        let retired = gfx.ctx.lock().unwrap().as_ref().unwrap().shipped.clone();
+        gfx.reset_for_live_resize();
+
+        let frame = EncodedFrame {
+            data: Vec::new(),
+            is_keyframe: true,
+            pts: 0,
+            parameter_sets: Vec::new(),
+        };
+        assert!(gfx.ship_frame(&frame, None, &retired).is_ok());
+        let active = gfx.ctx.lock().unwrap().as_ref().unwrap().shipped.clone();
+        assert!(!Arc::ptr_eq(&retired, &active));
     }
 
     /// Every connection-start clock, so a test can't pass by checking only the

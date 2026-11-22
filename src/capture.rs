@@ -379,10 +379,11 @@ pub struct CaptureDisplay {
     /// Trailing flush frames re-sent after the last change to drain mstsc's
     /// presentation buffer (`--flush-frames`; EGFX/H.264 path only). 0 disables.
     pub flush_frames: u32,
+    /// Optional interval for retained frames in a trailing flush.
+    pub flush_interval: Option<Duration>,
     /// `--capture-nv12` (experimental): ScreenCaptureKit delivers NV12 that the
     /// encoder takes as-is, instead of BGRA it converts on the CPU. No effect
     /// without H.264.
-    pub flush_interval: Option<Duration>,
     pub capture_nv12: bool,
     /// Shared "client minimized" flag from the vendor server's
     /// `SuppressOutput` handler. When set, `next_update` short-circuits
@@ -412,11 +413,8 @@ pub struct CaptureDisplay {
     /// size. See `request_initial_size`'s doc comment for why this exists.
     pub suppress_next_adopt: Arc<AtomicBool>,
     /// The `--virtual-display` this session serves, when there is one.
-    /// Shared with `main.rs`, which created it. Enables live client-driven
-    /// resize on the virtual-display path:
-    /// `request_layout` accepts the request even though `auto_size` is
-    /// pinned off there, and `updates()` re-modes the display to match
-    /// `desktop_size` before each capture stream is built.
+    /// Shared with `main.rs`, which created it. With `auto_size` enabled,
+    /// `updates()` re-modes it to match `desktop_size` before capture.
     pub virtual_display: Option<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
     /// When the virtual display runs HiDPI (`--virtual-display-hidpi`). With
     /// `Auto`, decided per connection from the client's desktop scale factor
@@ -650,7 +648,7 @@ impl RdpServerDisplay for CaptureDisplay {
     /// the virtual-display path (`virtual_display` is `Some` — the display
     /// itself is re-moded to the requested size in `updates()`, so the
     /// session stays a 1:1 native capture at the new size). Still a no-op
-    /// for a pinned size (`--width`/`--height`/`--hidpi` without a vd).
+    /// for a pinned size (`--no-client-resolution`, or a fixed primary size).
     /// Debounced by the capture loop via `pending_resize` so a window drag
     /// (many PDUs/sec) produces one resize, not one per tick. Both codec
     /// paths ride the same core deactivation-reactivation; on the EGFX
@@ -661,8 +659,7 @@ impl RdpServerDisplay for CaptureDisplay {
     /// surface swap without the core reactivation was tried first and was
     /// visually broken on a real client).
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
-        let resizable = self.auto_size || self.virtual_display.is_some();
-        if !resizable {
+        if !self.auto_size {
             tracing::debug!(
                 "client requested a live resize (window drag) but the session size \
                  is pinned (--no-client-resolution, or an explicit \
@@ -705,7 +702,7 @@ impl RdpServerDisplay for CaptureDisplay {
 
         let requested = cap_client_size(DesktopSize { width, height }, self.max_client_size);
         let (cur_w, cur_h) = self.desktop_size.get();
-        let Some(adopted) = adopt_client_size(resizable, (cur_w, cur_h), requested) else {
+        let Some(adopted) = adopt_client_size(self.auto_size, (cur_w, cur_h), requested) else {
             // Size unchanged (or outside the protocol-legal band): only a
             // scale change still needs a re-mode, at the current size.
             if scale_changed {
