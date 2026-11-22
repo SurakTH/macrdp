@@ -4280,6 +4280,21 @@ impl GraphicsPipelineHandler for StubHandler {
 
 /// Frame body after the region metablock for negotiated EGFX 11.2 HEVC420.
 fn hevc_v112_payload(frame: &EncodedFrame) -> Result<Vec<u8>> {
+    // The common inter frame is one length-prefixed slice. Write its EGFX
+    // table and Annex B start code directly into the final allocation.
+    if frame.parameter_sets.is_empty() {
+        if let Some((length, unit)) = frame.data.split_first_chunk::<4>() {
+            if unit.len() >= 2 && unit.len() == u32::from_be_bytes(*length) as usize {
+                let nal_size = u32::try_from(frame.data.len())?;
+                let mut payload = Vec::with_capacity(8 + frame.data.len());
+                payload.extend_from_slice(&4u32.to_le_bytes());
+                payload.extend_from_slice(&nal_size.to_le_bytes());
+                payload.extend_from_slice(&[0, 0, 0, 1]);
+                payload.extend_from_slice(unit);
+                return Ok(payload);
+            }
+        }
+    }
     let mut units: Vec<&[u8]> = frame.parameter_sets.iter().map(Vec::as_slice).collect();
     let mut data = frame.data.as_slice();
     while !data.is_empty() {
@@ -4297,8 +4312,10 @@ fn hevc_v112_payload(frame: &EncodedFrame) -> Result<Vec<u8>> {
         !units.is_empty() && units.len() <= 512,
         "invalid HEVC NAL count"
     );
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(u32::try_from(units.len() * 4)?).to_le_bytes());
+    let table_bytes = units.len() * 4;
+    let parameter_bytes: usize = frame.parameter_sets.iter().map(|unit| 4 + unit.len()).sum();
+    let mut payload = Vec::with_capacity(4 + table_bytes + parameter_bytes + frame.data.len());
+    payload.extend_from_slice(&u32::try_from(table_bytes)?.to_le_bytes());
     for unit in &units {
         anyhow::ensure!(unit.len() >= 2, "short HEVC NAL header");
         payload.extend_from_slice(&u32::try_from(unit.len() + 4)?.to_le_bytes());
@@ -4346,6 +4363,22 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hevc_inter_frame_uses_one_annex_b_nal_and_its_full_size() {
+        let mut frame = super::EncodedFrame {
+            data: vec![0, 0, 0, 3, 0x02, 0x01, 0xaa],
+            parameter_sets: vec![],
+            is_keyframe: false,
+            pts: 1,
+        };
+        assert_eq!(
+            super::hevc_v112_payload(&frame).unwrap(),
+            [4, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 1, 0x02, 0x01, 0xaa]
+        );
+        frame.data.pop();
+        assert!(super::hevc_v112_payload(&frame).is_err());
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     #[ignore = "requires a VideoToolbox HEVC encoder"]
