@@ -2322,10 +2322,8 @@ impl Gfx {
             }
             // Lazy one-time setup on the first ready frame (creates the encoder
             // and spawns the ship thread).
-            if ctx.surface_id.is_none() || ctx.encoder.is_none() {
-                if !self.setup_locked(ctx)? {
-                    return Ok(Deferred);
-                }
+            if (ctx.surface_id.is_none() || ctx.encoder.is_none()) && !self.setup_locked(ctx)? {
+                return Ok(Deferred);
             }
             // Blank-presentation detector (the mstsc reconnect-blank): the client
             // is decoding + acking every frame (QoE reports flowing) but its

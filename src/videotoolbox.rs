@@ -335,8 +335,7 @@ impl Encoder {
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
         let session = ffi::create_session(
-            width,
-            height,
+            (width, height),
             fps,
             bitrate_bps,
             VT_KEYFRAME_BACKSTOP,
@@ -994,8 +993,7 @@ mod ffi {
     unsafe impl Send for SessionGuard {}
 
     pub(super) fn create_session(
-        width: u16,
-        height: u16,
+        (width, height): (u16, u16),
         fps: u32,
         bitrate_bps: u32,
         keyframe_frames: u32,
