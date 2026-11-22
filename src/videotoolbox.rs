@@ -1527,21 +1527,11 @@ mod ffi {
         Ok(())
     }
 
-    // --- BGRA -> full-range YUV444 planar (AVC444 scoping benchmark) ---------
-    //
-    // Two reference implementations of full-resolution chroma conversion, kept
-    // side-by-side for an A/B perf decision before committing to AVC444's
-    // 2-encoder pipeline. Same BT.709 full-range matrix as the NV12 path.
-    // Neither is wired into encode_frame; they exist for the bench in
-    // videotoolbox::tests::bench_yuv444_full_range.
-    //
-    // Gated behind cfg(test) until AVC444 is actually wired up — they're
-    // dead code in a production build today.
+    // BGRA to full-range planar BT.709 for AVC444.
 
     /// Scalar BGRA -> three full-resolution planar Y/Cb/Cr buffers. The matrix
     /// matches `bgra_to_nv12_full_range` exactly — the only difference is no
     /// 2x2 averaging.
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bgra_to_yuv444_planar_scalar(
         bgra: &[u8],
@@ -1577,7 +1567,6 @@ mod ffi {
         }
     }
 
-    #[cfg(test)]
     extern "C" {
         /// `vImageMatrixMultiply_ARGB8888ToPlanar8` (vImage Transform.h). One call
         /// per output plane. The matrix is `int16_t[4]` in source byte order; we
@@ -1601,30 +1590,22 @@ mod ffi {
     /// - Y  =  0.2126 R + 0.7152 G + 0.0722 B
     /// - Cb = -0.114572 R - 0.385428 G + 0.500000 B + 128
     /// - Cr =  0.500000 R - 0.454153 G - 0.045847 B + 128
-    #[cfg(test)]
     const DIVISOR: i32 = 16384; // 2^14
 
     // Y plane coefficients: [B, G, R, A] * Q14, no post-bias.
-    #[cfg(test)]
     const Y_MATRIX: [i16; 4] = [1183, 11718, 3483, 0]; // 0.0722, 0.7152, 0.2126, 0
-    #[cfg(test)]
     const Y_POST_BIAS: i32 = DIVISOR / 2; // rounding offset
 
     // Cb plane coefficients + 128*Q14 bias to recenter.
-    #[cfg(test)]
     const CB_MATRIX: [i16; 4] = [8192, -6315, -1877, 0]; // 0.5, -0.385428, -0.114572, 0
-    #[cfg(test)]
     const CB_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     // Cr plane.
-    #[cfg(test)]
     const CR_MATRIX: [i16; 4] = [-751, -7440, 8192, 0]; // -0.045847, -0.454153, 0.5, 0
-    #[cfg(test)]
     const CR_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     /// vImage BGRA -> three full-resolution planar Y/Cb/Cr buffers via three
     /// `vImageMatrixMultiply_ARGB8888ToPlanar8` calls (one per plane).
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bgra_to_yuv444_planar_vimage(
         bgra: &[u8],
