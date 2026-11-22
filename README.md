@@ -162,6 +162,8 @@ macrdp reimplements the macOS symbolic hotkeys in user space (WindowServer won't
 | **Cmd+\`** / **Cmd+Shift+\`** | Cycle windows of the current app |
 | **Cmd+Space** | Spotlight |
 | **Cmd+Shift+3 / 4 / 5** | Screenshots (full screen / region / Screenshot.app) |
+| **Ctrl+Cmd+Shift+3** | Copy a full-screen screenshot directly to the Mac clipboard |
+| **Ctrl+Cmd+Shift+4** | Select an area and copy the screenshot directly to the Mac clipboard |
 | **Ctrl+↑ / ↓** | Mission Control / windows of the current app |
 | **Ctrl+← / →** | Previous / next desktop Space |
 | **Ctrl+Alt+G** | Gather windows stranded off the virtual display (headless `--capture-primary`/`--detach-primary` modes) |
