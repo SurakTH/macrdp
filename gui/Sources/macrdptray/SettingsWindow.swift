@@ -527,6 +527,28 @@ private struct DisplayTab: View {
                     + "window and stays lockable.")
                     .font(.caption).foregroundColor(.secondary)
             }
+            Section("Lock while away (experimental)") {
+                let headless = model.primaryMode != "none"
+                Toggle("Lock the Mac when the last client disconnects",
+                       isOn: model.boolBinding("LOCK_ON_DISCONNECT"))
+                    .disabled(!headless)
+                Toggle("Unlock it automatically when a client reconnects",
+                       isOn: model.boolBinding("AUTO_UNLOCK"))
+                    .disabled(!headless)
+                if !headless {
+                    Text("Needs one of the Detach/Blank modes above.")
+                        .font(.caption).foregroundColor(.secondary)
+                } else if model.bool("LOCK_ON_DISCONNECT") && !model.bool("AUTO_UNLOCK") {
+                    Text("Without automatic unlock you'll need to be at the Mac to unlock it — "
+                        + "a remote-only Mac would be unreachable once it locks.")
+                        .font(.caption).foregroundColor(.orange)
+                }
+                Text("Locking starts the screen saver about 25 s after you leave; it's only a real lock "
+                    + "if “Require password after screen saver begins” is set to Immediately "
+                    + "(Lock Screen settings). Automatic unlock types your account password into the "
+                    + "lock screen — while it's unlocked, anyone at the Mac has your desktop.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
         }
         .formStyle(.grouped)
     }
@@ -552,8 +574,14 @@ private struct InputTab: View {
                     ExcludeAppsView(model: model)
                 }
             }
+            Section("Mouse") {
+                Toggle("Reverse scroll direction", isOn: model.boolBinding("REVERSE_SCROLL"))
+                Text("For a Mac with natural scrolling on, if remote scrolling comes out backwards.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
             Section("App switching") {
                 Toggle("Option+Tab switches apps", isOn: model.boolBinding("ALT_TAB_SWITCH"))
+                Toggle("Option+Q quits apps", isOn: model.boolBinding("ALT_Q_QUIT"))
                 Toggle("App-switcher HUD overlay", isOn: model.boolBinding("APP_SWITCHER_HUD"))
                 Toggle("Un-minimize on Cmd+Tab", isOn: model.boolBinding("UNMINIMIZE"))
             }
@@ -592,6 +620,8 @@ private struct ExcludeAppsView: View {
 
 private struct RedirectionTab: View {
     @ObservedObject var model: SettingsModel
+    /// Bumped after an install/remove so the driver status is re-read.
+    @State private var micRefresh = 0
     var body: some View {
         Form {
             Text("The connecting client must also opt in to each redirection.")
@@ -614,6 +644,36 @@ private struct RedirectionTab: View {
                     + "FaceTime. The system extension must be enabled once.")
                     .font(.caption).foregroundColor(.secondary)
             }
+            Section("Microphone") {
+                let status: AppController.MicDriverStatus = {
+                    _ = micRefresh
+                    return model.controller.micDriverStatus()
+                }()
+                Toggle("Microphone redirection", isOn: model.boolBinding("ENABLE_MICROPHONE_REDIRECTION"))
+                HStack {
+                    Button(status == .updateAvailable ? "Update macrdp Microphone…"
+                               : "Install macrdp Microphone…") {
+                        model.controller.installMicDriver()
+                        micRefresh += 1
+                    }
+                    .disabled(status == .installed)
+                    if status != .notInstalled {
+                        Button("Remove…") {
+                            model.controller.removeMicDriver()
+                            micRefresh += 1
+                        }
+                    }
+                }
+                Text(status == .notInstalled ? "Driver: not installed"
+                        : status == .updateAvailable ? "Driver: installed — this macrdp bundles a newer one"
+                        : "Driver: installed")
+                    .font(.caption)
+                Text("Presents the client's microphone as “macrdp Microphone” in Zoom / FaceTime / "
+                    + "QuickTime. The driver must be installed once (admin; Core Audio restarts, "
+                    + "briefly interrupting sound). Other accounts on this Mac can listen to a live "
+                    + "stream.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
         }
         .formStyle(.grouped)
     }
@@ -623,13 +683,13 @@ private struct AdvancedTab: View {
     @ObservedObject var model: SettingsModel
     var body: some View {
         Form {
-            Section("UDP multitransport (experimental)") {
+            Section("UDP multitransport") {
                 Toggle("Offer UDP multitransport", isOn: model.boolBinding("ENABLE_UDP_MULTITRANSPORT"))
-                Toggle("Move video onto UDP (clean link only)", isOn: model.boolBinding("UDP_MIGRATE_EGFX"))
+                Toggle("Move video onto UDP (experimental, clean link only)", isOn: model.boolBinding("UDP_MIGRATE_EGFX"))
                     .disabled(!model.bool("ENABLE_UDP_MULTITRANSPORT"))
-                Text("Moving video onto the reliable UDP tunnel helps on a clean, low-latency link, "
-                    + "but under packet loss the picture can freeze until reconnect (audio stays on "
-                    + "TCP). Auto-enables H.264. LAN/Wi-Fi only.")
+                Text("Moving video onto the reliable UDP tunnel helps on a clean, low-latency link. "
+                    + "Under packet loss the picture can stall for a few seconds until it moves back "
+                    + "to TCP. Auto-enables H.264. High-latency links never get UDP.")
                     .font(.caption).foregroundColor(.secondary)
             }
             Section("Diagnostics") {

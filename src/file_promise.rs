@@ -35,7 +35,6 @@ use ironrdp_cliprdr::pdu::{FileContentsFlags, FileContentsRequest, FileContentsR
 use ironrdp_server::ServerEvent;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_app_kit::NSPasteboard;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -72,7 +71,7 @@ pub const EAGER_PARALLEL_CHUNKS: usize = 8;
 /// Serial (1) — the lazy path runs *while the user is interacting*
 /// (paste-time). Combined with `LAZY_CHUNK_SIZE = 128 KiB`, peak
 /// inbound in-flight is 128 KiB. The `dispatch_audio` carve-out in
-/// vendor/ironrdp-server fixed the per-connection `Mutex<Self>`
+/// ironrdp-server fixed the per-connection `Mutex<Self>`
 /// contention; at 2-in-flight 256 KiB we found TCP send-buffer
 /// pressure introduces audio/video stalls. Serial fetch keeps inbound
 /// pressure low enough that the shared writer / kernel buffer isn't
@@ -408,8 +407,8 @@ fn publish_to_pasteboard(paths: &[PathBuf], self_change_count: &SelfChangeCount)
     // guard so no other writer can bump it between our write and the capture.
     let _pb_guard = crate::clipboard::pasteboard_guard();
     let new_change_count = unsafe {
-        let pb = NSPasteboard::generalPasteboard();
-        pb.clearContents();
+        let pb = crate::clipboard::pasteboard();
+        crate::clipboard::begin_local_write(&pb);
         pb.writeObjects(&array);
         pb.changeCount() as i64
     };

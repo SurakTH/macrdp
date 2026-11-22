@@ -9,17 +9,17 @@
 )]
 
 mod aac;
+mod audin;
 mod audio;
 mod auth;
 mod auth_guard;
+mod auth_status;
 mod avc444;
-#[cfg(any(target_os = "macos", test))]
-mod bitmap_damage;
 mod camera;
 mod capture;
-#[cfg(any(target_os = "macos", test))]
-mod capture_fairness;
 mod clipboard;
+mod clipboard_rich;
+mod conn_hooks;
 #[cfg(test)]
 mod conn_test;
 mod cursor;
@@ -27,34 +27,37 @@ mod cursor;
 mod file_promise;
 #[cfg(target_os = "macos")]
 mod file_promise_lazy;
-#[cfg(any(target_os = "macos", test))]
-mod frame_flush;
 #[cfg(target_os = "macos")]
 mod h264;
+mod h264_sps;
 mod health;
 mod input;
 mod keyboard_layout;
+mod lock_activity;
 mod logging;
 mod multitransport;
 mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", unix))]
 mod scard_ipc;
 mod shield;
-mod startup_password;
 mod stats;
 mod switcher_hud;
 mod usb_redirect;
 mod videotoolbox;
 mod virtual_display;
 
-/// Wake capture even when ScreenCaptureKit is idle. Notifications coalesce.
-#[cfg(target_os = "macos")]
-pub(crate) static RESYNC_VIDEO: tokio::sync::Notify = tokio::sync::Notify::const_new();
-
-/// Manual A/V resync hotkey also requests an independent audio stream rebuild.
+/// Manual A/V resync hotkey (Ctrl+Alt+Shift+R — handled in `input.rs`). Set true
+/// by the input handler on the chord; consumed independently by the video path
+/// (`capture.rs` → a bare core reactivation + forced IDR, reusing the
+/// blank-recovery machinery) and the audio path (`audio.rs` → an SCK stream
+/// rebuild). Two flags so each consumer swaps its own back to false. Lets a user
+/// recover a session gone stale after a long idle — a blanked mstsc surface
+/// and/or drifted audio — on demand, without disconnecting.
+pub(crate) static RESYNC_VIDEO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 pub(crate) static RESYNC_AUDIO: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -76,7 +79,7 @@ use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
@@ -94,15 +97,13 @@ const FALLBACK_HEIGHT: u16 = 720;
 /// NSCodec. The encoder is a Phase-1 stub right now — see CLAUDE.md.
 fn bitmap_codecs() -> BitmapCodecs {
     BitmapCodecs(vec![
-        // NSCodec — for Microsoft Remote Desktop on macOS. CLL=1 is the
-        // highest-fidelity value allowed by MS-RDPNSC; chroma subsampling and
-        // dynamic fidelity stay disabled so text edges remain clean.
+        // NSCodec — for Microsoft Remote Desktop on macOS.
         Codec {
             id: 0,
             property: CodecProperty::NsCodec(NsCodec {
                 is_dynamic_fidelity_allowed: false,
-                is_subsampling_allowed: false,
-                color_loss_level: 1,
+                is_subsampling_allowed: false, // Phase 3 will flip this on.
+                color_loss_level: 3,
             }),
         },
         // RemoteFx — what mstsc actually uses.
@@ -124,27 +125,6 @@ fn bitmap_codecs() -> BitmapCodecs {
             property: CodecProperty::QoiZ,
         },
     ])
-}
-
-#[cfg(test)]
-mod bitmap_codec_tests {
-    use super::*;
-
-    #[test]
-    fn nscodec_preset_requests_maximum_fidelity() {
-        let ns = bitmap_codecs()
-            .0
-            .into_iter()
-            .find_map(|codec| match codec.property {
-                CodecProperty::NsCodec(ns) => Some(ns),
-                _ => None,
-            })
-            .expect("NSCodec must remain advertised");
-
-        assert!(!ns.is_dynamic_fidelity_allowed);
-        assert!(!ns.is_subsampling_allowed);
-        assert_eq!(ns.color_loss_level, 1);
-    }
 }
 
 /// Bounds of the user's primary display in macOS's global point-coord
@@ -274,6 +254,14 @@ struct Args {
     #[arg(long)]
     keychain: bool,
 
+    /// Read the password from this file instead of prompting (one trailing
+    /// newline is stripped). Keeps the password out of `ps` and shell history
+    /// for headless / launchd runs where the Keychain is not an option. The
+    /// file must belong to the user running macrdp and give no access to
+    /// group or others (mode 0600 or 0400); otherwise startup fails.
+    #[arg(long, conflicts_with_all = ["password", "keychain"])]
+    password_file: Option<PathBuf>,
+
     /// Directory holding cert.pem / key.pem. Generated on first run and
     /// reused thereafter so clients see a stable fingerprint across restarts.
     /// Defaults to ~/Library/Application Support/macrdp.
@@ -338,6 +326,23 @@ struct Args {
     /// future macOS releases.
     #[arg(long)]
     virtual_display: bool,
+
+    /// Make the virtual display a Retina-style HiDPI display: the session
+    /// size (--width/--height, or the size the client requests) is its pixel
+    /// count, and macOS lays the UI out at HALF that in points — so a client
+    /// asking for 3456×2168 gets a sharp desktop that looks like 1728×1084,
+    /// instead of tiny UI. Set --width/--height (VD_WIDTH/VD_HEIGHT) to twice
+    /// the size you want the UI to look. Costs ~4× the pixels of the same
+    /// apparent size without it (heavier encode, decode and bandwidth).
+    /// Only valid with --virtual-display. macOS-only.
+    /// `auto` keeps the display HiDPI and picks the UI scale per connection
+    /// from the desktop scale factor the client announces: a 2× client
+    /// (Windows App with "Optimize for Retina displays" sends 200) gets the UI
+    /// at half its size, any other client at its own size, captured down from
+    /// the 2× backing — normal-size UI either way. Config: VD_HIDPI=1 or
+    /// VD_HIDPI=auto.
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "on")]
+    virtual_display_hidpi: Option<VdHidpiArg>,
 
     /// Promote the virtual display to be the system's primary display
     /// for the duration of the run — the one with the menu bar, where
@@ -404,11 +409,55 @@ struct Args {
     #[arg(long)]
     restore_windows_on_disconnect: bool,
 
+    /// Lock the local macOS session when the last RDP client genuinely
+    /// disconnects (opt-in; only meaningful with --detach-primary/
+    /// --capture-primary/--shield-primary). Fires via `open
+    /// ScreenSaverEngine.app` after the existing disconnect-confirmation
+    /// grace PLUS an additional tunable safety buffer
+    /// (MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
+    /// LOCK_ON_DISCONNECT_DELAY_MS, default ~25s total) to reduce — not
+    /// eliminate — the chance of locking mid a blank-recovery self-heal
+    /// reconnect. Only an actual password-required lock if the account has
+    /// "require password" set to Immediately; otherwise this just starts
+    /// the screensaver. Heuristic, not a guarantee; see
+    /// docs/known-quirks.md. Never fires on server shutdown/kill, only on a
+    /// genuine watcher-observed last-client-disconnect. macOS-only.
+    #[arg(long)]
+    lock_on_disconnect: bool,
+
+    /// EXPERIMENTAL, opt-in. Type the account password into the lock screen
+    /// when an RDP client connects while the local session is locked — any
+    /// lock, any cause (a --lock-on-disconnect lock, one set manually, or
+    /// macOS's own idle policy), not just one this project set. Off unless
+    /// passed (config AUTO_UNLOCK=1); a no-op when the screen isn't locked,
+    /// and skipped entirely under --skip-auth (where the password was never
+    /// PAM-validated). Off by default because the effect lands on the
+    /// PHYSICAL machine: once it fires, anyone standing at that Mac has a
+    /// live desktop, and it undoes a lock it did not set — someone may have
+    /// locked it deliberately. Reuses the same credential PAM already
+    /// validated at startup, so no fresh keychain read. Verified on one
+    /// machine, one macOS version, one keyboard layout; rests on typing
+    /// real keycode events into a secure field, a private lock-state check,
+    /// and a behavior (synthetic input reaching the lock screen) Apple could
+    /// change. See docs/known-quirks.md. macOS-only.
+    #[arg(long)]
+    auto_unlock: bool,
+
     /// Expose a loopback (127.0.0.1) read-only live-telemetry endpoint for the
     /// menu-bar controller's Status pane (bitrate/RTT/fps). Default off. No disk
     /// writes. macOS-only concern but cross-platform code.
     #[arg(long)]
     stats_endpoint: bool,
+
+    /// Report network characteristics to the client (MS-RDPBCGR 2.2.14
+    /// auto-detect): RTT probes and bandwidth measurements on the MCS message
+    /// channel, and Network Characteristics Result PDUs the client can show, for
+    /// example in the Windows connection-quality dialog. IronRDP's own
+    /// auto-detect does the work; macrdp ticks it once a second. Only for
+    /// clients that open the message channel. Opt-in (default off). Config:
+    /// NETWORK_AUTODETECT=1.
+    #[arg(long)]
+    network_autodetect: bool,
 
     /// Serve the display as H.264 video over the EGFX virtual channel
     /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
@@ -490,13 +539,29 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     h264_frames_in_flight: u32,
 
-    /// Number of trailing pictures before and after the H.264 quiet refresh.
-    /// Send this many pictures at frame cadence immediately after a change.
-    /// After at least 100 ms without another capture, refresh the latest
-    /// surface with an IDR and repeat the burst for decoder recovery. This
-    /// drains presentation buffering without delaying sparse typing by 100 ms.
-    /// Default 4. Set 0 to disable the refresh burst; deferred real captures
-    /// are still retried so backpressure cannot discard the final update.
+    /// Cap how far the server may run ahead of the client's frame
+    /// acknowledgements on the TCP path (only with --enable-h264): once more
+    /// than N shipped frames are unacknowledged, captures are dropped (with a
+    /// 10 fps trickle so the client keeps presenting) until it catches up.
+    /// Without it, a client that decodes at roughly the rate we send builds a
+    /// backlog on every burst that can take seconds to drain — felt as
+    /// hundreds of ms of input lag. 0 (default) = off, the TCP path relies on
+    /// socket backpressure alone. Try 3–4. The --flush-frames re-sends are
+    /// exempt, so the last change before a pause still shows. The EGFX-over-UDP
+    /// path has its own always-on version (MACRDP_UDP_EGFX_MAX_FRAME_LAG).
+    /// Config: H264_MAX_UNACKED_FRAMES.
+    #[arg(long, default_value_t = 0)]
+    h264_max_unacked_frames: u32,
+
+    /// Number of trailing "flush" frames re-sent after the last on-screen change
+    /// (only with --enable-h264). ScreenCaptureKit stops delivering frames on a
+    /// static screen, so the last change before a pause (e.g. the final
+    /// keystroke) would otherwise sit in mstsc's ~2-frame AVC420 presentation
+    /// buffer until the next change or periodic keyframe — the "typing follows
+    /// the keyframe" lag. After each change we re-submit the last frame this many
+    /// times as cheap skip-P-frames to drain that buffer so the change appears
+    /// promptly. mstsc needs ≥2; default 4 gives margin. Raise if a slight
+    /// trailing lag remains; set 0 to disable the flush burst entirely.
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
 
@@ -505,6 +570,16 @@ struct Args {
     /// Does not change capture FPS, burst counts, or the 100 ms quiet IDR.
     #[arg(long, value_parser = clap::value_parser!(u64).range(8..=1000))]
     flush_interval_ms: Option<u64>,
+
+    /// EXPERIMENTAL (only with --enable-h264): have ScreenCaptureKit deliver
+    /// full-range BT.709 NV12 and hand those buffers straight to VideoToolbox,
+    /// instead of BGRA that macrdp converts to NV12 on the CPU every frame.
+    /// Measured at a 3456x2168 virtual display: 14.3 → 3.3 ms of CPU per
+    /// encoded frame. Frames that still go out as legacy bitmaps (before H.264
+    /// is up, or a client without AVC) are converted back to BGRA on the CPU.
+    /// Config: CAPTURE_NV12.
+    #[arg(long)]
+    capture_nv12: bool,
 
     /// Disable lazy Windows→Mac file paste. Lazy paste is ON by default:
     /// temp files are pre-sized but empty when the Windows copy lands,
@@ -518,6 +593,19 @@ struct Args {
     #[cfg(target_os = "macos")]
     #[arg(long = "no-lazy-paste", action = clap::ArgAction::SetTrue)]
     no_lazy_paste: bool,
+
+    /// Copy plain text and images only, without rich text. By default macrdp
+    /// also carries formatted text across the clipboard in both directions —
+    /// the Windows `HTML Format` / `Rich Text Format` clipboard formats mapped
+    /// to the Mac's `public.html` / `public.rtf` — so formatting survives a
+    /// copy from Word, Outlook or a browser into Mail, Notes or Pages, and back.
+    /// A Windows→Mac copy then fetches the formatted version as well as the
+    /// plain text, which is extra traffic on every copy; pass this if that
+    /// matters on a thin link. Images embedded in rich text generally don't
+    /// survive either way (Word's HTML points at local temp files). Config
+    /// key: RICH_CLIPBOARD=0.
+    #[arg(long = "no-rich-clipboard", action = clap::ArgAction::SetTrue)]
+    no_rich_clipboard: bool,
 
     /// Deprecated/no-op: lazy paste is now the default. Accepted so
     /// existing command lines that pass --lazy-paste keep working; use
@@ -593,18 +681,46 @@ struct Args {
     #[arg(long)]
     enable_usb_redirection: bool,
 
-    /// EXPERIMENTAL, opt-in (default OFF). Camera redirection (MS-RDPECAM) —
-    /// **Phase 0 protocol gate only**. Advertises the `RDCamera_Device_Enumerator`
-    /// DVC and logs the client's camera announcement (`DEVICE_ADDED_NOTIFICATION`)
-    /// so we can confirm a modern mstsc/Win11 will hand macrdp a redirected webcam
-    /// over MS-RDPECAM. It does NOT present a camera yet (no per-device channel, no
-    /// stream, no macOS code). The client must opt in too (mstsc: Local Resources ->
-    /// More -> "Video capture devices"). Cross-platform (pure protocol). See
-    /// docs/rdp-camera-redirection-feasibility.md.
+    /// Opt-in (default OFF). Camera redirection (MS-RDPECAM) — the client redirects
+    /// its WEBCAM and macrdp presents it as a REAL macOS camera: "macrdp Camera"
+    /// becomes selectable in Photo Booth / Zoom / FaceTime / Teams, showing the
+    /// client's live video. H.264 samples over the RDCamera DVC -> VideoToolbox
+    /// decode -> CoreMediaIO sink (zero-copy) -> a CoreMediaIO Camera system
+    /// extension. Live-verified on mstsc at 1080p/~30 fps. The client must opt in
+    /// too (mstsc: Local Resources -> More -> "Video capture devices", enabled
+    /// BEFORE connecting). REQUIRES the camera system extension to be installed +
+    /// activated once (macrdpController.app -> "Enable macrdp Camera...", needs the
+    /// signed + notarized build) — without it macrdp still negotiates and decodes,
+    /// it just has no camera to feed. Debug: MACRDP_CAMERA_DUMP=1 writes the raw
+    /// H.264 + the first decoded frames as PNG to $TMPDIR. macOS-only. See
+    /// docs/camera-extension-setup.md.
     #[arg(long)]
     enable_camera_redirection: bool,
 
-    /// EXPERIMENTAL, opt-in (default OFF). Offer RDP UDP multitransport
+    /// EXPERIMENTAL, opt-in (default OFF). Microphone / audio-input redirection
+    /// (MS-RDPEAI, the `AUDIO_INPUT` DVC) — the client redirects its MICROPHONE (a
+    /// standalone mic, or a webcam's built-in one) and macrdp presents it as a REAL
+    /// macOS input device: "macrdp Microphone" appears in System Settings -> Sound
+    /// -> Input and in QuickTime / Zoom / Teams, carrying the client's live audio.
+    /// Received PCM is fed to a CoreAudio AudioServerPlugIn over a shared-memory
+    /// ring; an idle device reads as digital silence and the feed is latency-bounded
+    /// at ~100 ms. Live-verified end-to-end on a real Win11 client. The client must
+    /// opt in too (mstsc: Remote audio -> Settings -> "Record from this computer";
+    /// FreeRDP: /microphone). REQUIRES the "macrdp Microphone" plug-in to be
+    /// installed once — the menu-bar controller's Settings -> Redirection ->
+    /// Microphone, or macrdp.app/Contents/Resources/install-audio-plugin.sh (a
+    /// file copy into the system HAL plug-ins dir + a coreaudiod restart, one admin
+    /// prompt, no entitlement); without it macrdp still negotiates and receives the
+    /// audio, it just has no device to feed. Only 16-bit PCM at 44.1 kHz is
+    /// accepted (a client that can't offer it gets no mic). Other local accounts can read a live
+    /// stream (docs/macos-gotchas.md). Debug: MACRDP_MIC_DUMP=1 (config MIC_DUMP=1)
+    /// writes the received PCM to a WAV under $TMPDIR INSTEAD of feeding the device.
+    /// macOS-only (the device half; the protocol half is cross-platform). See
+    /// docs/features.md.
+    #[arg(long)]
+    enable_microphone_redirection: bool,
+
+    /// Opt-in (default OFF). Offer RDP UDP multitransport
     /// (MS-RDPEMT over reliable RDPEUDP) to clients that advertise it, and bind a
     /// UDP listener on the same address/port as TCP. On its own, EGFX stays on TCP
     /// (the proven safe spike) — pass --udp-migrate-egfx to actually move the
@@ -617,26 +733,34 @@ struct Args {
     /// EXPERIMENTAL, opt-in (default OFF; requires --enable-udp-multitransport).
     /// Migrate the EGFX (H.264) channel onto the reliable UDP tunnel via MS-RDPEDYC
     /// Soft-Sync (verified rendering on mstsc). Without it, EGFX stays on TCP even
-    /// when multitransport is offered. **Caveat — clean-link feature only:** the
-    /// reliable tunnel is an ordered stream, so under packet loss it head-of-line-
-    /// blocks like TCP and, once the client abandons the tunnel, EGFX freezes with
-    /// no recovery until reconnect (audio survives on TCP). Use only on a low-loss
-    /// link. (Promoted from the MACRDP_UDP_MIGRATE_EGFX env var, which still works
-    /// as a fallback.) macOS-only build; see docs/rdp-udp-multitransport-feasibility.md.
+    /// when multitransport is offered. **Caveat — clean-link feature:** the reliable
+    /// tunnel is an ordered stream, so under packet loss it head-of-line-blocks like
+    /// TCP. A watchdog detects the wedge (~3 s of silent EGFX acks while shipping)
+    /// and moves EGFX back onto TCP for the rest of the session, so video recovers
+    /// instead of freezing until reconnect (audio stays on TCP throughout). Best on
+    /// a low-loss link. (Promoted from the MACRDP_UDP_MIGRATE_EGFX env var, which
+    /// still works as a fallback.) macOS-only build; see
+    /// docs/rdp-udp-multitransport-feasibility.md.
     #[arg(long)]
     udp_migrate_egfx: bool,
 
-    /// EXPERIMENTAL, opt-in (default OFF). Congestion-responsive H.264 bitrate for
-    /// EGFX-over-UDP: when the reliable UDP tunnel shows packet loss (retransmits),
-    /// lower the VideoToolbox bitrate toward a floor (AIMD multiplicative-decrease),
-    /// and climb back toward the --bitrate ceiling when the link clears — so video
-    /// degrades to "choppy but alive" under loss instead of wedging. Only acts while
-    /// EGFX is on a UDP tunnel (no-op on TCP). Tunables: MACRDP_UDP_ADAPTIVE_FLOOR_BPS,
-    /// _INCREASE_BPS, _DECREASE, _INTERVAL_MS. macOS-only build.
+    /// Opt-in (default OFF). Congestion-responsive H.264 bitrate, on BOTH the TCP
+    /// path and the UDP tunnel (only with --enable-h264): an AIMD controller reads
+    /// the standing queue delay (each frame's ship→ack round trip minus the
+    /// windowed-minimum RTT, EWMA-smoothed) plus reliable-tunnel retransmits, and
+    /// moves the VideoToolbox bitrate within [floor, --bitrate] — so --bitrate is a
+    /// ceiling. A long but clean link (VPN/ZeroTier) keeps full quality; a thin one
+    /// degrades gracefully instead of freezing. Under sustained congestion it also
+    /// stretches the periodic keyframe and, once the bitrate is at its floor, caps
+    /// the frame rate (default 10 fps, never zero). A link whose measured RTT at
+    /// connect is >= MACRDP_ADAPTIVE_SEED_RTT_MS (50) starts at ceiling/3. Tunables:
+    /// MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,DECREASE,INTERVAL_MS,RETX_TOLERANCE},
+    /// MACRDP_ADAPTIVE_{QUEUE_HIGH_MS,EWMA_ALPHA,FLOOR_FPS}. macOS-only build; see
+    /// docs/cli.md.
     #[arg(long)]
     adaptive_bitrate: bool,
 
-    /// EXPERIMENTAL, opt-in (default OFF; implies --enable-udp-multitransport,
+    /// Opt-in (default OFF; implies --enable-udp-multitransport,
     /// requires --enable-aac and --enable-h264). Stream RDPSND audio over a LOSSY
     /// UDP/DTLS tunnel with 1+1 redundancy instead of TCP — the loss-resilient audio
     /// path. The MS-RDPEA format handshake runs on a reliable DVC over TCP; AAC Wave2
@@ -719,6 +843,20 @@ struct Args {
     #[arg(long = "alt-backtick-switch")]
     alt_backtick_switch: bool,
 
+    /// Also accept Option+Space (Alt+Space from the client) as the Spotlight
+    /// trigger, in addition to Cmd+Space. Off by default. For macOS clients,
+    /// whose own Spotlight takes Cmd+Space before the RDP client sees it. When
+    /// off, Option+Space types a non-breaking space. macOS-only.
+    #[arg(long = "alt-space-spotlight")]
+    alt_space_spotlight: bool,
+
+    /// Deliver Option+Q (Alt+Q from the client) as Cmd+Q, so a Windows client
+    /// can quit the focused Mac app without the Windows key. Off by default
+    /// (then Option+Q reaches remote apps as a normal key). Plain Option only:
+    /// Option+Shift+Q is NOT turned into Cmd+Shift+Q (log out). macOS-only.
+    #[arg(long = "alt-q-quit")]
+    alt_q_quit: bool,
+
     /// Show a visual app-switcher overlay (icon row) on the remote during Cmd+Tab
     /// / Option+Tab, like macOS's native switcher. Off by default. macrdp spawns a
     /// small helper process that draws a real on-screen panel; ScreenCaptureKit
@@ -745,6 +883,14 @@ struct Args {
     /// Cmd+C, the app's native macOS copy). No effect without --map-ctrl-to-cmd.
     #[arg(long = "no-remap-apps", value_delimiter = ',')]
     no_remap_apps: Vec<String>,
+
+    /// Reverse the mouse-wheel direction (vertical and horizontal) for the
+    /// remote session. For a Mac with natural scrolling on: macOS applies it to
+    /// macrdp's scroll events too, and a local tool that un-reverses the
+    /// physical wheel (LinearMouse etc.) doesn't see them. Off by default.
+    /// macOS-only.
+    #[arg(long = "reverse-scroll")]
+    reverse_scroll: bool,
 
     /// Keyboard layout to interpret the client's keystrokes as, for non-US
     /// clients. By default the layout is **auto-detected** from the client's
@@ -925,6 +1071,139 @@ fn spawn_hud_helper() -> Option<std::process::Child> {
     }
 }
 
+/// Largest password file `--password-file` accepts.
+const MAX_PASSWORD_FILE_BYTES: usize = 4096;
+
+/// Read the password from `--password-file`. The file must belong to the
+/// user that runs macrdp and must give no access to group or others (mode
+/// 0600 or 0400), as ssh requires for private keys, and on macOS must have no
+/// access control list; otherwise it is refused.
+/// One trailing `\n` (or `\r\n`) is stripped; an empty password is an error.
+/// The bytes are read into one buffer of a fixed size that is never
+/// reallocated, so no unzeroized copy of the password is left on the heap.
+fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    // O_NONBLOCK: opening a FIFO without a writer would otherwise block
+    // startup with no log line; it is refused below as not a regular file.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening password file {}", path.display()))?;
+    // Check the opened file, not the path, so a swap between check and read
+    // cannot pass a different file.
+    let meta = file
+        .metadata()
+        .with_context(|| format!("reading metadata of password file {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(anyhow!(
+            "password file {} is not a regular file",
+            path.display()
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    check_password_file_access(meta.mode(), meta.uid(), euid)
+        .with_context(|| format!("password file {}", path.display()))?;
+    // A macOS ACL can grant access that the mode bits do not show, for
+    // example one inherited from the parent folder.
+    #[cfg(target_os = "macos")]
+    if has_extended_acl(&file).with_context(|| format!("password file {}", path.display()))? {
+        return Err(anyhow!(
+            "password file {} has an access control list; remove it with `chmod -N {}`",
+            path.display(),
+            path.display()
+        ));
+    }
+
+    let mut buf = Zeroizing::new(vec![0u8; MAX_PASSWORD_FILE_BYTES + 1]);
+    let mut len = 0;
+    loop {
+        let n = file
+            .read(&mut buf[len..])
+            .with_context(|| format!("reading password file {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+        if len == buf.len() {
+            return Err(anyhow!(
+                "password file {} is larger than {MAX_PASSWORD_FILE_BYTES} bytes",
+                path.display()
+            ));
+        }
+    }
+    buf.truncate(len); // keeps the allocation
+    let bytes = std::mem::take(&mut *buf);
+    let mut s = match String::from_utf8(bytes) {
+        Ok(s) => Zeroizing::new(s),
+        Err(e) => {
+            drop(Zeroizing::new(e.into_bytes()));
+            return Err(anyhow!(
+                "password file {} is not valid UTF-8",
+                path.display()
+            ));
+        }
+    };
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    if s.is_empty() {
+        return Err(anyhow!("password file {} is empty", path.display()));
+    }
+    Ok(s)
+}
+
+/// Whether the open file has an extended access control list (any entry).
+#[cfg(target_os = "macos")]
+fn has_extended_acl(file: &fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // <sys/acl.h>; the libc crate does not declare these.
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: the fd stays open while `file` is borrowed; a non-null result is
+    // freed once below.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let err = std::io::Error::last_os_error();
+        // ENOENT: no ACL. ENOTSUP: the file system has no ACLs.
+        return match err.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTSUP) => Ok(false),
+            _ => Err(err).context("reading its access control list"),
+        };
+    }
+    // SAFETY: `acl` came from acl_get_fd_np and is not used after this.
+    unsafe { acl_free(acl) };
+    Ok(true)
+}
+
+/// The access rule for `--password-file`: owned by `euid` and no permission
+/// bits for group or others.
+fn check_password_file_access(mode: u32, owner: u32, euid: u32) -> Result<()> {
+    if owner != euid {
+        return Err(anyhow!(
+            "is owned by uid {owner}, not by the user running macrdp (uid {euid})"
+        ));
+    }
+    if mode & 0o077 != 0 {
+        return Err(anyhow!(
+            "has mode {:04o}; group and others must have no access (chmod 600)",
+            mode & 0o7777
+        ));
+    }
+    Ok(())
+}
+
 /// Shell out to `security find-generic-password -s macrdp -a <user> -w`,
 /// which prints the password on stdout. The Keychain entry has to be
 /// created out-of-band; this never prompts the user interactively.
@@ -1054,6 +1333,15 @@ struct TlsMaterial {
     cert_der: Vec<u8>,
     /// Private-key DER, same purpose as `cert_der`.
     key_der: Vec<u8>,
+}
+
+/// `--virtual-display-hidpi` values (the bare flag means `on`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum VdHidpiArg {
+    /// Always HiDPI.
+    On,
+    /// HiDPI only for a client that announces a 2× desktop scale factor.
+    Auto,
 }
 
 /// Expiry classification for an operator-supplied cert. Pure (testable) split
@@ -1208,6 +1496,500 @@ fn restore_gather_windows(_display_id: u32) -> usize {
     0
 }
 
+/// Extra safety buffer on top of the overlay watcher's `REACTIVATION_GRACE`
+/// before `--lock-on-disconnect` actually locks the screen. Default chosen to
+/// clear the documented blank-recovery worst case (~12-15s drop-then-ARC-
+/// reconnect cycle, see docs/known-quirks.md) with real margin — a false-
+/// positive lock mid a legitimate self-heal is a worse outcome than staying
+/// unlocked a bit longer than strictly necessary after a genuine disconnect.
+/// Tunable via MACRDP_LOCK_ON_DISCONNECT_DELAY_MS / config
+/// LOCK_ON_DISCONNECT_DELAY_MS.
+const LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS: u64 = 22_500; // + 2.5s grace ≈ 25s total
+
+fn parse_lock_on_disconnect_delay_ms(env_override: Option<&str>) -> u64 {
+    env_override
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS)
+}
+
+fn lock_on_disconnect_delay_ms() -> u64 {
+    parse_lock_on_disconnect_delay_ms(
+        std::env::var("MACRDP_LOCK_ON_DISCONNECT_DELAY_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Lock the local macOS session by launching `ScreenSaverEngine.app`
+/// (no special TCC/entitlement needed beyond what `open` itself needs).
+/// **Note the older `CGSession -suspend` menu-extra trick documented widely
+/// online does NOT work here** — as of macOS 26 the `Menu Extras/User.menu`
+/// bundle that historically shipped `CGSession` no longer exists (confirmed
+/// live: only `AirPort.menu`/`VPN.menu`/etc. remain under `Menu Extras/`).
+/// `open -a ScreenSaverEngine` engages the screensaver, which macOS then
+/// treats as an actual password-required lock **only if the account has
+/// "require password" set to Immediately** (`sysadminctl -screenLock
+/// status`) — macrdp does not check or change that setting (changing
+/// security settings is out of scope), so this is a best-effort action: on
+/// an account configured with a delayed password requirement, this merely
+/// starts the screensaver rather than truly locking. Returns whether the
+/// launch command itself succeeded (best-effort — we can't independently
+/// confirm the screen actually locked, only that `open` didn't fail).
+#[cfg(target_os = "macos")]
+fn lock_session() -> bool {
+    const SCREEN_SAVER_ENGINE: &str = "/System/Library/CoreServices/ScreenSaverEngine.app";
+    if !std::path::Path::new(SCREEN_SAVER_ENGINE).exists() {
+        tracing::warn!(
+            path = SCREEN_SAVER_ENGINE,
+            "lock-on-disconnect: ScreenSaverEngine not found — cannot lock the screen"
+        );
+        return false;
+    }
+    match std::process::Command::new("/usr/bin/open")
+        .arg(SCREEN_SAVER_ENGINE)
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            tracing::warn!(
+                ?status,
+                "lock-on-disconnect: open ScreenSaverEngine.app exited non-zero"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("lock-on-disconnect: failed to launch ScreenSaverEngine.app: {e}");
+            false
+        }
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn lock_session() -> bool {
+    false
+}
+
+/// Best-effort check of whether this account's "require password after
+/// sleep or screen saver begins" delay is set to Immediately —
+/// `--lock-on-disconnect`'s `open ScreenSaverEngine.app` is only a true,
+/// password-required lock under that setting; otherwise it just starts the
+/// screen saver, so the flag's name would silently overpromise. Returns
+/// `None` when the check itself couldn't be run (parse the output loosely
+/// rather than fail the whole startup over a diagnostic). macrdp
+/// deliberately does not check or change this setting on its own — see
+/// docs/known-quirks.md.
+#[cfg(target_os = "macos")]
+fn screen_lock_delay_is_immediate() -> Option<bool> {
+    let output = std::process::Command::new("/usr/sbin/sysadminctl")
+        .args(["-screenLock", "status"])
+        .output()
+        .ok()?;
+    // sysadminctl logs its answer to stderr via NSLog, e.g. "screenLock
+    // delay is immediate" or "screenLock delay is N seconds" — match
+    // loosely rather than parse a brittle exact format.
+    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase()
+        + &String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if !output.status.success() || text.trim().is_empty() {
+        return None;
+    }
+    Some(text.contains("immediate"))
+}
+#[cfg(not(target_os = "macos"))]
+fn screen_lock_delay_is_immediate() -> Option<bool> {
+    None
+}
+
+/// Bumped on every disconnect edge that arms a `--lock-on-disconnect` lock, so
+/// a pending lock from an earlier disconnect stands down in favour of the
+/// latest one (which is timed from its own edge).
+static LOCK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total Return-keypress SUBMISSIONS sent while trying to auto-unlock the
+/// CURRENT lock cycle — reset to 0 the moment the screen is observed
+/// unlocked (a fresh lock cycle starts with a fresh budget) and on a
+/// successful unlock. This tracks actual submissions, NOT calls to
+/// [`attempt_auto_unlock`]: a single call's internal Return-retry loop
+/// draws from this same shared pool as every other call for this lock and
+/// stops the instant the pool is empty, rather than each call getting its
+/// own private allowance of retries. That distinction is load-bearing — see
+/// [`AUTO_UNLOCK_MAX_SUBMISSIONS`].
+static AUTO_UNLOCK_SUBMISSIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Whether the "gave up" alert has already fired for the current lock cycle
+/// (reset alongside [`AUTO_UNLOCK_SUBMISSIONS`]) — so a client that keeps
+/// reconnecting after the budget is spent gets one loud alert, not one per
+/// reconnect.
+static AUTO_UNLOCK_GAVE_UP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Every Return pressed while the correct password sits in a secure field is
+/// potentially scored by macOS's PAM/OpenDirectory throttle as a real
+/// authentication attempt — indistinguishable, from the outside, from "the
+/// field wasn't focused yet and ignored it" (both leave the screen locked).
+/// Capped at 2: a failure here is far more likely a wake/timing mechanical
+/// issue than a wrong password (the password is the same one PAM already
+/// validated at startup and every connecting RDP client has proven
+/// knowledge of via CredSSP), so one retry is worth allowing — but macOS's
+/// PAM throttle gives only 3 free attempts before an escalating delay, so 2
+/// stays inside that margin rather than risking real lockout escalation
+/// from a stuck bug. **This must cap actual submissions, not calls** — an
+/// earlier version capped calls to [`attempt_auto_unlock`] while each call
+/// internally retried Return up to 3 times, so two calls could submit up to
+/// 6 times against a comment promising fewer than 3.
+const AUTO_UNLOCK_MAX_SUBMISSIONS: u32 = 2;
+// Compile-time guarantee that the cap above never regresses past macOS's
+// 3-free-attempts PAM/OpenDirectory throttle margin.
+const _: () = assert!(AUTO_UNLOCK_MAX_SUBMISSIONS < 3);
+
+/// Try to reserve one submission from a budget of `max`, tracked by
+/// `counter`. Returns `true` if the caller may proceed (and the reservation
+/// is already recorded), `false` if `max` submissions are already spent.
+/// Pure and independent of which atomic is passed in, so it's unit-testable
+/// without touching the real shared [`AUTO_UNLOCK_SUBMISSIONS`] counter.
+fn try_reserve_submission(counter: &std::sync::atomic::AtomicU32, max: u32) -> bool {
+    counter
+        .try_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |n| (n < max).then_some(n + 1),
+        )
+        .is_ok()
+}
+
+/// Outcome of one [`attempt_auto_unlock`] call.
+enum AutoUnlockOutcome {
+    /// The screen wasn't locked (or, on non-macOS, locking doesn't apply
+    /// here) — nothing was attempted, and the per-lock budget/alert state
+    /// was reset since a lock cycle boundary was just observed.
+    NotLocked,
+    /// A password was submitted and the screen is now unlocked.
+    Unlocked,
+    /// Nothing was typed because doing so wasn't safe right now (the lock
+    /// state couldn't be determined, Caps Lock is on, the active layout
+    /// can't produce every character, or the layout couldn't be read) —
+    /// no submission was spent, so the next reconnect simply tries again.
+    SkippedUnsafe,
+    /// The shared submission budget for this lock is exhausted (by this
+    /// call, or an earlier one) — no further Return presses will be sent
+    /// until the lock cycle resets (screen observed unlocked) or macrdp
+    /// restarts.
+    BudgetExhausted,
+}
+
+/// Best-effort, loud alert that auto-unlock has given up for this lock —
+/// deliberately NOT just a log line, since this is exactly the moment the
+/// user needs to know they may have to unlock manually. Layered the way
+/// this project already handles unreliable notification delivery for the
+/// self-signed build (see `file_promise.rs`'s afplay + best-effort osascript
+/// combo): a system alert SOUND is the reliable channel here, a notification
+/// banner is attempted best-effort on top of it.
+#[cfg(target_os = "macos")]
+fn alert_auto_unlock_gave_up() {
+    let _ = std::process::Command::new("/usr/bin/afplay")
+        .arg("/System/Library/Sounds/Basso.aiff")
+        .status();
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "display notification \"auto-unlock stopped after repeated failures — the \
+             screen may need to be unlocked manually\" with title \"macrdp\" sound name \
+             \"Basso\"",
+        ])
+        .status();
+}
+#[cfg(not(target_os = "macos"))]
+fn alert_auto_unlock_gave_up() {}
+
+/// Attempt to unlock the local session by typing `password` into the
+/// screensaver lock screen, if (and only if) it's currently locked
+/// ([`virtual_display::screen_is_locked`]). Types it as REAL per-character
+/// keycode events (see below) followed by Return. This is the same class of
+/// mechanism Apple's own Screen Sharing/VNC and Apple Remote Desktop use to
+/// unlock a screensaver-locked Mac remotely — see docs/known-quirks.md for
+/// the SecureEventInput research behind why synthetic input is accepted here
+/// at all. Returns `true` if nothing needed to be done or the unlock
+/// succeeded; `false` if it was locked and is still locked afterward.
+///
+/// **Three failed live iterations are baked into the current shape — read
+/// before changing any of it (full write-up in docs/known-quirks.md):**
+/// 1. Leading with a synthetic Return as a "wake gesture" before typing
+///    submitted an EMPTY password (field visibly shook) and left the real
+///    password landing in a still-settling field. Never reintroduce a
+///    keypress before the password.
+/// 2. Filling the field with one bulk `set_string_from_utf16_unchecked`
+///    event then posting Return did nothing — retried Returns and longer
+///    settle delays did not help either, because…
+/// 3. …the bulk fill leaves the field INERT: the text is displayed but the
+///    field's own text-change bookkeeping never fires, so it ignores every
+///    subsequent Return — **including a REAL Return typed on the physical
+///    keyboard**, until a character was manually added and deleted. That
+///    observation is what ruled out timing entirely and forced the current
+///    approach: only genuine per-character keycode events (what a physical
+///    keyboard sends, and what the original successful manual test used)
+///    make the field accept a submit.
+#[cfg(target_os = "macos")]
+fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    // `CGEventSourceFlagsState` isn't wrapped by the `core-graphics` crate,
+    // so declare it directly — same pattern the project already uses for
+    // small FFI surfaces (see input.rs's ApplicationServices AX block).
+    // `CGEventSourceStateID`/`CGEventFlags` are both `#[repr(C)]`/bitflags
+    // types the crate itself passes across this exact boundary (see
+    // `CGEventSourceCreate`/`CGEventGetFlags`), so they're safe to reuse
+    // here as the parameter/return types.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceFlagsState(state_id: CGEventSourceStateID) -> CGEventFlags;
+    }
+
+    // macOS virtual keycode for Return (matches the constant already named
+    // in the keyboard-layout translation notes in known-quirks.md).
+    const VK_RETURN: u16 = 0x24;
+
+    match virtual_display::screen_is_locked() {
+        Some(true) => {}
+        Some(false) => {
+            // CONFIRMED not locked — a lock-cycle boundary. Clear the shared
+            // submission/alert state so the NEXT lock starts with a full
+            // budget rather than inheriting whatever a previous, unrelated
+            // lock spent.
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            AUTO_UNLOCK_SUBMISSIONS.store(0, AtomicOrdering::SeqCst);
+            AUTO_UNLOCK_GAVE_UP.store(false, AtomicOrdering::SeqCst);
+            return AutoUnlockOutcome::NotLocked;
+        }
+        None => {
+            // The lookup itself failed — genuinely unknown, NOT "not
+            // locked." Must not reset the budget here: a flaky lookup
+            // resetting it on every failure would defeat the cap
+            // AUTO_UNLOCK_MAX_SUBMISSIONS exists to enforce. Skip this
+            // attempt (safe direction); the next reconnect tries again.
+            warn!(
+                "auto-unlock: could not determine whether the screen is \
+                 locked — skipping this attempt"
+            );
+            return AutoUnlockOutcome::SkippedUnsafe;
+        }
+    }
+    // The submission budget is shared across every call for this lock (see
+    // AUTO_UNLOCK_SUBMISSIONS's docs) — if an earlier call already spent it,
+    // don't even wake/type; there is nothing left to safely submit with.
+    if AUTO_UNLOCK_SUBMISSIONS.load(std::sync::atomic::Ordering::SeqCst)
+        >= AUTO_UNLOCK_MAX_SUBMISSIONS
+    {
+        return AutoUnlockOutcome::BudgetExhausted;
+    }
+    // Caps Lock inverts letter case; `reverse_map` below always resolves
+    // assuming Caps is OFF, and whether a posted synthetic CGEvent honors or
+    // ignores the Mac's hardware Caps Lock state is unconfirmed (flagged in
+    // review; verifying it needs the live rig). Rather than gamble on which
+    // way that resolves and possibly submit an inverted-case password, skip
+    // the attempt entirely while Caps Lock is on — this check runs before
+    // anything is typed, so no submission budget is spent, and the next
+    // reconnect tries again for free once Caps Lock is off.
+    let caps_lock_on = unsafe { CGEventSourceFlagsState(CGEventSourceStateID::HIDSystemState) }
+        .contains(CGEventFlags::CGEventFlagAlphaShift);
+    if caps_lock_on {
+        warn!(
+            "auto-unlock: Caps Lock is on — skipping the attempt rather than \
+             risking an inverted-case password"
+        );
+        return AutoUnlockOutcome::SkippedUnsafe;
+    }
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+        warn!("auto-unlock: CGEventSource::new failed");
+        return AutoUnlockOutcome::SkippedUnsafe;
+    };
+    // Modifier state has to be posted on both sources — see `post_flags` below.
+    let Ok(source_hid) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        warn!("auto-unlock: CGEventSource::new (HID) failed");
+        return AutoUnlockOutcome::SkippedUnsafe;
+    };
+
+    // Resolve EVERY character to a real keystroke before typing anything —
+    // if any character can't be produced on this Mac's active layout, bail
+    // without typing rather than submit a partial/wrong password (which
+    // would shake the field and burn one of macOS's 3 free PAM attempts).
+    let Some(mut layout) = keyboard_layout::KeyboardLayout::current() else {
+        warn!("auto-unlock: could not read the Mac's active keyboard layout — skipping");
+        return AutoUnlockOutcome::SkippedUnsafe;
+    };
+    let map = layout.reverse_map();
+    let mut plan: Vec<(u16, bool, bool)> = Vec::with_capacity(password.len());
+    for ch in password.chars() {
+        let Some(&keystroke) = map.get(&ch) else {
+            // Deliberately does NOT log the character — it's password material.
+            warn!(
+                "auto-unlock: a password character has no keystroke on the Mac's \
+                 active keyboard layout — skipping the attempt rather than \
+                 submitting an incomplete password"
+            );
+            return AutoUnlockOutcome::SkippedUnsafe;
+        };
+        plan.push(keystroke);
+    }
+
+    // Wake/focus the field BEFORE typing. LIVE-TESTED 2026-08-28 (round 5):
+    // with per-character typing the field finally accepted a submit, but the
+    // password arrived one character SHORT (8 of 9) — the first keystroke is
+    // consumed waking/focusing the lock screen instead of entering text.
+    // Round 1's mistake was using RETURN as that wake (it submitted an empty
+    // password); a bare SHIFT tap cannot insert text and cannot submit, so
+    // it wakes the field harmlessly. Posted as FlagsChanged on both event
+    // sources, as live-tested; the lock screen ignores the doubled tap that
+    // `input.rs::post_flags_changed` now avoids for apps.
+    const VK_SHIFT: u16 = 0x38;
+    let post_flags = |flags: CGEventFlags| {
+        for src in [&source, &source_hid] {
+            if let Ok(ev) = CGEvent::new_keyboard_event(src.clone(), VK_SHIFT, true) {
+                ev.set_flags(flags);
+                ev.set_type(CGEventType::FlagsChanged);
+                ev.post(CGEventTapLocation::HID);
+            }
+        }
+    };
+    post_flags(CGEventFlags::CGEventFlagShift);
+    post_flags(CGEventFlags::empty());
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    // Clear anything the wake (or a previous rejected attempt) may have left
+    // behind, so a stray character can't corrupt the password we're about to
+    // type. Backspace on an empty field is a harmless no-op, which is why
+    // this is safe to do unconditionally.
+    const VK_DELETE: u16 = 0x33;
+    for _ in 0..(plan.len() + 4).min(64) {
+        if let Ok(down) = CGEvent::new_keyboard_event(source.clone(), VK_DELETE, true) {
+            down.post(CGEventTapLocation::HID);
+        }
+        if let Ok(up) = CGEvent::new_keyboard_event(source.clone(), VK_DELETE, false) {
+            up.post(CGEventTapLocation::HID);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Type it as real per-character keycode events. LIVE-TESTED 2026-08-28:
+    // a single bulk `set_string_from_utf16_unchecked` event fills the field
+    // VISIBLY but leaves it inert — even a REAL Return on the physical
+    // keyboard was then ignored, until a character was manually added and
+    // deleted. So the field's text-change bookkeeping only fires for genuine
+    // keystrokes; no amount of settle delay or Return-retry fixes a bulk
+    // fill. Modifiers are held across runs via real FlagsChanged events (not
+    // just per-event flags) so a shifted character can't come out unshifted
+    // — same reasoning as `input.rs::post_flags_changed`.
+    let mut shift_held = false;
+    let mut option_held = false;
+    let flags_for = |shift: bool, option: bool| {
+        let mut f = CGEventFlags::empty();
+        if shift {
+            f |= CGEventFlags::CGEventFlagShift;
+        }
+        if option {
+            f |= CGEventFlags::CGEventFlagAlternate;
+        }
+        f
+    };
+    for (vk, shift, option) in &plan {
+        let (shift, option) = (*shift, *option);
+        if shift != shift_held || option != option_held {
+            post_flags(flags_for(shift, option));
+            shift_held = shift;
+            option_held = option;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let flags = flags_for(shift, option);
+        if let Ok(down) = CGEvent::new_keyboard_event(source.clone(), *vk, true) {
+            down.set_flags(flags);
+            down.post(CGEventTapLocation::HID);
+        }
+        if let Ok(up) = CGEvent::new_keyboard_event(source.clone(), *vk, false) {
+            up.set_flags(flags);
+            up.post(CGEventTapLocation::HID);
+        }
+        // Inter-key gap so the field processes each keystroke in order and
+        // two identical adjacent characters aren't coalesced into one.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    if shift_held || option_held {
+        post_flags(CGEventFlags::empty());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // LIVE-TESTED 2026-08-28 (round 2): a single Return here is flaky — one
+    // connect unlocked cleanly, the next (same code, same settle) left the
+    // password visibly typed-but-not-submitted again. So the "field not
+    // ready yet" window isn't reliably cleared by any one fixed delay before
+    // Return; retry the SUBMIT keypress itself instead of chasing a bigger
+    // magic number. Deliberately does NOT retype the password (which is
+    // already sitting correctly in the field per the observed symptom) —
+    // just re-sends Return a few times with its own settle between
+    // attempts, polling `screen_is_locked()` throughout so a successful
+    // attempt (whichever one it is) resolves immediately rather than
+    // waiting out the rest of the budget. Same backoff-retry shape already
+    // used for exactly this class of "helper/field needs more time"
+    // flakiness in ShieldedPrimary::install's SHOW_BACKOFF_MS loop.
+    //
+    // Each Return below is a genuine PAM submission from the OS's point of
+    // view — the loop cannot tell "ignored" from "submitted and rejected"
+    // apart, both leave the screen locked — so every iteration reserves one
+    // unit from the SHARED per-lock budget before pressing anything, and
+    // stops the moment that budget (spent by this call or an earlier one)
+    // is empty, rather than always spending its own private allowance of
+    // retries. That is what keeps the total across every call for this lock
+    // under AUTO_UNLOCK_MAX_SUBMISSIONS.
+    //
+    // LIVE-TESTED 2026-09-25 on a Mac mini over ZeroTier: 400ms was too
+    // tight a window for `screen_is_locked()` to observe a real, successful
+    // unlock — 2 of 3 attempts spent their SECOND submission on a Return
+    // that landed after the first had already unlocked the desktop (a
+    // wasted/risky keypress into a live session), then reported a false
+    // `BudgetExhausted` because neither poll caught the `Some(false)` flip
+    // in time, even though the unlock had genuinely succeeded. Raised to
+    // 3s per the live-verified fix suggestion so a slower link/lookup has
+    // real room to register before the next Return is spent.
+    const RETURN_ATTEMPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+    const UNLOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    loop {
+        if !try_reserve_submission(&AUTO_UNLOCK_SUBMISSIONS, AUTO_UNLOCK_MAX_SUBMISSIONS) {
+            tracing::debug!(
+                "auto-unlock: submission budget exhausted — stopping without a \
+                 further Return"
+            );
+            return AutoUnlockOutcome::BudgetExhausted;
+        }
+        if let Ok(down) = CGEvent::new_keyboard_event(source.clone(), VK_RETURN, true) {
+            down.post(CGEventTapLocation::HID);
+        }
+        if let Ok(up) = CGEvent::new_keyboard_event(source.clone(), VK_RETURN, false) {
+            up.post(CGEventTapLocation::HID);
+        }
+        let deadline = std::time::Instant::now() + RETURN_ATTEMPT_BUDGET;
+        loop {
+            // Only a CONFIRMED `Some(false)` counts as success. `None`
+            // (lookup failed) must NOT be read as "unlocked" — that would
+            // both falsely report success and reset the submission budget,
+            // silently defeating the cap on a flaky lookup. Treat it the
+            // same as "still locked": keep polling within this Return's
+            // budget, then fall through to retry (which still costs a
+            // real reserved submission, so this can't loop forever).
+            if virtual_display::screen_is_locked() == Some(false) {
+                use std::sync::atomic::Ordering as AtomicOrdering;
+                AUTO_UNLOCK_SUBMISSIONS.store(0, AtomicOrdering::SeqCst);
+                AUTO_UNLOCK_GAVE_UP.store(false, AtomicOrdering::SeqCst);
+                return AutoUnlockOutcome::Unlocked;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(UNLOCK_POLL_INTERVAL);
+        }
+        tracing::debug!("auto-unlock: Return not acknowledged yet — retrying");
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn attempt_auto_unlock(_password: &str) -> AutoUnlockOutcome {
+    AutoUnlockOutcome::NotLocked
+}
+
 /// Exit code used when a stuck `--detach-primary` disconnect bounces the process
 /// so launchd restarts it (#168). **Deliberately non-zero** (`EX_UNAVAILABLE`,
 /// distinct from the health watchdog's `70`): with the shipped LaunchAgent
@@ -1237,6 +2019,7 @@ fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> b
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
     vd_id: u32,
@@ -1249,6 +2032,16 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
     // reconnect (so the client sees them without Ctrl+Alt+G). No-op otherwise.
     restore_windows: bool,
     physical_main_id: u32,
+    // (--lock-on-disconnect) When set, lock the local session on a genuine
+    // last-client-disconnect (after an extra safety buffer beyond the
+    // REACTIVATION_GRACE poll above), holding it while a reconnect is still
+    // handshaking (see lock_activity). None = feature off.
+    lock_on_disconnect: Option<Arc<lock_activity::ConnectionActivity>>,
+    // (--auto-unlock) When true, try to unlock the local session on
+    // reconnect using the exact same validated credential used for RDP
+    // auth. A no-op if the screen isn't locked.
+    password: Arc<Zeroizing<String>>,
+    auto_unlock: bool,
 ) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
@@ -1325,6 +2118,53 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                             "restore-windows: gathered windows onto the \
                                              virtual display on connect"
                                         );
+                                    }
+                                });
+                            }
+                            // Auto-unlock: if the screen happens to be locked
+                            // (for any reason — a lock-on-disconnect lock, one
+                            // set manually, or macOS's own idle policy), try to
+                            // unlock it now that a client is connected. No-op
+                            // instantly if it isn't locked. Off-thread so the
+                            // watcher loop isn't blocked by the settle delays
+                            // inside attempt_auto_unlock.
+                            if auto_unlock {
+                                let password = Arc::clone(&password);
+                                std::thread::spawn(move || {
+                                    use std::sync::atomic::Ordering as AtomicOrdering;
+                                    match attempt_auto_unlock(password.as_str()) {
+                                        AutoUnlockOutcome::NotLocked
+                                        | AutoUnlockOutcome::SkippedUnsafe => {}
+                                        AutoUnlockOutcome::Unlocked => {
+                                            info!(label, "auto-unlock: succeeded");
+                                        }
+                                        AutoUnlockOutcome::BudgetExhausted => {
+                                            // Fire the loud alert exactly once per lock
+                                            // cycle — a client that keeps reconnecting
+                                            // while still locked and out of budget would
+                                            // otherwise re-trigger it on every attempt.
+                                            if !AUTO_UNLOCK_GAVE_UP
+                                                .swap(true, AtomicOrdering::SeqCst)
+                                            {
+                                                error!(
+                                                    label,
+                                                    max = AUTO_UNLOCK_MAX_SUBMISSIONS,
+                                                    "auto-unlock: exhausted its submission \
+                                                     budget for this lock without \
+                                                     unlocking the screen — giving up \
+                                                     until it's unlocked another way (or \
+                                                     macrdp restarts), to avoid tripping \
+                                                     macOS's password-retry lockout"
+                                                );
+                                                alert_auto_unlock_gave_up();
+                                            } else {
+                                                warn!(
+                                                    label,
+                                                    "auto-unlock: still locked and out of \
+                                                     submission budget for this lock"
+                                                );
+                                            }
+                                        }
                                     }
                                 });
                             }
@@ -1447,6 +2287,119 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                 }
                             });
                         }
+                        // (--lock-on-disconnect) Lock the local session after an
+                        // EXTRA safety buffer on top of the REACTIVATION_GRACE poll
+                        // above. That poll only absorbs a fast in-place flap (a core
+                        // reactivation); it can't distinguish a genuine disconnect
+                        // from blank-recovery's slower fallback (a full connection
+                        // drop + ARC auto-reconnect, documented up to ~12-15s worst
+                        // case) — so this waits longer still and re-checks
+                        // `tracker.count` before actually locking, canceling if the
+                        // session came back. Off-thread so the watcher loop isn't
+                        // blocked; naturally abandoned (never fires) if the process
+                        // exits in the meantime (e.g. the #168 restart-on-stuck
+                        // path) — lock-on-disconnect only ever fires on a genuine
+                        // watcher-observed last-client-disconnect, never on server
+                        // shutdown/kill. Heuristic, not a guarantee — see
+                        // docs/known-quirks.md.
+                        if let Some(activity) = lock_on_disconnect.clone() {
+                            let tracker_for_lock = tracker.clone();
+                            // A later disconnect supersedes this one's pending
+                            // lock (it arms its own, timed from ITS edge).
+                            let generation = LOCK_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+                            let disconnect_ms = activity.now_ms();
+                            std::thread::spawn(move || {
+                                let delay = Duration::from_millis(lock_on_disconnect_delay_ms());
+                                std::thread::sleep(delay);
+                                // A client reconnecting late in the buffer only
+                                // counts as live once FULLY connected (~10 s over
+                                // ZeroTier), so hold the lock while a reconnect
+                                // is still handshaking — capped, so a peer that
+                                // merely opens connections can only delay it.
+                                let due_ms = activity.now_ms();
+                                let mut holding = false;
+                                loop {
+                                    if LOCK_GENERATION.load(Ordering::SeqCst) != generation {
+                                        tracing::debug!(
+                                            label,
+                                            "lock-on-disconnect: superseded by a later disconnect"
+                                        );
+                                        return;
+                                    }
+                                    let live = tracker_for_lock.count.load(Ordering::SeqCst) > 0;
+                                    match activity.decide(live, disconnect_ms, due_ms) {
+                                        lock_activity::LockDecision::Skip => {
+                                            info!(
+                                                label,
+                                                "lock-on-disconnect: session came back during \
+                                                 the safety buffer — skipping lock (treating \
+                                                 as a delayed reconnect/self-heal)"
+                                            );
+                                            return;
+                                        }
+                                        lock_activity::LockDecision::Hold => {
+                                            if !holding {
+                                                info!(
+                                                    label,
+                                                    "lock-on-disconnect: a client is reconnecting — \
+                                                     holding the lock until it connects (capped)"
+                                                );
+                                                holding = true;
+                                            }
+                                            std::thread::sleep(Duration::from_millis(250));
+                                        }
+                                        lock_activity::LockDecision::Lock => break,
+                                    }
+                                }
+                                // Reset the auto-unlock submission budget/alert
+                                // latch HERE, not just on an observed unlock —
+                                // this is a point where the screen is USUALLY
+                                // unlocked (we're about to lock it), and it's
+                                // the fix for a real live-reproduced lockout:
+                                // if a prior auto-unlock attempt actually
+                                // succeeded but a too-tight detection window
+                                // (see RETURN_ATTEMPT_BUDGET above) missed the
+                                // `Some(false)` flip and reported a false
+                                // BudgetExhausted, nothing would otherwise ever
+                                // reset the shared budget — the NEXT lock
+                                // cycle would start pre-exhausted and refuse to
+                                // even attempt an unlock, indefinitely, on a
+                                // Mac nobody is physically at to recover.
+                                //
+                                // GATED on a CONFIRMED `Some(false)` read —
+                                // caught in review: an unconditional reset
+                                // assumed the screen is unlocked here without
+                                // checking, which breaks if it's actually
+                                // already locked (e.g. the account password
+                                // changed while macrdp kept running: RDP still
+                                // accepts the cached old password via NLA, but
+                                // auto-unlock keeps typing that same stale
+                                // password and genuinely fails every time).
+                                // Without the gate, every disconnect/reconnect
+                                // cycle would hand that genuinely-failing
+                                // attempt a fresh budget and burn 2 more real
+                                // PAM submissions against a lock that will
+                                // never clear — exactly the macOS
+                                // escalating-lockout risk the cap exists to
+                                // prevent. `Some(true)` (still locked) or
+                                // `None` (unknown) leaves the budget/latch
+                                // alone, so a persistently-wrong password
+                                // stays given-up rather than retrying forever.
+                                if virtual_display::screen_is_locked() == Some(false) {
+                                    use std::sync::atomic::Ordering as AtomicOrdering;
+                                    AUTO_UNLOCK_SUBMISSIONS.store(0, AtomicOrdering::SeqCst);
+                                    AUTO_UNLOCK_GAVE_UP.store(false, AtomicOrdering::SeqCst);
+                                }
+                                info!(label, "lock-on-disconnect: locking the local session");
+                                if !lock_session() {
+                                    warn!(
+                                        label,
+                                        "lock-on-disconnect: failed to lock the \
+                                         session (see warning above)"
+                                    );
+                                }
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -1499,6 +2452,16 @@ fn boost_thread_qos() {
 }
 
 fn main() -> Result<()> {
+    // One-shot helper mode for the virtual display (see
+    // `virtual_display::SELECT_MODE_ARG`); never reaches the server.
+    #[cfg(target_os = "macos")]
+    {
+        let mut argv = std::env::args().skip(1);
+        if argv.next().as_deref() == Some(virtual_display::SELECT_MODE_ARG) {
+            let spec = argv.next().unwrap_or_default();
+            std::process::exit(virtual_display::run_select_mode_helper(&spec));
+        }
+    }
     // Build the tokio runtime explicitly so every worker thread starts
     // at boosted QoS (see `boost_thread_qos`). `#[tokio::main]`'s
     // generated runtime gives us no hook for this. Crucially: the main
@@ -1591,7 +2554,22 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push(username);
     }
 
-    if on("USE_KEYCHAIN", true) {
+    // PASSWORD_FILE replaces the Keychain, so USE_KEYCHAIN then defaults off.
+    let password_file = cfg.get("PASSWORD_FILE").filter(|p| !p.is_empty());
+    if let Some(p) = password_file {
+        argv.push("--password-file".into());
+        argv.push(p.clone());
+    }
+    if on("USE_KEYCHAIN", password_file.is_none()) {
+        if password_file.is_some() {
+            // Both set: say which line to change instead of clap's generic
+            // "cannot be used with" error.
+            return Err(anyhow!(
+                "{}: PASSWORD_FILE and USE_KEYCHAIN=1 are both set; set USE_KEYCHAIN=0 \
+                 (or remove that line) to read the password from the file",
+                path.display()
+            ));
+        }
         argv.push("--keychain".into());
     }
     if on("ENABLE_H264", false) {
@@ -1615,17 +2593,41 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ALT_BACKTICK_SWITCH", false) {
         argv.push("--alt-backtick-switch".into());
     }
+    if on("ALT_SPACE_SPOTLIGHT", false) {
+        argv.push("--alt-space-spotlight".into());
+    }
+    if on("ALT_Q_QUIT", false) {
+        argv.push("--alt-q-quit".into());
+    }
     if on("APP_SWITCHER_HUD", false) {
         argv.push("--app-switcher-hud".into());
     }
     if on("RESTORE_WINDOWS_ON_DISCONNECT", false) {
         argv.push("--restore-windows-on-disconnect".into());
     }
+    if on("LOCK_ON_DISCONNECT", false) {
+        argv.push("--lock-on-disconnect".into());
+    }
+    if on("AUTO_UNLOCK", false) {
+        argv.push("--auto-unlock".into());
+    }
+    if !on("RICH_CLIPBOARD", true) {
+        argv.push("--no-rich-clipboard".into());
+    }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
+    if on("NETWORK_AUTODETECT", false) {
+        argv.push("--network-autodetect".into());
+    }
+    if on("CAPTURE_NV12", false) {
+        argv.push("--capture-nv12".into());
+    }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
+    }
+    if on("REVERSE_SCROLL", false) {
+        argv.push("--reverse-scroll".into());
     }
     if let Some(list) = cfg.get("NO_REMAP_APPS") {
         if !list.is_empty() {
@@ -1645,6 +2647,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("ENABLE_CAMERA_REDIRECTION", false) {
         argv.push("--enable-camera-redirection".into());
     }
+    if on("ENABLE_MICROPHONE_REDIRECTION", false) {
+        argv.push("--enable-microphone-redirection".into());
+    }
     if on("ENABLE_UDP_MULTITRANSPORT", false) {
         argv.push("--enable-udp-multitransport".into());
     }
@@ -1663,6 +2668,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push(get("VD_WIDTH", "1920"));
         argv.push("--height".into());
         argv.push(get("VD_HEIGHT", "1080"));
+        if get("VD_HIDPI", "0").eq_ignore_ascii_case("auto") {
+            argv.push("--virtual-display-hidpi=auto".into());
+        } else if on("VD_HIDPI", false) {
+            argv.push("--virtual-display-hidpi".into());
+        }
         // Back-compat: old configs set CAPTURE_PRIMARY=1 with no PRIMARY_MODE.
         let mut primary_mode = get("PRIMARY_MODE", "none");
         if primary_mode == "none" && on("CAPTURE_PRIMARY", false) {
@@ -1711,7 +2721,6 @@ fn args_from_config(path: &Path) -> Result<Args> {
             argv.push(sz.clone());
         }
     }
-
     // First-class config keys used by the menu-bar controller's performance
     // profiles. Keeping these out of EXTRA_FLAGS makes the generated config
     // readable and lets the UI update one setting without rewriting unrelated
@@ -1727,12 +2736,26 @@ fn args_from_config(path: &Path) -> Result<Args> {
         ("KEYFRAME_INTERVAL", "--keyframe-interval"),
         ("H264_FRAMES_IN_FLIGHT", "--h264-frames-in-flight"),
         ("FLUSH_FRAMES", "--flush-frames"),
+        ("H264_MAX_UNACKED_FRAMES", "--h264-max-unacked-frames"),
     ] {
         if let Some(value) = cfg.get(cfg_key).filter(|value| !value.is_empty()) {
             argv.push(cli_flag.into());
             argv.push(value.clone());
             configured_value_flags.push(cli_flag);
         }
+    }
+
+    // Keep existing Controller TCP pacing preferences with upstream's ACK cap.
+    if cfg.contains_key("TCP_VIDEO_BACKPRESSURE")
+        && !configured_value_flags.contains(&"--h264-max-unacked-frames")
+    {
+        configured_value_flags.push("--h264-max-unacked-frames");
+        let limit = if on("TCP_VIDEO_BACKPRESSURE", false) {
+            "3"
+        } else {
+            "0"
+        };
+        argv.extend(["--h264-max-unacked-frames".into(), limit.into()]);
     }
 
     // An explicit empty value restores stable cadence, including when an
@@ -1857,6 +2880,14 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "BLANK_RECOVERY_HEAL_CONFIRM_MS",
             "MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS",
         ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+        ),
+        (
+            "BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+            "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+        ),
         ("BLANK_RECOVERY_ARM_MS", "MACRDP_BLANK_RECOVERY_ARM_MS"),
         ("BLANK_RECOVERY_RETRY_MS", "MACRDP_BLANK_RECOVERY_RETRY_MS"),
         (
@@ -1868,9 +2899,6 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS",
         ),
         ("AUTO_RECONNECT", "MACRDP_AUTO_RECONNECT"),
-        // AVC444 is diagnostics-only, but make its all-intra safety setting
-        // explicit when the controller stages that experimental mode.
-        ("AVC444_ALL_INTRA", "MACRDP_AVC444_ALL_INTRA"),
         // USB-redirection read-ahead tunables (--enable-usb-redirection). These
         // are env-only, read via getenv() in usb_spike.m; bridging them lets the
         // webcam knobs be set from config.env instead of the plist's
@@ -1881,16 +2909,24 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // H.264 + PNG frame dumps to $TMPDIR. Env-only like the USB knobs above;
         // bridged so it can be flipped in config.env when debugging the camera.
         ("CAMERA_DUMP", "MACRDP_CAMERA_DUMP"),
+        ("MIC_DUMP", "MACRDP_MIC_DUMP"),
         // #168 stopgap: when --detach-primary can't re-enable the physical panel
         // on disconnect (macOS 26.x won't do it in-process), restart under
         // launchd to restore it. Env-read at the disconnect edge.
         ("DETACH_RESTART_ON_STUCK", "MACRDP_DETACH_RESTART_ON_STUCK"),
+        // Extra safety-buffer delay (--lock-on-disconnect) on top of the
+        // overlay watcher's REACTIVATION_GRACE before actually locking the
+        // screen. Env-read at the disconnect edge via lock_on_disconnect_delay_ms().
+        (
+            "LOCK_ON_DISCONNECT_DELAY_MS",
+            "MACRDP_LOCK_ON_DISCONNECT_DELAY_MS",
+        ),
         // Loopback live-telemetry endpoint port (--stats-endpoint). Read via
         // getenv() in stats::default_port(); bridged like the USB/camera knobs
         // above so STATS_PORT can be set from config.env.
-        ("STATS_PORT", "MACRDP_STATS_PORT"),
         ("RESPONSIVE_CAPTURE", "MACRDP_RESPONSIVE_CAPTURE"),
-        ("TCP_VIDEO_BACKPRESSURE", "MACRDP_TCP_VIDEO_BACKPRESSURE"),
+        ("STATS_PORT", "MACRDP_STATS_PORT"),
+        ("AVC444_ALL_INTRA", "MACRDP_AVC444_ALL_INTRA"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {
@@ -1905,8 +2941,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
     // rather than taking the last). Unset/empty → EXTRA_FLAGS or the default (6).
     let bitrate = cfg.get("BITRATE").filter(|b| !b.is_empty());
 
-    // EXTRA_FLAGS: space-separated escape hatch, appended verbatim — except a
-    // `--bitrate <val>` pair is skipped when the dedicated BITRATE key is set.
+    // Keep unrelated escape-hatch flags. Dedicated keys override legacy values.
     if let Some(extra) = cfg.get("EXTRA_FLAGS") {
         let mut toks = extra.split_whitespace();
         while let Some(tok) = toks.next() {
@@ -1935,8 +2970,70 @@ fn args_from_config(path: &Path) -> Result<Args> {
         .with_context(|| format!("config file {} produced invalid settings", path.display()))
 }
 
+/// Log a startup credential failure once and write the auth-status file the
+/// controller reads (#266). The caller then waits and re-reads the password
+/// instead of exiting into a launchd KeepAlive restart loop.
+fn report_auth_failure(
+    err: &anyhow::Error,
+    failure: auth_status::Failure,
+    username: &str,
+    status_dir: &Option<PathBuf>,
+) {
+    error!(
+        error = format!("{err:#}"),
+        credential_process = std::process::id(),
+        credential_status = "waiting",
+        reason = failure.code(),
+        user = %username,
+        "cannot start: no valid password for this Mac account. Waiting, and checking \
+         again only when the stored password changes, so the account doesn't collect \
+         failed logins. Re-enter it in the macrdp menu-bar controller, or fix the \
+         Keychain entry"
+    );
+    if let Some(dir) = status_dir.as_deref() {
+        if let Err(e) = auth_status::write(dir, failure, username) {
+            warn!(error = %e, "could not write the auth-status file for the controller");
+        }
+    }
+}
+
+/// How often `--network-autodetect` ticks IronRDP's auto-detect. Each tick
+/// sends one RTT probe; every 8th starts a bandwidth measurement over the next
+/// 4 ticks; a Network Characteristics Result goes out at most once a second.
+const AUTODETECT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Send `ServerEvent::AutoDetectRttRequest` every `period` until the server's
+/// event channel closes. A tick sent while no session is served is discarded by
+/// the server's accept loop (and by the drain before a takeover), so ticks
+/// can't pile up and reach the next client as a burst of probes.
+fn spawn_autodetect_ticker(
+    events: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if events
+                .send(ironrdp_server::ServerEvent::AutoDetectRttRequest)
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
 async fn async_main() -> Result<()> {
     let mut args = Args::parse();
+    // Where the auth-status file goes for the controller (#266): beside the
+    // config file when there is one, else the default config directory.
+    let status_dir: Option<PathBuf> = args
+        .config
+        .as_deref()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .or_else(|| default_cert_dir().ok());
     // If launched with `--config <file>` (the LaunchAgent path), the file is the
     // sole source of truth — rebuild Args from it.
     if let Some(cfg_path) = args.config.clone() {
@@ -1991,45 +3088,6 @@ async fn async_main() -> Result<()> {
     });
     logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
 
-    // Validate credentials before bringing up capture, displays, or helpers.
-    let username = args
-        .username
-        .clone()
-        .or_else(|| std::env::var("USER").ok())
-        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
-    if args.skip_auth && !args.bind.ip().is_loopback() {
-        return Err(anyhow!(
-            "--skip-auth refused on non-loopback bind {} — remove --skip-auth or rebind to 127.0.0.1",
-            args.bind,
-        ));
-    }
-    let mut cli_password = args.password.take();
-    let password = startup_password::read_and_verify(
-        args.keychain && multitransport::env_truthy("MACRDP_PARK_ON_AUTH_FAILURE"),
-        || {
-            if args.keychain {
-                read_password_from_keychain(&username)
-            } else if let Some(password) = cli_password.take() {
-                warn!("--password is visible in process arguments; prefer --keychain or the terminal prompt");
-                Ok(Zeroizing::new(password))
-            } else {
-                rpassword::prompt_password(format!("Password for {username}: "))
-                    .map(Zeroizing::new)
-                    .context("read password from terminal")
-            }
-        },
-        |password| {
-            if args.skip_auth {
-                warn!("--skip-auth set; using the given password without PAM (loopback only)");
-            } else {
-                auth::authenticate(&username, password)
-                    .with_context(|| format!("PAM auth failed for {username}"))?;
-                info!(user = %username, "PAM auth ok");
-            }
-            Ok(())
-        },
-    ).await?;
-
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste
     // temp dirs). Dead-pid-gated so it's safe with another instance live; on a
@@ -2069,6 +3127,11 @@ async fn async_main() -> Result<()> {
         tokio::spawn(crate::stats::serve(port, stats));
     }
 
+    if args.virtual_display_hidpi.is_some() && !args.virtual_display {
+        return Err(anyhow!(
+            "--virtual-display-hidpi requires --virtual-display"
+        ));
+    }
     if args.make_primary && !args.virtual_display {
         return Err(anyhow!(
             "--make-primary requires --virtual-display (it promotes the \
@@ -2114,14 +3177,37 @@ async fn async_main() -> Result<()> {
              (pick one mechanism for going headless)"
         ));
     }
-    if args.restore_windows_on_disconnect
+    if (args.restore_windows_on_disconnect || args.lock_on_disconnect || args.auto_unlock)
         && !(args.detach_primary || args.capture_primary || args.shield_primary)
     {
         warn!(
-            "--restore-windows-on-disconnect has no effect without \
-             --detach-primary, --capture-primary or --shield-primary (it needs \
-             the headless session watcher); ignoring"
+            "--restore-windows-on-disconnect / --lock-on-disconnect / \
+             --auto-unlock have no effect without --detach-primary, \
+             --capture-primary or --shield-primary (they need the headless \
+             session watcher); ignoring"
         );
+    }
+    if args.lock_on_disconnect {
+        match screen_lock_delay_is_immediate() {
+            Some(false) => warn!(
+                "--lock-on-disconnect is set, but this account's \"require \
+                 password after sleep or screen saver begins\" delay is not \
+                 Immediately — `open ScreenSaverEngine.app` will start the \
+                 screen saver without actually requiring a password to get \
+                 back in, so the Mac won't really be locked. Set it with \
+                 System Settings, or `sudo sysadminctl -screenLock \
+                 immediate -password <password>`; macrdp does not change \
+                 this setting itself."
+            ),
+            Some(true) => {}
+            None => warn!(
+                "--lock-on-disconnect is set, but macrdp couldn't confirm \
+                 this account's screen-lock delay is Immediately (the \
+                 `sysadminctl -screenLock status` check failed) — if it \
+                 isn't, the Mac won't really be locked. See \
+                 docs/known-quirks.md."
+            ),
+        }
     }
 
     // Shared slots so the signal handler and the session-transition
@@ -2191,6 +3277,121 @@ async fn async_main() -> Result<()> {
         std::process::exit(0);
     });
 
+    // Credentials first (#266): read and check the password BEFORE any setup
+    // with side effects (sleep blocker, virtual display, helper processes), so a
+    // wrong password costs nothing but the check itself. Under launchd a failure
+    // does not exit: KeepAlive would restart it every ~10 s, each restart another
+    // failed check against the Mac account. See src/auth_status.rs.
+    let username = args
+        .username
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
+    // Only the Keychain and a password file can change while we wait; the
+    // terminal prompt and --password are one-shot, so they never wait.
+    let pollable = args.keychain || args.password_file.is_some();
+    let park = pollable
+        && auth_status::should_park(
+            std::io::stdout().is_terminal(),
+            std::env::var("MACRDP_PARK_ON_AUTH_FAILURE").ok().as_deref(),
+        );
+    let mut cli_password = args.password.take();
+    // The password the account check last rejected. While parked, PAM runs
+    // again only once the stored password differs from it, so waiting adds no
+    // failed logins; a missing or unreadable password is re-read with no PAM.
+    let mut rejected: Option<Zeroizing<String>> = None;
+    let mut reported: Option<auth_status::Failure> = None;
+    let password: Zeroizing<String> = loop {
+        let read: Result<Zeroizing<String>> = if args.keychain {
+            read_password_from_keychain(&username)
+        } else if let Some(path) = args.password_file.as_deref() {
+            read_password_file(path)
+        } else if let Some(p) = cli_password.take() {
+            warn!(
+                "--password is visible to any local user via `ps` and may be saved in \
+                 shell history; prefer --keychain (headless) or the interactive prompt. \
+                 Kept only for compatibility / scripted tests."
+            );
+            Ok(Zeroizing::new(p))
+        } else {
+            rpassword::prompt_password(format!("Password for {username}: "))
+                .map(Zeroizing::new)
+                .context("read password from terminal")
+        };
+        let (failure, err) = match read {
+            Err(e) => (auth_status::Failure::NoPassword, e),
+            Ok(p) => {
+                if !auth_status::should_check(rejected.as_ref().map(|r| r.as_str()), &p) {
+                    // Same password the check already rejected: no new check,
+                    // keep waiting (the report below runs only on a change of
+                    // reason, e.g. after the entry briefly went missing).
+                    (
+                        auth_status::Failure::WrongPassword,
+                        anyhow!("the stored password is still the one the account check rejected"),
+                    )
+                } else if args.skip_auth {
+                    break p;
+                } else {
+                    if rejected.is_some() {
+                        info!(user = %username, "the stored password changed — checking it again");
+                    }
+                    match auth::authenticate(&username, p.as_str())
+                        .with_context(|| format!("PAM auth failed for {username}"))
+                    {
+                        Ok(()) => {
+                            info!(user = %username, "PAM auth ok");
+                            break p;
+                        }
+                        Err(e) => {
+                            rejected = Some(p);
+                            (auth_status::Failure::WrongPassword, e)
+                        }
+                    }
+                }
+            }
+        };
+        if !park {
+            return Err(err);
+        }
+        if reported != Some(failure) {
+            report_auth_failure(&err, failure, &username, &status_dir);
+            reported = Some(failure);
+        }
+        tokio::time::sleep(auth_status::POLL_INTERVAL).await;
+    };
+    if reported.is_some() {
+        info!(
+            user = %username,
+            credential_process = std::process::id(),
+            credential_status = "recovered",
+            "a valid password is available now — starting"
+        );
+    }
+    // Arc'd so the reconnect-time auto-unlock watcher (below) can reuse this
+    // exact validated credential without a second Keychain read — works
+    // identically regardless of which branch above produced it.
+    let password: Arc<Zeroizing<String>> = Arc::new(password);
+    if args.skip_auth {
+        // --skip-auth is a dev-only escape hatch. Refuse it whenever the
+        // listener is reachable beyond loopback so a fat-fingered config
+        // can't accidentally expose an unauth'd RDP server to the LAN.
+        if !args.bind.ip().is_loopback() {
+            return Err(anyhow!(
+                "--skip-auth refused on non-loopback bind {} — \
+                 remove --skip-auth or rebind to 127.0.0.1",
+                args.bind,
+            ));
+        }
+        warn!(
+            "--skip-auth set; using the given password verbatim without PAM check (loopback only)"
+        );
+    }
+    if let Some(dir) = status_dir.as_deref() {
+        if let Err(e) = auth_status::clear(dir) {
+            warn!(error = %e, "could not remove the stale auth-status file");
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         if !args.allow_sleep {
@@ -2231,6 +3432,14 @@ async fn async_main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let physical_main_id: u32 = 0;
 
+    // The client's desktop scale factor, filled by the server per connection;
+    // only consulted (and only wired to the server) for --virtual-display-hidpi=auto.
+    let client_scale_factor = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let vd_hidpi = match args.virtual_display_hidpi {
+        None => virtual_display::HidpiPolicy::Off,
+        Some(VdHidpiArg::On) => virtual_display::HidpiPolicy::On,
+        Some(VdHidpiArg::Auto) => virtual_display::HidpiPolicy::Auto(client_scale_factor.clone()),
+    };
     let virtual_display: Option<Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>> =
         if args.virtual_display {
             let w = args
@@ -2242,12 +3451,22 @@ async fn async_main() -> Result<()> {
             // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
             // metadata here (capture cadence is governed by --fps); pass a
             // safe value so CGVirtualDisplay doesn't reject the mode.
-            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
-                .context("attaching virtual display")?;
+            let vd = virtual_display::VirtualDisplay::new(
+                u32::from(w),
+                u32::from(h),
+                60,
+                vd_hidpi.capable(),
+                // Before any client: --width/--height are Retina pixels (the
+                // UI at half that), for `auto` too. Each connection then picks
+                // its own UI scale in `CaptureDisplay::sync_virtual_display`.
+                if vd_hidpi.capable() { 2 } else { 1 },
+            )
+            .context("attaching virtual display")?;
             info!(
                 display_id = vd.display_id(),
                 origin = ?vd.origin_pts(),
                 size = ?vd.size_pts(),
+                hidpi = virtual_display::is_hidpi_virtual_display(vd.display_id()),
                 "virtual display attached — the RDP session uses this surface; \
                  your primary panel is untouched"
             );
@@ -2262,7 +3481,21 @@ async fn async_main() -> Result<()> {
     // guard on 0→≥1 client transitions and drops it on ≥1→0. Both
     // flags subsume --make-primary (each puts the virtual display
     // at (0,0)), so if both are set, only the lazy path runs.
+
     let session_tracker = capture::SessionTracker::default();
+    // (--lock-on-disconnect) Connection activity the pending lock consults so
+    // it doesn't fire under a reconnect's handshake. None when the flag is off.
+    let lock_activity = args
+        .lock_on_disconnect
+        .then(|| Arc::new(lock_activity::ConnectionActivity::default()));
+    // Auto-unlock is opt-in (--auto-unlock / config AUTO_UNLOCK=1), and
+    // additionally skipped entirely under --skip-auth, since in that mode
+    // `password` was never validated by PAM and isn't trustworthy to
+    // auto-type (see attempt_auto_unlock's docs).
+    let auto_unlock = args.auto_unlock && !args.skip_auth;
+    if args.auto_unlock && args.skip_auth {
+        warn!("--auto-unlock has no effect under --skip-auth; ignoring");
+    }
     if args.detach_primary {
         let vd_id = virtual_display
             .as_ref()
@@ -2278,6 +3511,9 @@ async fn async_main() -> Result<()> {
             virtual_display::DetachedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
+            lock_activity.clone(),
+            Arc::clone(&password),
+            auto_unlock,
         );
     } else if args.capture_primary {
         let vd_id = virtual_display
@@ -2294,6 +3530,9 @@ async fn async_main() -> Result<()> {
             virtual_display::CapturedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
+            lock_activity.clone(),
+            Arc::clone(&password),
+            auto_unlock,
         );
     } else if args.shield_primary {
         let vd_id = virtual_display
@@ -2310,6 +3549,9 @@ async fn async_main() -> Result<()> {
             virtual_display::ShieldedPrimary::install,
             args.restore_windows_on_disconnect,
             physical_main_id,
+            lock_activity.clone(),
+            Arc::clone(&password),
+            auto_unlock,
         );
     } else if args.make_primary {
         let vd_id = virtual_display
@@ -2482,26 +3724,36 @@ async fn async_main() -> Result<()> {
     if !args.enable_h264 {
         info!(
             "video codec: legacy bitmap path (RemoteFX/QOI/NSCodec/raw, client-negotiated). \
-             For smoother motion and lower bandwidth on capable clients pass --enable-h264 \
-             (AVC420 over EGFX), or add --avc444 for sharper color detail on RDPGFX V10+."
+             For crisp H.264 on capable clients (mstsc, Microsoft Remote Desktop, FreeRDP, \
+             Thincast) pass --enable-h264 (AVC420 over EGFX)."
         );
+        if args.capture_nv12 {
+            warn!("--capture-nv12 has no effect without --enable-h264; capturing BGRA");
+        }
     }
 
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
     crate::input::set_alt_backtick_switch(args.alt_backtick_switch);
+    crate::input::set_alt_space_spotlight(args.alt_space_spotlight);
+    crate::input::set_alt_q_quit(args.alt_q_quit);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());
+    crate::input::set_reverse_scroll(args.reverse_scroll);
+    if args.reverse_scroll {
+        info!("mouse-wheel direction reversed (--reverse-scroll)");
+    }
     if args.map_ctrl_to_cmd {
         info!(
             no_remap_apps = ?args.no_remap_apps,
             "Ctrl→Cmd Windows-shortcut remap enabled (--map-ctrl-to-cmd)"
         );
-        // Event-driven frontmost-app tracking for the terminal/app suppression
-        // (catches click-focus + Electron apps that AX polling misses).
-        crate::input::init_focus_observer();
     }
+    // Event-driven frontmost-app tracking (catches activations AX polling
+    // misses). Feeds the Ctrl→Cmd terminal suppression AND the app switcher's
+    // MRU, so it's armed regardless of --map-ctrl-to-cmd.
+    crate::input::init_focus_observer();
 
     // App-switcher HUD overlay helper (macOS-only). Tell it which display to
     // center on (the captured one) and spawn it; it idles until a Cmd+Tab. Held
@@ -2561,9 +3813,9 @@ async fn async_main() -> Result<()> {
             desktop_size.clone(),
             fps,
             args.bitrate.max(1).saturating_mul(1_000_000),
-            args.avc444,
             args.keyframe_interval,
             args.h264_frames_in_flight.max(1),
+            args.h264_max_unacked_frames,
             egfx_on_lossy_flag.clone(),
             egfx_on_udp_flag.clone(),
             egfx_demigrate_flag.clone(),
@@ -2571,6 +3823,7 @@ async fn async_main() -> Result<()> {
             congestion_retransmits.clone(),
             link_rtt_ms.clone(),
         )
+        .with_avc444(args.avc444)
     });
 
     // On-change keyframes are off by default; --keyframe-on-change opts in.
@@ -2589,12 +3842,10 @@ async fn async_main() -> Result<()> {
 
     // Shared "client minimized / SuppressOutput" flag — created here so
     // the same `Arc<AtomicBool>` can be handed to both the capture
-    // backend (which reads it to gate frame emission) and the vendor
-    // server (whose per-connection PDU handler writes it). See
-    // `vendor/ironrdp-server` `display_suppressed` plumbing.
+    // backend (which reads it to gate frame emission) and ironrdp-server
+    // (whose per-connection PDU handler writes it). See its
+    // `display_suppressed` plumbing.
     let display_suppressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let display_suppressed_changed = Arc::new(tokio::sync::Notify::new());
 
     let display = CaptureDisplay {
         desktop_size: desktop_size.clone(),
@@ -2618,8 +3869,8 @@ async fn async_main() -> Result<()> {
         click_signal: click_signal.clone(),
         flush_frames: args.flush_frames,
         flush_interval: args.flush_interval_ms.map(std::time::Duration::from_millis),
+        capture_nv12: args.capture_nv12 && !args.avc444,
         display_suppressed: Some(display_suppressed.clone()),
-        display_suppressed_changed: display_suppressed_changed.clone(),
         // Live in-session resize (client drags its window, sending an
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the
         // connect-time auto-adopt above. See `CaptureDisplay::request_layout`.
@@ -2631,6 +3882,8 @@ async fn async_main() -> Result<()> {
         // Shared so a live client resize can re-mode the display; None on
         // the mirror-primary path (no virtual display to re-mode).
         virtual_display: virtual_display.clone(),
+        vd_hidpi: vd_hidpi.clone(),
+        pointer_ui_scale: Arc::new(std::sync::atomic::AtomicU32::new(vd_hidpi.ui_scale())),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {
@@ -2661,7 +3914,10 @@ async fn async_main() -> Result<()> {
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {
-            Box::new(clipboard::MacCliprdr::new(!args.no_lazy_paste))
+            Box::new(clipboard::MacCliprdr::new(
+                !args.no_lazy_paste,
+                !args.no_rich_clipboard,
+            ))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2692,7 +3948,7 @@ async fn async_main() -> Result<()> {
     // Mac browse/read the client's redirected drive; smart-card redirection
     // (--enable-smartcard-redirection) lets macOS apps use the client's reader.
     // Both ride the one RDPDR channel, so attach the factory if either is on.
-    let rdpdr_factory: Option<Box<dyn ironrdp_server::RdpdrServerFactory>> =
+    let rdpdr_factory: Option<Box<dyn ironrdp_server::RdpdrDriveServerFactory>> =
         if args.enable_drive_redirection || args.enable_smartcard_redirection {
             Some(Box::new(rdpdr::MacRdpdr::new(
                 args.enable_drive_redirection,
@@ -2723,11 +3979,101 @@ async fn async_main() -> Result<()> {
             None
         };
 
-    // Auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log via the
-    // server's pre-handshake/post-disconnect ConnectionHandler seam. On by default
-    // (MACRDP_CONN_GUARD=0 disables). Passes --allow-ip whitelist if configured.
-    let conn_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> =
-        auth_guard::AuthGuardHandler::from_allow_ips(args.allow_ip);
+    // MS-RDPEAI microphone / audio-input redirection (Phase-0 gate). The AUDIO_INPUT
+    // DVC is advertised only when the flag is set; inert (byte-identical) when off.
+    let audin_factory: Option<Box<dyn ironrdp_server::AudinServerFactory>> =
+        if args.enable_microphone_redirection {
+            Some(Box::new(audin::MacAudin::new()))
+        } else {
+            None
+        };
+
+    // The server's connection-lifecycle hooks, run in this order (the first
+    // rejection stops the rest seeing the connection):
+    // - auth hardening (Tier 1.2): per-IP rate-limit + lockout + audit log. On by
+    //   default (MACRDP_CONN_GUARD=0 disables);
+    // - with --lock-on-disconnect, reconnect activity, so a pending lock holds for
+    //   a client still handshaking;
+    // - the client's keyboard-layout id, for the input handler to auto-select a
+    //   matching non-US layout when --keyboard-layout is unset.
+    let mut hooks: Vec<Box<dyn ironrdp_server::ConnectionHandler>> = Vec::new();
+    hooks.extend(auth_guard::AuthGuardHandler::from_allow_ips(args.allow_ip));
+    #[cfg(target_os = "macos")]
+    hooks.push(Box::new(input_handler.cleanup_hook()));
+    if let Some(activity) = &lock_activity {
+        hooks.push(Box::new(lock_activity::ActivityHook(Arc::clone(activity))));
+    }
+    hooks.push(Box::new(conn_hooks::KeyboardLayoutHook(
+        keyboard_layout_klid,
+    )));
+    // `--virtual-display-hidpi=auto` sizes the virtual display from the
+    // desktop scale factor the connecting client announces.
+    if matches!(vd_hidpi, virtual_display::HidpiPolicy::Auto(_)) {
+        hooks.push(Box::new(conn_hooks::DesktopScaleHook(client_scale_factor)));
+    }
+    // With --stats-endpoint, clear the per-session stats when a connection ends.
+    if let Some(stats) = stats::global() {
+        hooks.push(Box::new(conn_hooks::StatsHook(Arc::clone(stats))));
+    }
+
+    // Client-resolution auto-adopt: the acceptor reads the desktop size the
+    // client requests in its GCC Client Core Data and negotiates the session at
+    // that size from the start (Demand Active); the CaptureDisplay's
+    // `request_initial_size` then adopts it into the shared `desktop_size` that
+    // capture, input scaling, and the H.264 pipeline all read. The value is the
+    // ceiling (--max-client-size, defense-in-depth; the clamp is per dimension),
+    // or MS-RDPBCGR's own 8192 maximum.
+    let honor_client_size = auto_size.then(|| match args.max_client_size {
+        Some((width, height)) => {
+            info!(
+                max_w = width,
+                max_h = height,
+                "client-requested session size capped at the operator maximum"
+            );
+            ironrdp_server::DesktopSize { width, height }
+        }
+        None => ironrdp_server::DesktopSize {
+            width: 8192,
+            height: 8192,
+        },
+    });
+    if args.max_client_size.is_some() && !auto_size {
+        warn!(
+            "--max-client-size has no effect: client-resolution auto-adopt is off \
+             (--no-client-resolution, or an explicit --width/--height/--hidpi \
+             without --virtual-display)"
+        );
+    }
+
+    // Server Auto-Reconnect Cookie (MS-RDPBCGR ARC): provision it so a client
+    // (mstsc) auto-reconnects on an ungraceful drop instead of showing
+    // "disconnected". This is what makes the EGFX blank-recovery connection drop
+    // (src/h264.rs, when a reconnect lands on mstsc's stale surface and never
+    // presents) heal seamlessly — the client re-establishes on its own. Default
+    // on (standard RDP server behavior); MACRDP_AUTO_RECONNECT=0 disables. The
+    // server verifies the cookie a client returns, replaces it after every
+    // connection and hourly, and invalidates it when a session is taken over.
+    let auto_reconnect = !matches!(
+        std::env::var("MACRDP_AUTO_RECONNECT").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    );
+    let auto_reconnect_cookie = auto_reconnect.then(|| {
+        let mut random_bits = [0u8; 16];
+        match getrandom::getrandom(&mut random_bits) {
+            Ok(()) => {
+                info!("server auto-reconnect cookie provisioned (clients auto-reconnect on an ungraceful drop)");
+                // logon_id is informational for us; a stable per-process id.
+                Some(ironrdp_server::ServerAutoReconnect {
+                    logon_id: std::process::id(),
+                    random_bits,
+                })
+            }
+            Err(e) => {
+                warn!(error = %e, "could not generate auto-reconnect cookie random bits — skipping");
+                None
+            }
+        }
+    });
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
@@ -2736,90 +4082,39 @@ async fn async_main() -> Result<()> {
         .with_display_handler(display)
         .with_cliprdr_factory(Some(cliprdr))
         .with_sound_factory(Some(sound))
-        .with_rdpdr_factory(rdpdr_factory)
-        .with_usb_factory(usb_factory)
+        .with_rdpdr_drive_factory(rdpdr_factory)
+        .with_urbdrc_factory(usb_factory)
         .with_camera_factory(camera_factory)
+        .with_audin_factory(audin_factory)
         .with_bitmap_codecs(bitmap_codecs())
         .with_gfx_factory(gfx_factory)
-        .with_connection_handler(conn_handler)
+        .with_connection_handler(Some(Box::new(conn_hooks::ConnectionHooks::new(hooks))))
+        // Share the suppress flag with the capture backend, so the server's
+        // per-connection PDU handler writes to the `AtomicBool` it reads.
+        .with_display_suppressed_handle(display_suppressed)
+        .with_honor_client_desktop_size(honor_client_size)
+        .with_auto_reconnect_cookie(auto_reconnect_cookie.flatten())
+        // macrdp is a single console session: a new authenticated client takes it
+        // over. Without this the default (Queue) leaves the second client hanging
+        // in the listen backlog until the first disconnects.
+        .with_connection_policy(ironrdp_server::ConnectionPolicy::Preempt)
         .build();
 
-    // Hand the shared suppress flag to the server so its per-connection
-    // PDU handler writes to the same `AtomicBool` the capture backend
-    // reads from. Without this, the server uses an internally-created
-    // flag the display never sees.
-    server.set_display_suppressed_handle(display_suppressed);
-    server.set_display_suppressed_wakeup(display_suppressed_changed);
-
-    // The acceptor records the client's announced keyboard-layout id (KLID) in
-    // its Client Core Data; the server publishes it here so the input handler
-    // can auto-select a matching non-US layout (when --keyboard-layout is unset).
-    server.set_keyboard_layout_handle(keyboard_layout_klid);
+    // Per-SERVED-connection reset for the input handler's held-modifier and
+    // button-down state (vendored divergence 24). The server raises this once
+    // at the top of `run_connection`/`serve_negotiated` — not on a live-resize
+    // or blank-recovery reactivation, and not for a preemption candidate — and
+    // the input handler drains it on its next event. See
+    // `input::modifier_reset_handle` for why the display `updates()` path and
+    // `on_accept` were both the wrong seam.
+    server.set_input_reset_handle(input::modifier_reset_handle());
 
     // The server samples the kernel's smoothed TCP RTT for each accepted
     // connection (divergence 15) into this cell; the H.264 pipeline reads it
     // for link-aware blank-recovery gating + adaptive-bitrate seeding.
     server.set_link_rtt_handle(link_rtt_ms.clone());
 
-    // Client-resolution auto-adopt: the vendored acceptor reads the desktop
-    // size the client requests in its GCC Client Core Data and negotiates
-    // the session at that size from the start (Demand Active); the
-    // CaptureDisplay's `request_initial_size` then adopts it into the
-    // shared `desktop_size` that capture, input scaling, and the H.264
-    // pipeline all read.
-    server.set_honor_client_desktop_size(auto_size);
-    // Optional operator ceiling for the adopted size (--max-client-size,
-    // defense-in-depth): a request above the cap is clamped per-dimension in
-    // the acceptor. Meaningless off the auto-adopt path (nothing is adopted),
-    // so warn rather than silently ignore.
-    if let Some((max_w, max_h)) = args.max_client_size {
-        if auto_size {
-            server.set_honor_client_desktop_size_max(Some(ironrdp_server::DesktopSize {
-                width: max_w,
-                height: max_h,
-            }));
-            info!(
-                max_w,
-                max_h, "client-requested session size capped at the operator maximum"
-            );
-        } else {
-            warn!(
-                "--max-client-size has no effect: client-resolution auto-adopt is off \
-                 (--no-client-resolution, or an explicit --width/--height/--hidpi \
-                 without --virtual-display)"
-            );
-        }
-    }
-
-    // Server Auto-Reconnect Cookie (MS-RDPBCGR ARC): provision it so a client
-    // (mstsc) auto-reconnects on an ungraceful drop instead of showing
-    // "disconnected". This is what makes the EGFX blank-recovery connection drop
-    // (src/h264.rs, when a reconnect lands on mstsc's stale surface and never
-    // presents) heal seamlessly — the client re-establishes on its own. Default
-    // on (harmless + standard RDP server behavior); MACRDP_AUTO_RECONNECT=0
-    // disables. The returning ARC_CS cookie is not validated (single console
-    // session, NLA re-auths every connection), so a fixed per-process value is
-    // fine — it only enables the client's auto-reconnect loop.
-    let auto_reconnect = !matches!(
-        std::env::var("MACRDP_AUTO_RECONNECT").as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE")
-    );
-    if auto_reconnect {
-        let mut random_bits = [0u8; 16];
-        match getrandom::getrandom(&mut random_bits) {
-            Ok(()) => {
-                // logon_id is informational for us; a stable per-process id.
-                let logon_id = std::process::id();
-                server.set_auto_reconnect_cookie(logon_id, random_bits);
-                info!("server auto-reconnect cookie provisioned (clients auto-reconnect on an ungraceful drop)");
-            }
-            Err(e) => {
-                warn!(error = %e, "could not generate auto-reconnect cookie random bits — skipping")
-            }
-        }
-    }
-
-    // EXPERIMENTAL UDP multitransport (MS-RDPEMT). When enabled, install the
+    // UDP multitransport (MS-RDPEMT). When enabled, install the
     // provider so the server offers reliable UDP to clients that advertise it,
     // and (M3) bind a real UDP listener on the same address/port as TCP — the
     // client reuses the server address for the auxiliary UDP flow. The handle is
@@ -2956,12 +4251,25 @@ async fn async_main() -> Result<()> {
         None
     };
 
+    // Network auto-detect (--network-autodetect). IronRDP's AutoDetectManager
+    // sends the RTT probes, brackets ordinary traffic for the bandwidth
+    // measurement and reports the results; it only needs a periodic tick.
+    if args.network_autodetect {
+        server.enable_autodetect();
+        spawn_autodetect_ticker(server.event_sender().clone(), AUTODETECT_TICK);
+        info!(
+            tick_ms = AUTODETECT_TICK.as_millis() as u64,
+            "network auto-detect enabled (--network-autodetect): RTT and bandwidth are measured and \
+             reported to clients that open the message channel"
+        );
+    }
+
     // ironrdp_server::Credentials holds a plain String, so this copy is
     // outside our control and won't be zeroed when the server shuts down.
     // Our Zeroizing<String> still wipes its own allocation at scope exit.
     server.set_credentials(Some(Credentials {
         username: username.clone(),
-        password: (*password).clone(),
+        password: (**password).clone(),
         domain: None,
     }));
 
@@ -2972,7 +4280,7 @@ async fn async_main() -> Result<()> {
         args.bind.port(),
         username,
     );
-    server.run().await
+    Ok(server.run().await?)
 }
 
 /// Resolves when the process receives SIGINT (Ctrl-C) or, on Unix, SIGTERM.
@@ -3029,6 +4337,88 @@ mod detach_restart_tests {
 }
 
 #[cfg(test)]
+mod lock_on_disconnect_tests {
+    use super::{parse_lock_on_disconnect_delay_ms, LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS};
+
+    #[test]
+    fn defaults_when_unset_or_garbage() {
+        assert_eq!(
+            parse_lock_on_disconnect_delay_ms(None),
+            LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS
+        );
+        assert_eq!(
+            parse_lock_on_disconnect_delay_ms(Some("not-a-number")),
+            LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS
+        );
+        assert_eq!(
+            parse_lock_on_disconnect_delay_ms(Some("")),
+            LOCK_ON_DISCONNECT_DELAY_DEFAULT_MS
+        );
+    }
+
+    #[test]
+    fn honors_a_valid_override() {
+        assert_eq!(parse_lock_on_disconnect_delay_ms(Some("5000")), 5000);
+        // Surrounding whitespace tolerated (matches env_u64 elsewhere).
+        assert_eq!(parse_lock_on_disconnect_delay_ms(Some(" 100 ")), 100);
+        assert_eq!(parse_lock_on_disconnect_delay_ms(Some("0")), 0);
+    }
+
+    #[test]
+    fn lock_on_disconnect_alone_parses_without_a_headless_mode() {
+        // The flag is accepted by clap on its own; the no-headless-mode case
+        // is a runtime warn!, not a parse error (mirrors
+        // --restore-windows-on-disconnect's validation).
+        use clap::Parser;
+        let args = super::Args::try_parse_from(["macrdp", "--lock-on-disconnect"]);
+        assert!(args.is_ok());
+        assert!(args.unwrap().lock_on_disconnect);
+    }
+}
+
+#[cfg(test)]
+mod auto_unlock_flag_tests {
+    #[test]
+    fn parses_as_a_plain_opt_in_flag() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from(["macrdp", "--auto-unlock"]);
+        assert!(args.is_ok());
+        assert!(args.unwrap().auto_unlock);
+
+        let args = super::Args::try_parse_from(["macrdp"]);
+        assert!(args.is_ok());
+        assert!(!args.unwrap().auto_unlock);
+    }
+}
+
+#[cfg(test)]
+mod auto_unlock_submission_budget_tests {
+    use super::try_reserve_submission;
+    use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn reserves_up_to_the_max_then_refuses() {
+        let counter = AtomicU32::new(0);
+        assert!(try_reserve_submission(&counter, 2));
+        assert!(try_reserve_submission(&counter, 2));
+        // The budget of 2 is now spent — a THIRD reservation must be
+        // refused regardless of whether it comes from the same call's
+        // internal Return-retry loop or a brand-new call for the same lock.
+        // This is exactly the bug the fix guards against: capping CALLS
+        // rather than actual submissions let a single call's internal
+        // retries alone exceed the documented budget.
+        assert!(!try_reserve_submission(&counter, 2));
+        assert!(!try_reserve_submission(&counter, 2));
+    }
+
+    #[test]
+    fn zero_budget_never_reserves() {
+        let counter = AtomicU32::new(0);
+        assert!(!try_reserve_submission(&counter, 0));
+    }
+}
+
+#[cfg(test)]
 mod max_client_size_tests {
     use super::parse_max_client_size;
 
@@ -3059,6 +4449,16 @@ mod max_client_size_tests {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+
+    fn write_temp(name: &str, body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "macrdp-cfgtest-{}-{}.env",
+            std::process::id(),
+            name
+        ));
+        fs::write(&path, body).unwrap();
+        path
+    }
 
     #[test]
     fn fast_flush_is_opt_in_and_interval_is_bounded() {
@@ -3133,88 +4533,6 @@ mod config_tests {
         fs::remove_file(path).unwrap();
     }
 
-    fn write_temp(name: &str, body: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "macrdp-cfgtest-{}-{}.env",
-            std::process::id(),
-            name
-        ));
-        fs::write(&path, body).unwrap();
-        path
-    }
-
-    #[test]
-    fn parses_full_config_into_flags() {
-        let path = write_temp(
-            "full",
-            "# a comment, then a blank line\n\
-             \n\
-             export BIND=0.0.0.0:3390\n\
-             USERNAME=alice\n\
-             ENABLE_H264=1\n\
-             AVC444=1\n\
-             ENABLE_AAC=0\n\
-             HIDPI=1\n\
-             UNMINIMIZE=1\n\
-             VIRTUAL_DISPLAY=1\n\
-             VD_WIDTH=2560\n\
-             VD_HEIGHT=1440\n\
-             PRIMARY_MODE=detach\n\
-             ENABLE_UDP_MULTITRANSPORT=1\n\
-             UDP_MIGRATE_EGFX=1\n\
-             MAX_CLIENT_SIZE=2560x1440\n\
-             EXTRA_FLAGS=\"--fps 30\"\n",
-        );
-        let args = args_from_config(&path).unwrap();
-        fs::remove_file(&path).ok();
-
-        assert_eq!(args.bind.to_string(), "0.0.0.0:3390");
-        assert_eq!(args.username.as_deref(), Some("alice"));
-        assert!(args.enable_h264);
-        assert!(args.avc444);
-        assert!(!args.enable_aac);
-        assert!(args.hidpi);
-        assert!(args.unminimize_on_switch);
-        assert!(args.virtual_display);
-        assert_eq!(args.width, Some(2560));
-        assert_eq!(args.height, Some(1440));
-        assert!(args.detach_primary);
-        assert!(!args.capture_primary);
-        assert!(args.enable_udp_multitransport);
-        assert!(args.udp_migrate_egfx);
-        assert_eq!(args.max_client_size, Some((2560, 1440)));
-        // USE_KEYCHAIN defaults on (matches the old wrapper).
-        assert!(args.keychain);
-        // EXTRA_FLAGS is parsed as real CLI tokens.
-        assert_eq!(args.fps, Some(30));
-    }
-
-    #[test]
-    fn bitrate_config_bridge() {
-        // BITRATE alone maps to --bitrate.
-        let p = write_temp("br1", "BITRATE=8\n");
-        assert_eq!(args_from_config(&p).unwrap().bitrate, 8);
-        fs::remove_file(&p).ok();
-
-        // BITRATE wins over a stale `--bitrate` in EXTRA_FLAGS (which is dropped
-        // so clap never sees a duplicate) WITHOUT eating the other EXTRA_FLAGS.
-        let p = write_temp("br2", "EXTRA_FLAGS=\"--fps 24 --bitrate 6\"\nBITRATE=12\n");
-        let a = args_from_config(&p).unwrap();
-        assert_eq!(a.bitrate, 12);
-        assert_eq!(a.fps, Some(24)); // the non-bitrate flag survived the strip
-        fs::remove_file(&p).ok();
-
-        // Unset → the server default (6).
-        let p = write_temp("br3", "ENABLE_H264=1\n");
-        assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
-        fs::remove_file(&p).ok();
-
-        // Empty BITRATE is ignored (no arg pushed) → default, not an error.
-        let p = write_temp("br4", "BITRATE=\n");
-        assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
-        fs::remove_file(&p).ok();
-    }
-
     #[test]
     fn controller_profile_keys_map_to_cli_and_override_stale_extra_flags() {
         let p = write_temp(
@@ -3258,6 +4576,246 @@ mod config_tests {
     }
 
     #[test]
+    fn parses_full_config_into_flags() {
+        let path = write_temp(
+            "full",
+            "# a comment, then a blank line\n\
+             \n\
+             export BIND=0.0.0.0:3390\n\
+             USERNAME=alice\n\
+             ENABLE_H264=1\n\
+             ENABLE_AAC=0\n\
+             HIDPI=1\n\
+             UNMINIMIZE=1\n\
+             VIRTUAL_DISPLAY=1\n\
+             VD_WIDTH=2560\n\
+             VD_HEIGHT=1440\n\
+             PRIMARY_MODE=detach\n\
+             ENABLE_UDP_MULTITRANSPORT=1\n\
+             UDP_MIGRATE_EGFX=1\n\
+             MAX_CLIENT_SIZE=2560x1440\n\
+             EXTRA_FLAGS=\"--fps 30\"\n",
+        );
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(args.bind.to_string(), "0.0.0.0:3390");
+        assert_eq!(args.username.as_deref(), Some("alice"));
+        assert!(args.enable_h264);
+        assert!(!args.enable_aac);
+        assert!(args.hidpi);
+        assert!(args.unminimize_on_switch);
+        assert!(args.virtual_display);
+        assert_eq!(args.width, Some(2560));
+        assert_eq!(args.height, Some(1440));
+        assert!(args.detach_primary);
+        assert!(!args.capture_primary);
+        assert!(args.enable_udp_multitransport);
+        assert!(args.udp_migrate_egfx);
+        assert_eq!(args.max_client_size, Some((2560, 1440)));
+        // USE_KEYCHAIN defaults on (matches the old wrapper).
+        assert!(args.keychain);
+        // EXTRA_FLAGS is parsed as real CLI tokens.
+        assert_eq!(args.fps, Some(30));
+    }
+
+    #[test]
+    fn reverse_scroll_config_bridge() {
+        let p = write_temp("rs1", "REVERSE_SCROLL=1\n");
+        assert!(args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
+        let p = write_temp("rs0", "REVERSE_SCROLL=0\n");
+        assert!(!args_from_config(&p).unwrap().reverse_scroll);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn bitrate_config_bridge() {
+        // BITRATE alone maps to --bitrate.
+        let p = write_temp("br1", "BITRATE=8\n");
+        assert_eq!(args_from_config(&p).unwrap().bitrate, 8);
+        fs::remove_file(&p).ok();
+
+        // BITRATE wins over a stale `--bitrate` in EXTRA_FLAGS (which is dropped
+        // so clap never sees a duplicate) WITHOUT eating the other EXTRA_FLAGS.
+        let p = write_temp("br2", "EXTRA_FLAGS=\"--fps 24 --bitrate 6\"\nBITRATE=12\n");
+        let a = args_from_config(&p).unwrap();
+        assert_eq!(a.bitrate, 12);
+        assert_eq!(a.fps, Some(24)); // the non-bitrate flag survived the strip
+        fs::remove_file(&p).ok();
+
+        // Unset → the server default (6).
+        let p = write_temp("br3", "ENABLE_H264=1\n");
+        assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
+        fs::remove_file(&p).ok();
+
+        // Empty BITRATE is ignored (no arg pushed) → default, not an error.
+        let p = write_temp("br4", "BITRATE=\n");
+        assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
+        fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn password_file_config_bridge() {
+        // PASSWORD_FILE maps to --password-file and turns the Keychain default off.
+        let p = write_temp("pwf1", "PASSWORD_FILE=/tmp/x/pw\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert_eq!(a.password_file.as_deref(), Some(Path::new("/tmp/x/pw")));
+        assert!(!a.keychain);
+
+        // Both set explicitly is a conflict, not a silent pick, and the
+        // error says how to fix the config.
+        let p = write_temp("pwf2", "PASSWORD_FILE=/tmp/x/pw\nUSE_KEYCHAIN=1\n");
+        let e = args_from_config(&p).unwrap_err().to_string();
+        fs::remove_file(&p).ok();
+        assert!(e.contains("USE_KEYCHAIN=0"), "{e}");
+
+        // PASSWORD_FILE with USE_KEYCHAIN=0 (as config.env.example says).
+        let p = write_temp("pwf2b", "PASSWORD_FILE=/tmp/x/pw\nUSE_KEYCHAIN=0\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert!(a.password_file.is_some() && !a.keychain);
+
+        // Empty PASSWORD_FILE is ignored → Keychain default as before.
+        let p = write_temp("pwf3", "PASSWORD_FILE=\n");
+        let a = args_from_config(&p).unwrap();
+        fs::remove_file(&p).ok();
+        assert!(a.password_file.is_none());
+        assert!(a.keychain);
+    }
+
+    /// A 0600 password file for the tests.
+    fn write_pw(name: &str, body: &str) -> PathBuf {
+        let p = write_temp(name, body);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        p
+    }
+
+    #[test]
+    fn password_file_access_rule() {
+        assert!(check_password_file_access(0o100600, 501, 501).is_ok());
+        assert!(check_password_file_access(0o100400, 501, 501).is_ok());
+        // Any group/other bit is refused, not only read.
+        for mode in [0o100644, 0o100640, 0o100620, 0o100601, 0o100610] {
+            let e = check_password_file_access(mode, 501, 501)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(&format!("{:04o}", mode & 0o7777)), "{e}");
+        }
+        let e = check_password_file_access(0o100600, 0, 501)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("uid 0"), "{e}");
+    }
+
+    #[test]
+    fn password_file_refuses_open_permissions() {
+        let p = write_pw("pwf7", "s3cret\n");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("chmod 600"), "{e}");
+        assert!(!e.contains("s3cret"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn password_file_refuses_an_acl() {
+        let p = write_pw("pwf-acl", "s3cret\n");
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        // Without the ACL the same file is accepted.
+        let status = std::process::Command::new("chmod")
+            .arg("-N")
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let ok = read_password_file(&p);
+        fs::remove_file(&p).ok();
+        assert!(
+            e.contains("access control list") && e.contains("chmod -N"),
+            "{e}"
+        );
+        assert!(!e.contains("s3cret"));
+        assert_eq!(ok.unwrap().as_str(), "s3cret");
+    }
+
+    #[test]
+    fn password_file_must_be_a_regular_file() {
+        // A FIFO without a writer must not block startup.
+        let p = std::env::temp_dir().join(format!("macrdp-pwfifo-{}", std::process::id()));
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("not a regular file"), "{e}");
+        // A directory neither.
+        let e = format!(
+            "{:#}",
+            read_password_file(&std::env::temp_dir()).unwrap_err()
+        );
+        assert!(e.contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn password_file_size_and_encoding() {
+        let p = write_pw("pwf8", &"x".repeat(MAX_PASSWORD_FILE_BYTES));
+        assert_eq!(
+            read_password_file(&p).unwrap().len(),
+            MAX_PASSWORD_FILE_BYTES
+        );
+        fs::remove_file(&p).ok();
+
+        let p = write_pw("pwf9", &"x".repeat(MAX_PASSWORD_FILE_BYTES + 1));
+        assert!(read_password_file(&p).is_err());
+        fs::remove_file(&p).ok();
+
+        let p = write_temp("pwf10", "");
+        fs::write(&p, [0x73u8, 0xff, 0x0a]).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        fs::remove_file(&p).ok();
+        assert!(e.contains("not valid UTF-8"), "{e}");
+    }
+
+    #[test]
+    fn password_file_reads_and_strips_one_newline() {
+        let p = write_pw("pwf4", "s3cret\r\n");
+        assert_eq!(read_password_file(&p).unwrap().as_str(), "s3cret");
+        fs::remove_file(&p).ok();
+
+        let p = write_pw("pwf5", "two\n\n");
+        assert_eq!(read_password_file(&p).unwrap().as_str(), "two\n");
+        fs::remove_file(&p).ok();
+
+        let p = write_pw("pwf6", "\n");
+        assert!(read_password_file(&p).is_err());
+        fs::remove_file(&p).ok();
+
+        assert!(read_password_file(Path::new("/nonexistent/macrdp-pw")).is_err());
+    }
+
+    #[test]
+    fn password_file_conflicts_with_password_flag() {
+        assert!(
+            Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw", "--password", "x"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw", "--keychain"]).is_err()
+        );
+        assert!(Args::try_parse_from(["macrdp", "--password-file", "/tmp/pw"]).is_ok());
+    }
+
+    #[test]
     fn empty_config_matches_wrapper_defaults() {
         let path = write_temp("empty", "\n# nothing set\n");
         let args = args_from_config(&path).unwrap();
@@ -3269,15 +4827,6 @@ mod config_tests {
         assert!(!args.enable_h264);
         assert!(!args.enable_udp_multitransport);
         assert!(!args.udp_migrate_egfx);
-    }
-
-    #[test]
-    fn avc444_cli_requires_h264() {
-        let args = Args::try_parse_from(["macrdp", "--enable-h264", "--avc444"]).unwrap();
-        assert!(args.enable_h264);
-        assert!(args.avc444);
-
-        assert!(Args::try_parse_from(["macrdp", "--avc444"]).is_err());
     }
 
     #[test]

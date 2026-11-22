@@ -4,7 +4,7 @@
 //! in desktop-pixel space. We translate to macOS virtual keycodes and post via
 //! `CGEventPost(kCGHIDEventTap)`. Non-macOS targets get a logging stub.
 
-use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 #[cfg(not(target_os = "macos"))]
 use tracing::trace;
 
@@ -24,7 +24,7 @@ pub struct MacInputHandler {
     /// keyframe threshold briefly after a click. `None` unless `--enable-h264`.
     click_signal: Option<crate::capture::ClickSignal>,
     #[cfg(target_os = "macos")]
-    inner: macos::Inner,
+    inner: std::sync::Arc<std::sync::Mutex<macos::Inner>>,
 }
 
 impl MacInputHandler {
@@ -58,20 +58,32 @@ impl MacInputHandler {
             desktop_size,
             click_signal,
             #[cfg(target_os = "macos")]
-            inner,
+            inner: std::sync::Arc::new(std::sync::Mutex::new(inner)),
         })
+    }
+    #[cfg(target_os = "macos")]
+    pub fn cleanup_hook(&self) -> impl ironrdp_server::ConnectionHandler {
+        InputCleanup(self.inner.clone())
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct InputCleanup(std::sync::Arc<std::sync::Mutex<macos::Inner>>);
+
+#[cfg(target_os = "macos")]
+impl ironrdp_server::ConnectionHandler for InputCleanup {
+    fn on_disconnected(
+        &mut self,
+        _peer: std::net::SocketAddr,
+        _duration: std::time::Duration,
+        _error: Option<&ironrdp_server::ServerError>,
+    ) -> ironrdp_server::PostConnectionAction {
+        self.0.lock().unwrap().release_session_input();
+        ironrdp_server::PostConnectionAction::Continue
     }
 }
 
 impl RdpServerInputHandler for MacInputHandler {
-    fn session_ended(&mut self) {
-        if let Some(stats) = crate::stats::global() {
-            stats.end_video_session();
-        }
-        #[cfg(target_os = "macos")]
-        self.inner.release_session_input();
-    }
-
     fn keyboard(&mut self, event: KeyboardEvent) {
         if let Some(stats) = crate::stats::global() {
             stats
@@ -79,7 +91,7 @@ impl RdpServerInputHandler for MacInputHandler {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(target_os = "macos")]
-        self.inner.keyboard(event);
+        self.inner.lock().unwrap().keyboard(event);
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "keyboard event (stub)");
     }
@@ -91,7 +103,11 @@ impl RdpServerInputHandler for MacInputHandler {
         if let Some(sig) = &self.click_signal {
             if matches!(
                 event,
-                MouseEvent::LeftPressed | MouseEvent::RightPressed | MouseEvent::MiddlePressed
+                MouseEvent::Button {
+                    button: MouseButton::Left | MouseButton::Right | MouseButton::Middle,
+                    pressed: true,
+                    ..
+                }
             ) {
                 sig.record_click();
             }
@@ -100,7 +116,10 @@ impl RdpServerInputHandler for MacInputHandler {
         {
             let (width, height) = self.desktop_size.get();
             let letterbox = self.desktop_size.letterbox();
-            self.inner.mouse(event, width, height, letterbox);
+            self.inner
+                .lock()
+                .unwrap()
+                .mouse(event, width, height, letterbox);
         }
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "mouse event (stub)");
@@ -170,9 +189,9 @@ fn map_client_to_display(
 }
 
 /// macOS virtual keycodes whose `Ctrl+<key>` combo is remapped to `Cmd+<key>`
-/// under --map-ctrl-to-cmd: C V X A Z S F N T W O P R G (copy / paste / cut /
+/// under --map-ctrl-to-cmd: C V X A Z S F N T W O P R G , (copy / paste / cut /
 /// select-all / undo / save / find / new / new-tab / close / open / print /
-/// reload / find-next). Deliberately EXCLUDES Q (`Cmd+Q` quits — a nasty
+/// reload / find-next / preferences). Deliberately EXCLUDES Q (`Cmd+Q` quits — a nasty
 /// surprise from `Ctrl+Q`) and all nav keys (Mac word-nav is Option+arrow, not
 /// Cmd+arrow). Windows redo (`Ctrl+Y`) is intentionally not here — Mac redo is
 /// `Cmd+Shift+Z`, reachable via `Ctrl+Shift+Z` through the Z mapping.
@@ -196,157 +215,294 @@ fn is_remappable_shortcut(vk: u16) -> bool {
             | 0x23 // P
             | 0x0F // R
             | 0x05 // G
+            | 0x2B // , (Cmd+, = Preferences)
     )
 }
 
-/// macOS actions behind the default plain `Ctrl+Arrow` Mission Control
-/// shortcuts. RDP delivers the chord correctly, but WindowServer refuses to
-/// dispatch these system shortcuts from a user-space `CGEventPost`, so the
-/// macOS backend invokes the equivalent system action explicitly.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CtrlArrowAction {
-    MissionControl,
-    ApplicationWindows,
-    PreviousSpace,
-    NextSpace,
+/// Pure decision table for the MOUSE half of the Ctrl→Cmd remap: should a
+/// left click's Control be delivered to macOS as Command?
+///
+/// Mirrors the keyboard gate in `key()` minus the per-key
+/// `is_remappable_shortcut` test (a click has no vk). Evaluated ONCE per
+/// gesture — at button-down — and the verdict is latched for the matching drag
+/// and up (see `Inner::left_click_remapped`). Split out pure so the whole table
+/// (remap × ctrl × cmd × alt × excluded) is unit-tested on every target, the
+/// way `map_client_to_display` is; the impure inputs are gathered by
+/// `Inner::click_remap_active`, which checks the cheap flags through this
+/// function first and only then pays for the frontmost-app lookup.
+fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded: bool) -> bool {
+    remap_on && ctrl && !cmd && !alt && !excluded
 }
 
-/// Match only the four *plain* Ctrl+Arrow chords. Extra Shift/Option/Cmd
-/// modifiers remain application-owned, and ordinary arrows are untouched.
-/// Pure so the interception boundary is regression-tested on every target.
-fn ctrl_arrow_action(
-    ctrl: bool,
-    shift: bool,
-    option: bool,
-    command: bool,
-    vk: u16,
-) -> Option<CtrlArrowAction> {
-    if !ctrl || shift || option || command {
-        return None;
-    }
-    match vk {
-        0x7E => Some(CtrlArrowAction::MissionControl), // Up
-        0x7D => Some(CtrlArrowAction::ApplicationWindows), // Down
-        0x7B => Some(CtrlArrowAction::PreviousSpace),  // Left
-        0x7C => Some(CtrlArrowAction::NextSpace),      // Right
-        _ => None,
+/// Does a button-down bring the app under the cursor to the front? Only a
+/// plain left click does: right/middle clicks open menus in place, Cmd+click
+/// on a background window acts on it without activating its app, and
+/// Ctrl+click is a secondary click (or, under --map-ctrl-to-cmd, a Cmd+click).
+/// Gates the click hit-test's feed into the app switcher's focus tracking.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_activating_click(left_button: bool, cmd: bool, ctrl: bool) -> bool {
+    left_button && !cmd && !ctrl
+}
+
+/// What `resync_modifiers_if_stale` must do for one trigger. Split out pure —
+/// like `should_remap_click` — so the decision table is unit-tested on every
+/// target; the method itself only gathers the inputs and performs the effects.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct ResyncPlan {
+    /// Buttons to release with a synthetic Up (left, right, middle). Only on a
+    /// connection edge: an idle gap must never drop a drag in progress.
+    release_buttons: [bool; 3],
+    /// Drop `remapped_keys` and the click latch. Connection edge only —
+    /// clearing the latch on an idle gap would undo the down/up consistency fix.
+    clear_gesture_state: bool,
+    /// Post the `FlagsChanged` that releases held modifiers. Gated on a
+    /// modifier actually being held, so a clean reconnect doesn't bother macOS.
+    post_flags_changed: bool,
+}
+
+/// `reconnected`: a new served connection began. `buttons_down`: left, right,
+/// middle as currently tracked. `mods_held`: any non-lock modifier is held.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn resync_plan(reconnected: bool, buttons_down: [bool; 3], mods_held: bool) -> ResyncPlan {
+    ResyncPlan {
+        release_buttons: if reconnected {
+            buttons_down
+        } else {
+            [false; 3]
+        },
+        clear_gesture_state: reconnected,
+        post_flags_changed: mods_held,
     }
 }
 
-/// Apple virtual keycodes consumed by the System Events fallback. Keep this
-/// mapping pure and pinned by tests: Up/Down are easy to accidentally swap
-/// because their values run in the opposite visual order.
-fn ctrl_arrow_system_events_keycode(action: CtrlArrowAction) -> u16 {
-    match action {
-        CtrlArrowAction::MissionControl => 126,
-        CtrlArrowAction::ApplicationWindows => 125,
-        CtrlArrowAction::PreviousSpace => 123,
-        CtrlArrowAction::NextSpace => 124,
-    }
+/// When true, invert the client's wheel direction (both axes) before posting.
+/// For a Mac with natural scrolling on, where a local tool such as LinearMouse
+/// un-reverses the physical wheel but can't see macrdp's synthetic scroll
+/// events (#240). Opt-in via `--reverse-scroll`; off by default.
+static REVERSE_SCROLL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_reverse_scroll(on: bool) {
+    REVERSE_SCROLL.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Convert one wheel event while retaining only a sub-line remainder.
-/// Drop old-direction remainder on reversal and discard excess whole lines
-/// rather than letting a large gesture leave an invisible backlog.
-/// Adapted from upstream clintcan/macrdp#210.
-#[cfg(any(target_os = "macos", test))]
-fn scroll_lines(remainder: i32, delta: i32) -> (i32, i32) {
-    const UNITS_PER_LINE: i64 = 60;
-    let remainder = if delta != 0 && remainder.signum() != delta.signum() {
-        0
+/// The client's wheel delta, inverted when `reverse` is set.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn wheel_delta(raw: i32, reverse: bool) -> i32 {
+    if reverse {
+        raw.saturating_neg()
     } else {
-        remainder
+        raw
+    }
+}
+
+/// Wheel units per posted scroll line; see `Inner::scroll`.
+const SCROLL_UNITS_PER_LINE: i32 = 60;
+
+/// Adds a wheel delta to the running total and returns the lines to post (at
+/// most 5 per event) and the new total. Whatever the cap cuts off is dropped,
+/// and a reversal starts from zero.
+fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
+    let accum = if delta != 0 && accum != 0 && (accum < 0) != (delta < 0) {
+        delta
+    } else {
+        accum.saturating_add(delta)
     };
-    let total = i64::from(remainder) + i64::from(delta);
-    (
-        (total / UNITS_PER_LINE).clamp(-5, 5) as i32,
-        (total % UNITS_PER_LINE) as i32,
-    )
+    let lines = accum / SCROLL_UNITS_PER_LINE;
+    (lines.clamp(-5, 5), accum - lines * SCROLL_UNITS_PER_LINE)
 }
 
 #[cfg(test)]
 mod coord_tests {
     use super::{
-        ctrl_arrow_action, ctrl_arrow_system_events_keycode, is_remappable_shortcut,
-        map_client_to_display, CtrlArrowAction,
+        is_remappable_shortcut, map_client_to_display, remove_switcher_selection, resync_plan,
+        scroll_lines, should_alt_q_quit, should_remap_click, wheel_delta, ResyncPlan,
     };
+
+    #[test]
+    fn reverse_scroll_inverts_the_wheel_only_when_on() {
+        assert_eq!(wheel_delta(120, false), 120);
+        assert_eq!(wheel_delta(-3, false), -3);
+        assert_eq!(wheel_delta(120, true), -120);
+        assert_eq!(wheel_delta(-3, true), 3);
+        assert_eq!(wheel_delta(0, true), 0);
+        assert_eq!(wheel_delta(i32::MIN, true), i32::MAX);
+    }
+
+    #[test]
+    fn scroll_drops_what_the_cap_cuts_off() {
+        assert_eq!(scroll_lines(0, -1236), (-5, -36));
+        assert_eq!(scroll_lines(0, 30), (0, 30));
+        assert_eq!(scroll_lines(30, 30), (1, 0));
+    }
+
+    #[test]
+    fn scroll_saturates_instead_of_overflowing() {
+        assert_eq!(scroll_lines(59, i32::MAX), (5, i32::MAX % 60));
+    }
+
+    #[test]
+    fn scroll_reversal_ignores_the_previous_direction() {
+        let (_, accum) = scroll_lines(0, -1236);
+        assert_eq!(scroll_lines(accum, 120), (2, 0));
+    }
+
+    /// Connection edge: every tracked button is released, the gesture state is
+    /// cleared, and `FlagsChanged` is posted only if a modifier was held.
+    #[test]
+    fn resync_plan_connection_edge_releases_buttons_and_clears_state() {
+        // Mid-drag disconnect: left held, no modifier left.
+        assert_eq!(
+            resync_plan(true, [true, false, false], false),
+            ResyncPlan {
+                release_buttons: [true, false, false],
+                clear_gesture_state: true,
+                post_flags_changed: false,
+            },
+            "latch/remapped_keys are cleared even though no modifier was held"
+        );
+        // Every button + a held modifier.
+        assert_eq!(
+            resync_plan(true, [true, true, true], true),
+            ResyncPlan {
+                release_buttons: [true, true, true],
+                clear_gesture_state: true,
+                post_flags_changed: true,
+            }
+        );
+        // Clean reconnect: nothing to release, nothing to post — but state
+        // is still cleared.
+        assert_eq!(
+            resync_plan(true, [false; 3], false),
+            ResyncPlan {
+                release_buttons: [false; 3],
+                clear_gesture_state: true,
+                post_flags_changed: false,
+            }
+        );
+    }
+
+    /// Idle gap: modifiers only. A drag/click in progress inside a live
+    /// connection is legitimate state, and the latch must survive.
+    #[test]
+    fn resync_plan_idle_gap_touches_modifiers_only() {
+        assert_eq!(
+            resync_plan(false, [true, true, true], true),
+            ResyncPlan {
+                release_buttons: [false; 3],
+                clear_gesture_state: false,
+                post_flags_changed: true,
+            },
+            "buttons and latch survive an idle gap"
+        );
+        assert!(!resync_plan(false, [false; 3], false).post_flags_changed);
+    }
+
+    /// Quitting from the switcher keeps the selection in place (the next app
+    /// slides under it), wraps when the last entry goes, and ends at empty.
+    #[test]
+    fn switcher_quit_moves_selection_to_the_next_app() {
+        let mut apps = vec!["A", "B", "C"];
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(1));
+        assert_eq!(apps, ["A", "C"]);
+        // Quitting the last entry stays on the new last entry, not the first.
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(0));
+        assert_eq!(apps, ["A"]);
+        let mut apps = vec!["A", "B", "C"];
+        assert_eq!(remove_switcher_selection(&mut apps, 2), Some(1));
+        assert_eq!(apps, ["A", "B"]);
+        let mut apps = vec!["A", "B"];
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(0));
+        assert_eq!(apps, ["A"]);
+        let mut apps = vec!["A", "B", "C"];
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(1));
+        assert_eq!(remove_switcher_selection(&mut apps, 1), Some(0));
+        assert_eq!(apps, ["A"]);
+        assert_eq!(remove_switcher_selection(&mut apps, 0), None);
+        assert!(apps.is_empty());
+    }
+
+    /// `--alt-q-quit` fires for exactly one row: flag on + plain Option. In
+    /// particular Option+Shift+Q must NOT become Cmd+Shift+Q (log out).
+    #[test]
+    fn alt_q_quit_decision_table() {
+        // (on, opt, cmd, ctrl, shift) -> expected
+        let only_quitting_row = (true, true, false, false, false);
+        for on in [false, true] {
+            for opt in [false, true] {
+                for cmd in [false, true] {
+                    for ctrl in [false, true] {
+                        for shift in [false, true] {
+                            let row = (on, opt, cmd, ctrl, shift);
+                            assert_eq!(
+                                should_alt_q_quit(on, opt, cmd, ctrl, shift),
+                                row == only_quitting_row,
+                                "unexpected verdict for {row:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
+    /// flag is on, a plain Ctrl is held (no Cmd, no Alt), and the frontmost app
+    /// is not excluded. Every other combination must leave the click alone.
+    #[test]
+    fn mouse_remap_decision_table() {
+        // (remap_on, ctrl, cmd, alt, excluded) -> expected
+        let only_remapping_row = (true, true, false, false, false);
+        for remap_on in [false, true] {
+            for ctrl in [false, true] {
+                for cmd in [false, true] {
+                    for alt in [false, true] {
+                        for excluded in [false, true] {
+                            let row = (remap_on, ctrl, cmd, alt, excluded);
+                            assert_eq!(
+                                should_remap_click(remap_on, ctrl, cmd, alt, excluded),
+                                row == only_remapping_row,
+                                "unexpected verdict for {row:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spot-check the rows that each guard exists for, so a future edit that
+    /// drops one is caught by name rather than by a table diff.
+    #[test]
+    fn mouse_remap_guards_each_hold_independently() {
+        // Flag off → never, even with a perfect Ctrl.
+        assert!(!should_remap_click(false, true, false, false, false));
+        // No Ctrl held → nothing to swap.
+        assert!(!should_remap_click(true, false, false, false, false));
+        // Ctrl+Cmd combo passes through unchanged (matches the keyboard gate).
+        assert!(!should_remap_click(true, true, true, false, false));
+        // Ctrl+Alt combo passes through unchanged (matches the keyboard gate).
+        assert!(!should_remap_click(true, true, false, true, false));
+        // Excluded app (terminal / --no-remap-apps) keeps a REAL Ctrl+click.
+        assert!(!should_remap_click(true, true, false, false, true));
+        // The one remapping case.
+        assert!(should_remap_click(true, true, false, false, false));
+    }
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.5
     }
 
     #[test]
-    fn wheel_fragments_accumulate_without_delaying_a_reversal() {
-        use super::scroll_lines;
-        assert_eq!(scroll_lines(0, 30), (0, 30));
-        assert_eq!(scroll_lines(30, 0), (0, 30));
-        assert_eq!(scroll_lines(30, 30), (1, 0));
-        let (lines, remainder) = scroll_lines(0, -1236);
-        assert_eq!((lines, remainder), (-5, -36));
-        assert_eq!(scroll_lines(remainder, 120), (2, 0));
-        assert_eq!(scroll_lines(remainder, -24), (-1, 0));
-        assert_eq!(scroll_lines(0, 600), (5, 0));
-        for delta in [i32::MIN, i32::MAX] {
-            let (lines, remainder) = scroll_lines(delta.signum() * 59, delta);
-            assert_eq!(lines, delta.signum() * 5);
-            assert!(remainder.abs() < 60);
-        }
-    }
-
-    #[test]
     fn curated_keys_remap_and_q_does_not() {
-        // Curated editing keys (C, V, X, A, Z, S) remap.
-        for vk in [0x08u16, 0x09, 0x07, 0x00, 0x06, 0x01] {
+        // Curated editing keys (C, V, X, A, Z, S) + comma (Cmd+, = Preferences) remap.
+        for vk in [0x08u16, 0x09, 0x07, 0x00, 0x06, 0x01, 0x2B] {
             assert!(is_remappable_shortcut(vk), "vk {vk:#x} should remap");
         }
         // Q (0x0C) is deliberately excluded so Ctrl+Q can't become Cmd+Q.
         assert!(!is_remappable_shortcut(0x0C));
         // Arrows / nav keys are untouched (e.g. left arrow 0x7B).
         assert!(!is_remappable_shortcut(0x7B));
-    }
-
-    #[test]
-    fn plain_ctrl_arrows_map_only_to_mission_control_actions() {
-        assert_eq!(
-            ctrl_arrow_action(true, false, false, false, 0x7E),
-            Some(CtrlArrowAction::MissionControl)
-        );
-        assert_eq!(
-            ctrl_arrow_action(true, false, false, false, 0x7D),
-            Some(CtrlArrowAction::ApplicationWindows)
-        );
-        assert_eq!(
-            ctrl_arrow_action(true, false, false, false, 0x7B),
-            Some(CtrlArrowAction::PreviousSpace)
-        );
-        assert_eq!(
-            ctrl_arrow_action(true, false, false, false, 0x7C),
-            Some(CtrlArrowAction::NextSpace)
-        );
-
-        // No Ctrl, an extra modifier, or a non-arrow stays application-owned.
-        assert_eq!(ctrl_arrow_action(false, false, false, false, 0x7E), None);
-        assert_eq!(ctrl_arrow_action(true, true, false, false, 0x7E), None);
-        assert_eq!(ctrl_arrow_action(true, false, true, false, 0x7E), None);
-        assert_eq!(ctrl_arrow_action(true, false, false, true, 0x7E), None);
-        assert_eq!(ctrl_arrow_action(true, false, false, false, 0x00), None);
-
-        assert_eq!(
-            ctrl_arrow_system_events_keycode(CtrlArrowAction::MissionControl),
-            126
-        );
-        assert_eq!(
-            ctrl_arrow_system_events_keycode(CtrlArrowAction::ApplicationWindows),
-            125
-        );
-        assert_eq!(
-            ctrl_arrow_system_events_keycode(CtrlArrowAction::PreviousSpace),
-            123
-        );
-        assert_eq!(
-            ctrl_arrow_system_events_keycode(CtrlArrowAction::NextSpace),
-            124
-        );
     }
 
     #[test]
@@ -455,6 +611,52 @@ pub fn set_alt_backtick_switch(on: bool) {
     ALT_BACKTICK_SWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When true, Option+Space opens Spotlight like Cmd+Space, for macOS clients
+/// whose own OS takes Cmd+Space before the RDP client sees it. Opt-in via
+/// `--alt-space-spotlight`; off by default so Option+Space still types a
+/// non-breaking space.
+static ALT_SPACE_SPOTLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_alt_space_spotlight(on: bool) {
+    ALT_SPACE_SPOTLIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// When true, Option+Q (i.e. Alt+Q forwarded from the client) is delivered to
+/// the focused app as Cmd+Q, so a Windows client can quit Mac apps without the
+/// Windows key (which mstsc gates when windowed, and which the macOS Windows
+/// App forwards only as a tap). Opt-in via `--alt-q-quit`; off by default so
+/// Option+Q otherwise reaches remote apps as a normal key (it types `œ` on the
+/// US layout). Plain Option only — see `should_alt_q_quit`.
+static ALT_Q_QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_alt_q_quit(on: bool) {
+    ALT_Q_QUIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pure decision table for `--alt-q-quit`: should this Q key-down be posted
+/// as Cmd+Q? Only for a PLAIN Option — Shift is excluded because the result
+/// would be Cmd+Shift+Q (log out), and Cmd/Ctrl combos are left alone so
+/// they keep their own meaning. Unit-tested on every target.
+fn should_alt_q_quit(on: bool, opt: bool, cmd: bool, ctrl: bool, shift: bool) -> bool {
+    on && opt && !cmd && !ctrl && !shift
+}
+
+/// Drop the switcher's selected entry at `idx` (Q pressed in the switcher) and
+/// return the index the selection moves to: the entry that slid into `idx`,
+/// or the new last entry when the last one was removed (no wrap to the first
+/// app, like the native Cmd+Tab switcher). `None` once the list is empty. Pure, so it's unit-tested on
+/// every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn remove_switcher_selection<T>(items: &mut Vec<T>, idx: usize) -> Option<usize> {
+    items.remove(idx);
+    if items.is_empty() {
+        None
+    } else {
+        Some(idx.min(items.len() - 1))
+    }
+}
+
 /// When true, drive the `macrdphud` overlay helper so the remote client sees a
 /// visual app switcher during Cmd+Tab / Option+Tab. Opt-in via
 /// `--app-switcher-hud`; off by default. The switch itself works the same either
@@ -474,6 +676,44 @@ static MAP_CTRL_TO_CMD: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 
 pub fn set_map_ctrl_to_cmd(on: bool) {
     MAP_CTRL_TO_CMD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Shared per-SERVED-connection reset flag for held-modifier + button state.
+///
+/// Modifier state lives in `Inner`, which is constructed ONCE for the process,
+/// so a modifier whose key-up never arrived — the classic case being the client
+/// losing focus while Ctrl is held — used to persist across disconnect AND
+/// reconnect, clearing only on a server restart. That was survivable while mouse
+/// events ignored `mods`; now that clicks carry the modifier flags, a stuck Ctrl
+/// turns every left click into a secondary click, so it needs a way out. The
+/// MS-RDPBCGR Synchronize PDU can't provide one — it carries only lock keys
+/// (Caps/Num/Scroll/Kana), never Ctrl/Shift/Alt/Cmd — hence this out-of-band
+/// flag. The same reset also clears button-down tracking, which fixes a
+/// pre-existing hazard: a connection dropped between a left-down and its up
+/// left `left_down` stuck, so every move on the next connection posted as
+/// `LeftMouseDragged`.
+///
+/// **Who raises it matters.** `RdpServerInputHandler` has only
+/// `keyboard`/`mouse`, so the connection edge has to come from the server, and
+/// it is raised (vendored `ironrdp-server` divergence 24) once at the top of
+/// `run_connection` / `serve_negotiated` — the two places that each call
+/// `accept_finalize` exactly once, with reactivations looping *inside* it. Two
+/// tempting seams were rejected: the display `updates()` path (re-runs on every
+/// live resize and blank-recovery reactivation, so it would clear a held
+/// modifier — and, once button state is included, break a drag — with no user
+/// action), and `on_accept` (runs for preemption *candidates* while the live
+/// session is still being served, so a mere connection attempt could clear the
+/// live session's modifiers).
+static MODS_RESET_REQUEST: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+/// The shared reset flag. Hand a clone to the server via
+/// `RdpServer::set_input_reset_handle`; the input handler drains it on its next
+/// event. Idempotent — every call returns the same `Arc`.
+pub fn modifier_reset_handle() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    MODS_RESET_REQUEST
+        .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .clone()
 }
 
 /// Bundle ids whose frontmost focus suppresses the Ctrl→Cmd remap, in ADDITION to
@@ -513,11 +753,8 @@ mod macos {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
-    use super::{
-        ctrl_arrow_action, ctrl_arrow_system_events_keycode, is_remappable_shortcut,
-        CtrlArrowAction,
-    };
+    use super::is_remappable_shortcut;
+    use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode, to_iso_key_order};
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -528,7 +765,7 @@ mod macos {
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
     use ironrdp_pdu::input::fast_path::SynchronizeFlags;
-    use ironrdp_server::{KeyboardEvent, MouseEvent};
+    use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent};
     use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
     use tracing::{debug, trace, warn};
 
@@ -542,6 +779,9 @@ mod macos {
     const VK_CAPS_LOCK: u16 = 0x39;
     const VK_G: u16 = 0x05; // kVK_ANSI_G — the on-demand "gather windows" chord
     const VK_R: u16 = 0x0F; // kVK_ANSI_R — the on-demand "A/V resync" chord
+    const VK_Q: u16 = 0x0C; // kVK_ANSI_Q — Option+Q → Cmd+Q under --alt-q-quit
+    const VK_LEFT: u16 = 0x7B; // kVK_LeftArrow — step the app switcher backward while it's up
+    const VK_RIGHT: u16 = 0x7C; // kVK_RightArrow — step the app switcher forward while it's up
 
     // macOS virtual keycodes for the left/right halves of each modifier.
     // Used by ModifierState to track which physical key is held so we can
@@ -675,25 +915,6 @@ mod macos {
             CGEventFlags::from_bits_retain(bits)
         }
 
-        fn command_instead_of_control(&self) -> CGEventFlags {
-            let mut bits = self.cg_flags().bits();
-            bits &=
-                !(CGEventFlags::CGEventFlagControl.bits() | NX_DEVICE_L_CTRL | NX_DEVICE_R_CTRL);
-            bits |= CGEventFlags::CGEventFlagCommand.bits() | NX_DEVICE_L_CMD;
-            CGEventFlags::from_bits_retain(bits)
-        }
-
-        fn should_map_left_click(&self, enabled: bool) -> bool {
-            enabled && self.has_ctrl() && !self.has_cmd() && !self.has_alt() && !self.has_shift()
-        }
-
-        fn pointer_flags(&self, command_click: bool) -> CGEventFlags {
-            if command_click {
-                self.command_instead_of_control()
-            } else {
-                self.cg_flags()
-            }
-        }
         fn has_shift(&self) -> bool {
             self.l_shift || self.r_shift
         }
@@ -755,17 +976,44 @@ mod macos {
             *slot = down;
             true
         }
+
+        /// True if any held (non-lock) modifier is currently asserted.
+        fn any_held(&self) -> bool {
+            self.l_shift
+                || self.r_shift
+                || self.l_ctrl
+                || self.r_ctrl
+                || self.l_alt
+                || self.r_alt
+                || self.l_cmd
+                || self.r_cmd
+        }
+
+        /// Drop every held non-lock modifier; returns true if anything changed.
+        /// Caps Lock is deliberately preserved: it is a TOGGLE, not a held key,
+        /// it is the one modifier the Synchronize PDU actually reconciles, and
+        /// clearing it here would fight `synchronize()`.
+        fn clear_non_lock(&mut self) -> bool {
+            let had = self.any_held();
+            self.l_shift = false;
+            self.r_shift = false;
+            self.l_ctrl = false;
+            self.r_ctrl = false;
+            self.l_alt = false;
+            self.r_alt = false;
+            self.l_cmd = false;
+            self.r_cmd = false;
+            had
+        }
     }
 
     pub struct Inner {
         source: CGEventSource,
-        // Secondary source used *only* to mirror modifier FlagsChanged
-        // events. See `Inner::new` for why one source isn't enough.
+        // Source for modifier FlagsChanged events. See `Inner::new`.
         source_hid: CGEventSource,
         last_x: f64,
         last_y: f64,
         left_down: bool,
-        left_click_as_command: bool,
         right_down: bool,
         middle_down: bool,
         mods: ModifierState,
@@ -805,8 +1053,23 @@ mod macos {
         // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
         // Cmd swap + restores the real (Ctrl) modifier state.
         remapped_keys: HashSet<u16>,
-        // Ordinary virtual keycodes for which we actually posted a key-down.
         posted_keys: HashSet<u16>,
+        // Whether the Ctrl→Cmd swap was applied to the CURRENTLY-HELD left
+        // button, latched at button-down and reused for the drag and the up.
+        // The verdict must not be recomputed per event: the down itself fires
+        // `update_focus_from_click`, which refreshes the frontmost bundle
+        // off-thread, so Ctrl+clicking INTO an excluded app could otherwise
+        // post a Cmd-flagged down and a Ctrl-flagged up — a mismatched pair,
+        // on the very event that drives the context menu. Latching also keeps
+        // `frontmost_is_excluded()` off the per-motion drag path entirely.
+        left_click_remapped: bool,
+        // Monotonic ms of the previous input event, for the idle-gap modifier
+        // resync in `resync_modifiers_if_stale`. u64::MAX = no event yet.
+        last_event_ms: u64,
+        // The shared per-served-connection reset flag (see `modifier_reset_handle`
+        // at file scope). Cloned once here so draining it per event is a bare
+        // atomic swap, not an `Arc` clone.
+        reset_request: std::sync::Arc<std::sync::atomic::AtomicBool>,
         // Optional non-US keyboard layout. When set, ordinary typing keys are
         // translated to characters against this layout and posted as Unicode
         // strings instead of positional keycodes. `None` → keycode path only.
@@ -838,12 +1101,10 @@ mod macos {
             //   screenshot, Mission Control, Show Desktop) checks before
             //   firing. Cmd+Tab is the canonical case.
             //
-            // A flagsChanged event posted from one source does NOT update the
-            // other. So we maintain both: the session source is the canonical
-            // one used for every event, and `source_hid` exists solely to
-            // mirror modifier flagsChanged so symbolic hotkeys also see Cmd
-            // as held. Without the mirror, Cmd+Tab is a no-op; with it, both
-            // classes of shortcut work.
+            // The session source is used for every key event; modifier
+            // flagsChanged go through `source_hid` only, because HID state
+            // feeds the combined session state and symbolic hotkeys need it.
+            // Without it, Cmd+Tab is a no-op.
             let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
                 .map_err(|_| anyhow!("CGEventSource::new(CombinedSessionState) failed"))?;
             let source_hid = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -877,7 +1138,6 @@ mod macos {
                 last_x: 0.0,
                 last_y: 0.0,
                 left_down: false,
-                left_click_as_command: false,
                 right_down: false,
                 middle_down: false,
                 mods: ModifierState::default(),
@@ -892,6 +1152,9 @@ mod macos {
                 consumed_keys: HashSet::new(),
                 remapped_keys: HashSet::new(),
                 posted_keys: HashSet::new(),
+                left_click_remapped: false,
+                last_event_ms: u64::MAX,
+                reset_request: super::modifier_reset_handle(),
                 layout,
                 klid_handle,
                 last_klid: 0,
@@ -930,6 +1193,7 @@ mod macos {
 
         pub fn keyboard(&mut self, event: KeyboardEvent) {
             mark_input_activity();
+            self.resync_modifiers_if_stale();
             match event {
                 KeyboardEvent::Pressed { code, extended } => self.key(code, extended, true),
                 KeyboardEvent::Released { code, extended } => self.key(code, extended, false),
@@ -956,6 +1220,119 @@ mod macos {
                 );
                 self.mods.caps_lock = want_caps;
                 self.post_flags_changed(VK_CAPS_LOCK);
+            }
+        }
+
+        /// Drop stale per-connection input state before processing an event.
+        ///
+        /// Both triggers exist because a modifier key-up that never arrived
+        /// leaves `mods` asserting a key the user is not holding, and once
+        /// clicks carry the modifier flags a stuck Ctrl turns every left click
+        /// into a secondary click. Nothing in the protocol reconciles a held
+        /// modifier (Synchronize carries lock keys only). But the two triggers
+        /// clear DIFFERENT amounts, deliberately:
+        ///
+        ///  * **A new served connection** (`reset_request`, raised by the
+        ///    vendored server once at the top of `run_connection` /
+        ///    `serve_negotiated` — never on a reactivation, never for a
+        ///    preemption candidate) — clears EVERYTHING, unconditionally:
+        ///    modifiers, the click latch, outstanding remapped key-downs, and
+        ///    any button still down — which is RELEASED (a synthetic Up through
+        ///    `button()`), not merely forgotten, since macOS itself still
+        ///    believes it held. Nothing from the previous connection is live,
+        ///    so none of it is worth preserving — and the button release in
+        ///    particular fixes a pre-existing hazard: a drop between a left-down
+        ///    and its up left `left_down` stuck, so every move on the next
+        ///    connection posted as `LeftMouseDragged` (a phantom drag) until the
+        ///    user next clicked. This is also why the clears are NOT gated on
+        ///    "a modifier was held": a connection can end with the modifier
+        ///    already released but a remapped key-up or the left-up still
+        ///    outstanding, and that state must not leak into the next one.
+        ///
+        ///  * **An idle gap** of `mods_resync_idle_ms()` — covers the common
+        ///    case with no disconnect at all (the client loses focus mid-session,
+        ///    the modifier is released where we cannot see it) — clears
+        ///    modifiers ONLY. A click or drag in progress inside a live
+        ///    connection is legitimate state: a drag held still sends no events,
+        ///    so clearing button state here would drop it; and clearing the
+        ///    latch here would undo the down/up consistency fix (Ctrl+down,
+        ///    release Ctrl, hold still past the threshold, release → the up must
+        ///    still post with the Cmd the down carried).
+        ///
+        /// The idle gap is deliberately generous, and the cost asymmetry is the
+        /// point: a false clear costs one keystroke (re-press the modifier), a
+        /// missed one costs every click until the server restarts. Any event — a
+        /// mouse move included — refreshes the timer, so the only false-positive
+        /// shape is a genuine multi-second hold with zero input in between.
+        fn resync_modifiers_if_stale(&mut self) {
+            let now = monotonic_ms();
+            let idle_ms = mods_resync_idle_ms();
+            let idled = self.last_event_ms != u64::MAX
+                && idle_ms > 0
+                && now.saturating_sub(self.last_event_ms) >= idle_ms;
+            self.last_event_ms = now;
+            let reconnected = self
+                .reset_request
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            if !(idled || reconnected) {
+                return;
+            }
+
+            let plan = super::resync_plan(
+                reconnected,
+                [self.left_down, self.right_down, self.middle_down],
+                self.mods.any_held(),
+            );
+
+            // Connection edge: release any button macOS still believes is
+            // held — we posted the Down, the connection died before the Up.
+            // Go through `button()` so the Up carries the same (latched)
+            // flags the Down did and the click bookkeeping stays paired,
+            // and do it BEFORE clearing modifiers so the pair can't
+            // disagree. This also zeroes `left_down`/`right_down`/
+            // `middle_down`, so the next move posts as MouseMoved, not a
+            // phantom `LeftMouseDragged`.
+            let [rel_left, rel_right, rel_middle] = plan.release_buttons;
+            if rel_left {
+                self.button(CGMouseButton::Left, false);
+            }
+            if rel_right {
+                self.button(CGMouseButton::Right, false);
+            }
+            if rel_middle {
+                self.button(CGMouseButton::Center, false);
+            }
+
+            // Snapshot first so the log shows WHAT was stuck.
+            let stuck = self.mods.cg_flags().bits();
+            self.mods.clear_non_lock();
+
+            if plan.clear_gesture_state {
+                // Drop the remaining per-gesture state regardless of whether a
+                // modifier was held (see the doc): an outstanding remapped
+                // key-down or a latch left by a Down whose Up never came.
+                self.remapped_keys.clear();
+                self.left_click_remapped = false;
+            }
+
+            // Only bother macOS when a modifier was actually released: our
+            // earlier FlagsChanged left the session state asserting it, and
+            // macOS derives press-vs-release from the flags diff, so one event
+            // carrying the now-empty set releases all of them.
+            if plan.post_flags_changed {
+                debug!(
+                    reason = if reconnected {
+                        "new connection"
+                    } else {
+                        "idle gap"
+                    },
+                    stuck_flags = format!("0x{stuck:08X}"),
+                    "clearing stale held modifiers"
+                );
+                self.post_flags_changed(VK_LCMD);
+                // The modifier that held an open Cmd+Tab or Option+Tab switcher is gone, so close it.
+                CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                commit_cycle_session();
             }
         }
 
@@ -1042,14 +1419,20 @@ mod macos {
         }
 
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
-            let Some(vk) = scancode_to_cgkeycode(scancode, extended) else {
+            let Some(mut vk) = scancode_to_cgkeycode(scancode, extended) else {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };
             self.refresh_auto_layout();
+            // Every Apple layout except the US-style ones is drawn for ISO key order.
+            if let (Some(iso_vk), Some(layout)) = (to_iso_key_order(vk), self.layout.as_mut()) {
+                if !layout.grave_types_backtick() {
+                    vk = iso_vk;
+                }
+            }
 
-            // Modifier path: update per-side state and emit FlagsChanged
-            // mirrored to both sources. We do this BEFORE any of the
+            // Modifier path: update per-side state and emit FlagsChanged.
+            // We do this BEFORE any of the
             // symbolic-hotkey logic so the held-modifier check in
             // try_symbolic_hotkey sees the just-pressed modifier.
             if ModifierState::is_modifier_vk(vk) {
@@ -1209,32 +1592,69 @@ mod macos {
             }
         }
 
-        /// Emit a FlagsChanged event for `vk` from both sources. We send
-        /// the same event twice so two different parts of macOS see the
-        /// modifier as held:
-        ///   - CombinedSessionState backs `[NSEvent modifierFlags]` —
-        ///     what Cocoa apps query for Cmd+C / Cmd+Q / Cmd+~.
-        ///   - HIDSystemState backs the modifier view that WindowServer's
-        ///     symbolic-hotkey dispatcher (Dock, Spotlight, screencapture,
-        ///     Mission Control, Show Desktop) checks before firing.
-        ///
-        /// A FlagsChanged posted from one source does NOT update the other,
-        /// so without the mirror you get either app shortcuts or symbolic
-        /// hotkeys but not both.
+        /// Emit one FlagsChanged event for `vk` from the HID source. The
+        /// HIDSystemState feeds the CombinedSessionState, so a single post
+        /// updates both the symbolic-hotkey view and `[NSEvent modifierFlags]`.
+        /// Posting it from both sources delivered every modifier change to
+        /// apps twice, and double-tap shortcuts (VS Code's `shift shift`)
+        /// fired on a single press.
         fn post_flags_changed(&self, vk: u16) {
-            let flags = self.mods.cg_flags();
-            for source in [&self.source, &self.source_hid] {
-                // `down` parameter is ignored for FlagsChanged: macOS
-                // derives press-vs-release purely from the diff between
-                // the prior flags state and the new flags carried on the
-                // event. We pass `true` for shape only.
-                let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), vk, true) else {
-                    warn!(vk, "CGEvent::new_keyboard_event failed (modifier)");
-                    continue;
-                };
-                ev.set_flags(flags);
-                ev.set_type(CGEventType::FlagsChanged);
-                ev.post(CGEventTapLocation::HID);
+            // `down` parameter is ignored for FlagsChanged: macOS derives
+            // press-vs-release purely from the diff between the prior flags
+            // state and the new flags carried on the event.
+            let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), vk, true) else {
+                warn!(vk, "CGEvent::new_keyboard_event failed (modifier)");
+                return;
+            };
+            ev.set_flags(self.mods.cg_flags());
+            ev.set_type(CGEventType::FlagsChanged);
+            ev.post(CGEventTapLocation::HID);
+        }
+
+        /// Swap Control→Command in both the public CGEventFlag bits and the
+        /// device-dependent NX bits, leaving every other modifier intact.
+        /// Shared by the keyboard remap (`post_ctrl_as_cmd`) and the mouse
+        /// remap (`mouse_flags`, when the latched click verdict is set).
+        fn ctrl_to_cmd_flags(&self) -> CGEventFlags {
+            let mut bits = self.mods.cg_flags().bits();
+            bits &= !CGEventFlags::CGEventFlagControl.bits();
+            bits &= !(NX_DEVICE_L_CTRL | NX_DEVICE_R_CTRL);
+            bits |= CGEventFlags::CGEventFlagCommand.bits();
+            bits |= NX_DEVICE_L_CMD;
+            CGEventFlags::from_bits_retain(bits)
+        }
+
+        /// Whether the Ctrl→Cmd swap applies to a left click being pressed
+        /// right now — the mouse analogue of the keyboard remap, so a
+        /// Windows-style Ctrl+click behaves like a macOS Cmd+click (open a link
+        /// in a new tab) instead of a secondary/context click. The decision
+        /// table itself is the pure `should_remap_click`; this gathers its
+        /// inputs. Evaluated at button-down ONLY and latched (see
+        /// `left_click_remapped`), never on the drag or the up.
+        ///
+        /// Two-step on purpose: the cheap flag checks go through the table
+        /// first, and only if they agree do we pay for `frontmost_is_excluded()`
+        /// (two mutexes, a per-candidate `format!`, and — before the first click
+        /// of a session, while `LAST_FOCUS_BUNDLE` is still `None` — a
+        /// synchronous AX round-trip on the input thread).
+        fn click_remap_active(&self) -> bool {
+            let cheap_gate_open = super::should_remap_click(
+                super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed),
+                self.mods.has_ctrl(),
+                self.mods.has_cmd(),
+                self.mods.has_alt(),
+                false, // assume not excluded; the real check is the step below
+            );
+            cheap_gate_open && !frontmost_is_excluded()
+        }
+
+        /// Flags to stamp on a mouse event: the live held-modifier state, with
+        /// Control swapped for Command when `remapped` (the latched verdict).
+        fn mouse_flags(&self, remapped: bool) -> CGEventFlags {
+            if remapped {
+                self.ctrl_to_cmd_flags()
+            } else {
+                self.mods.cg_flags()
             }
         }
 
@@ -1247,19 +1667,16 @@ mod macos {
         /// `self.mods` already reflects it). Shift/Caps in `self.mods` carry
         /// through unchanged, so `Ctrl+Shift+Z` → `Cmd+Shift+Z` (redo) works.
         fn post_ctrl_as_cmd(&self, vk: u16, down: bool) {
-            // Swap Control→Command in both the public CGEventFlag bits and the
-            // device-dependent NX bits, leaving every other modifier intact.
-            let swapped = self.mods.command_instead_of_control();
+            let swapped = self.ctrl_to_cmd_flags();
 
             if down {
-                for source in [&self.source, &self.source_hid] {
-                    let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), VK_LCMD, true) else {
-                        warn!("CGEvent::new_keyboard_event failed (ctrl→cmd flags)");
-                        continue;
-                    };
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), VK_LCMD, true)
+                {
                     ev.set_flags(swapped);
                     ev.set_type(CGEventType::FlagsChanged);
                     ev.post(CGEventTapLocation::HID);
+                } else {
+                    warn!("CGEvent::new_keyboard_event failed (ctrl→cmd flags)");
                 }
             }
             if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) {
@@ -1274,6 +1691,38 @@ mod macos {
             }
         }
 
+        /// Post a full `Cmd+<vk>` tap in place of the held `Option+<vk>`
+        /// (--alt-q-quit). Same shape as `post_ctrl_as_cmd`, but the down and
+        /// up go out together: present Cmd-held (Option cleared) with one
+        /// FlagsChanged from the HID source, tap the key with those flags, then
+        /// restore the real state (Option still physically held) via
+        /// `post_flags_changed`.
+        fn post_alt_as_cmd_tap(&self, vk: u16) {
+            let mut bits = self.mods.cg_flags().bits();
+            bits &= !CGEventFlags::CGEventFlagAlternate.bits();
+            bits &= !(NX_DEVICE_L_ALT | NX_DEVICE_R_ALT);
+            bits |= CGEventFlags::CGEventFlagCommand.bits();
+            bits |= NX_DEVICE_L_CMD;
+            let swapped = CGEventFlags::from_bits_retain(bits);
+
+            if let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), VK_LCMD, true) {
+                ev.set_flags(swapped);
+                ev.set_type(CGEventType::FlagsChanged);
+                ev.post(CGEventTapLocation::HID);
+            } else {
+                warn!("CGEvent::new_keyboard_event failed (alt→cmd flags)");
+            }
+            for down in [true, false] {
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) {
+                    ev.set_flags(swapped);
+                    ev.post(CGEventTapLocation::HID);
+                } else {
+                    warn!(vk, down, "CGEvent::new_keyboard_event failed (alt→cmd key)");
+                }
+            }
+            self.post_flags_changed(VK_LCMD);
+        }
+
         /// Match the current modifier state + non-modifier vk against the
         /// set of symbolic hotkeys we re-implement. Returns true if we
         /// handled it (and the caller should suppress the keystroke).
@@ -1283,19 +1732,6 @@ mod macos {
             let shift = f.contains(CGEventFlags::CGEventFlagShift);
             let ctrl = f.contains(CGEventFlags::CGEventFlagControl);
             let opt = f.contains(CGEventFlags::CGEventFlagAlternate);
-
-            // Plain Ctrl+Arrow is the default macOS Mission Control family:
-            // Up = overview, Down = application windows, Left/Right = adjacent
-            // Space. WindowServer does not dispatch those symbolic shortcuts
-            // for our synthetic CGEvents, so invoke their system equivalents.
-            // Suppress key-repeat after the first down: the overview actions
-            // toggle, so repeating would immediately close/reopen them.
-            if let Some(action) = ctrl_arrow_action(ctrl, shift, opt, cmd, vk) {
-                if !self.consumed_keys.contains(&vk) {
-                    invoke_ctrl_arrow(action);
-                }
-                return true;
-            }
 
             // Ctrl+Option+G: on-demand "gather windows" — sweep any window stranded
             // off the session display (e.g. an app opened on the now-blanked
@@ -1333,10 +1769,10 @@ mod macos {
             // (a brief gap lets the client's audio backlog drain, the same
             // principle as a minimize→unminimize resync). From a Windows client
             // this is Ctrl+Alt+Shift+R — Win-key-free so mstsc forwards it, and
-            // not a system shortcut on either OS. Wake video even while the
-            // desktop is static; audio handles its flag on the next poll.
+            // not a system shortcut on either OS. Cheap atomic stores, so no
+            // off-thread hop needed; the consumers act on their next poll.
             if ctrl && opt && shift && !cmd && vk == VK_R {
-                crate::RESYNC_VIDEO.notify_one();
+                crate::RESYNC_VIDEO.store(true, std::sync::atomic::Ordering::Relaxed);
                 crate::RESYNC_AUDIO.store(true, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(
                     "on-demand A/V resync hotkey (Ctrl+Option+Shift+R) — refreshing video (IDR) + rebuilding audio"
@@ -1369,6 +1805,61 @@ mod macos {
                 && vk == VK_GRAVE
             {
                 ax_cycle_windows_of_front(shift);
+                return true;
+            }
+
+            if super::ALT_SPACE_SPOTLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+                && opt
+                && !cmd
+                && !ctrl
+                && !shift
+                && vk == VK_SPACE
+            {
+                invoke_spotlight();
+                return true;
+            }
+
+            // Q while the switcher is up (Cmd+Tab, or Option+Tab with
+            // --alt-tab-switch, still held): quit the HIGHLIGHTED app, as the
+            // native switcher does. Checked before the Option+Q → Cmd+Q rule
+            // below, which would hit the frontmost app instead. Needs no flag:
+            // a session only exists while the switcher's modifier is held.
+            if (cmd || opt) && !ctrl && vk == VK_Q && quit_cycle_selection() {
+                return true;
+            }
+
+            // Opt+Q → Cmd+Q (opt-in via --alt-q-quit): quit the focused app
+            // from a Windows client without the Windows key. The whole tap is
+            // posted here on key-down; the caller swallows the matching key-up
+            // via `consumed_keys`.
+            if vk == VK_Q
+                && super::should_alt_q_quit(
+                    super::ALT_Q_QUIT.load(std::sync::atomic::Ordering::Relaxed),
+                    opt,
+                    cmd,
+                    ctrl,
+                    shift,
+                )
+            {
+                self.post_alt_as_cmd_tap(VK_Q);
+                tracing::debug!("Option+Q → Cmd+Q (--alt-q-quit)");
+                return true;
+            }
+
+            // Left/Right arrows step an ACTIVE app-switcher cycle, matching
+            // native Cmd+Tab (hold the switcher, arrow to move the selection).
+            // Gated on a live cycle session so bare arrows reach the focused app
+            // the rest of the time; that session only exists while the switcher
+            // modifier is held (Cmd, or Option with --alt-tab-switch), and the
+            // extra cmd||opt guard keeps a stray arrow from a lingering
+            // grace-window session from being swallowed. Right = forward (next in
+            // the row), Left = backward (previous). Reuses cycle_apps, so it
+            // continues the frozen snapshot and drives the HUD's ADVANCE exactly
+            // like a Tab tap. Placed before the `!cmd` gate below because an
+            // Option+Tab session holds Option, not Cmd.
+            if (cmd || opt) && !ctrl && (vk == VK_LEFT || vk == VK_RIGHT) && cycle_session_active()
+            {
+                cycle_apps(vk == VK_LEFT);
                 return true;
             }
 
@@ -1450,23 +1941,46 @@ mod macos {
             letterbox: bool,
         ) {
             mark_input_activity();
+            self.resync_modifiers_if_stale();
             match event {
                 MouseEvent::Move { x, y } => self.move_to(x, y, desktop_w, desktop_h, letterbox),
-                MouseEvent::LeftPressed => self.button(CGMouseButton::Left, true),
-                MouseEvent::LeftReleased => self.button(CGMouseButton::Left, false),
-                MouseEvent::RightPressed => self.button(CGMouseButton::Right, true),
-                MouseEvent::RightReleased => self.button(CGMouseButton::Right, false),
-                MouseEvent::MiddlePressed => self.button(CGMouseButton::Center, true),
-                MouseEvent::MiddleReleased => self.button(CGMouseButton::Center, false),
-                MouseEvent::VerticalScroll { value } => self.scroll(i32::from(value), 0),
-                MouseEvent::Scroll { x, y } => self.scroll(y, x),
-                MouseEvent::Button4Pressed
-                | MouseEvent::Button4Released
-                | MouseEvent::Button5Pressed
-                | MouseEvent::Button5Released => {
-                    trace!(?event, "extra mouse buttons not implemented");
+                // A button event carries the pointer position: apply it first, or a
+                // client that sends a tap as a lone button PDU (the iOS Windows App
+                // in touch mode) clicks wherever the cursor last was.
+                MouseEvent::Button {
+                    x,
+                    y,
+                    button,
+                    pressed,
+                } => {
+                    self.move_to(x, y, desktop_w, desktop_h, letterbox);
+                    self.mouse_button(button, pressed);
                 }
+                MouseEvent::ButtonRel {
+                    x,
+                    y,
+                    button,
+                    pressed,
+                } => {
+                    self.move_rel(x, y);
+                    self.mouse_button(button, pressed);
+                }
+                MouseEvent::VerticalScroll { value } => self.scroll(i32::from(value), 0),
+                // RDP's horizontal wheel is positive to the right; macOS's
+                // horizontal scroll delta is positive to the left.
+                MouseEvent::HorizontalScroll { value } => self.scroll(0, -i32::from(value)),
+                MouseEvent::Scroll { x, y } => self.scroll(y, x),
                 MouseEvent::RelMove { x, y } => self.move_rel(x, y),
+                _ => trace!(?event, "mouse event not implemented"),
+            }
+        }
+
+        fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
+            match button {
+                MouseButton::Left => self.button(CGMouseButton::Left, pressed),
+                MouseButton::Right => self.button(CGMouseButton::Right, pressed),
+                MouseButton::Middle => self.button(CGMouseButton::Center, pressed),
+                _ => trace!(?button, pressed, "extra mouse buttons not implemented"),
             }
         }
 
@@ -1506,26 +2020,36 @@ mod macos {
             self.last_x = sx;
             self.last_y = sy;
 
-            let (etype, button, command_click) = if self.left_down {
-                (
-                    CGEventType::LeftMouseDragged,
-                    CGMouseButton::Left,
-                    self.left_click_as_command,
-                )
+            let etype = if self.left_down {
+                CGEventType::LeftMouseDragged
             } else if self.right_down {
-                (CGEventType::RightMouseDragged, CGMouseButton::Right, false)
+                CGEventType::RightMouseDragged
             } else if self.middle_down {
-                (CGEventType::OtherMouseDragged, CGMouseButton::Center, false)
+                CGEventType::OtherMouseDragged
             } else {
-                (CGEventType::MouseMoved, CGMouseButton::Left, false)
+                CGEventType::MouseMoved
+            };
+            let button = if self.middle_down {
+                CGMouseButton::Center
+            } else if self.right_down {
+                CGMouseButton::Right
+            } else {
+                CGMouseButton::Left
             };
             let Ok(ev) =
                 CGEvent::new_mouse_event(self.source.clone(), etype, CGPoint::new(sx, sy), button)
             else {
                 return;
             };
-            ev.set_flags(self.mods.pointer_flags(command_click));
-            ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button as i64);
+            // Carry the held-modifier state onto the move/drag, just as the
+            // keyboard path does — so a Cmd/Shift/Alt+drag reads correctly
+            // (e.g. Shift-drag to extend a selection). Without this the event
+            // is delivered with empty modifierFlags regardless of what's held.
+            // During a left drag reuse the Ctrl→Cmd verdict LATCHED at
+            // button-down, so the whole gesture posts one consistent modifier
+            // set — and so this path, which fires hundreds of times a second,
+            // never evaluates the frontmost-app check itself.
+            ev.set_flags(self.mouse_flags(self.left_down && self.left_click_remapped));
             ev.post(CGEventTapLocation::HID);
         }
 
@@ -1537,22 +2061,6 @@ mod macos {
                 (CGMouseButton::Right, false) => CGEventType::RightMouseUp,
                 (CGMouseButton::Center, true) => CGEventType::OtherMouseDown,
                 (CGMouseButton::Center, false) => CGEventType::OtherMouseUp,
-            };
-            // Decide at the initial left-down so modifier release mid-drag
-            // cannot turn the paired up event into a different gesture.
-            let command_click = if matches!(button, CGMouseButton::Left) {
-                if down && !self.left_down {
-                    self.left_click_as_command = self.mods.should_map_left_click(
-                        super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed),
-                    );
-                }
-                let mapped = self.left_click_as_command;
-                if !down {
-                    self.left_click_as_command = false;
-                }
-                mapped
-            } else {
-                false
             };
             match button {
                 CGMouseButton::Left => self.left_down = down,
@@ -1592,6 +2100,22 @@ mod macos {
                 state_slot.map(|s| s.count).unwrap_or(1)
             };
 
+            // Ctrl→Cmd verdict for this click. Decided ONCE, at left-button-down,
+            // and latched for the matching up (and any drag in between) so the
+            // pair can never disagree — see `left_click_remapped`. LEFT BUTTON
+            // ONLY: the promise is that a Windows-style Ctrl+click opens a link
+            // in a new tab; turning a Ctrl+right-click into a Cmd+right-click was
+            // never intended, so right/middle carry the real held modifiers.
+            let remapped = match (button, down) {
+                (CGMouseButton::Left, true) => {
+                    let verdict = self.click_remap_active();
+                    self.left_click_remapped = verdict;
+                    verdict
+                }
+                (CGMouseButton::Left, false) => std::mem::take(&mut self.left_click_remapped),
+                _ => false,
+            };
+
             let Ok(ev) = CGEvent::new_mouse_event(
                 self.source.clone(),
                 etype,
@@ -1601,28 +2125,60 @@ mod macos {
                 warn!("CGEvent mouse button create failed");
                 return;
             };
-            ev.set_flags(self.mods.pointer_flags(command_click));
-            ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button as i64);
             ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_count);
+            // Attach the currently-held modifier state to the click. macOS does
+            // NOT fold the session's modifier flags into a synthesized mouse
+            // event on its own, so without this a click while Cmd/Shift/Ctrl/Alt
+            // is held arrives with empty modifierFlags — Cmd+click doesn't open a
+            // link in a new tab, Shift+click doesn't range-select, and Ctrl+click
+            // isn't a secondary click. Mirrors the keyboard path (`key()`), which
+            // set_flags for exactly this reason. With --map-ctrl-to-cmd on and
+            // `remapped` latched above, a plain Ctrl is delivered as Cmd so a
+            // Windows-style Ctrl+click opens a link in a new tab (Cmd+click)
+            // rather than firing a secondary/context click.
+            ev.set_flags(self.mouse_flags(remapped));
             ev.post(CGEventTapLocation::HID);
 
             // On a button-down, record which app's window is under the cursor so
             // the Ctrl→Cmd suppression knows the real focus target — the only way
             // to catch an Electron app (VSCode) clicked into in a headless session,
-            // which takes key focus without activating. Gated to when the remap is
-            // on (the only consumer); the hit-test runs off-thread, best-effort.
-            if down && super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed) {
-                update_focus_from_click(self.last_x, self.last_y);
+            // which takes key focus without activating. Also feeds the app
+            // switcher's MRU (so Alt+Tab after a click-switch returns to the
+            // previous app) — but only for a click that ACTIVATES the app it
+            // lands on: a plain left click. Right/middle clicks, Cmd+click on a
+            // background window and Ctrl+click (a secondary click, or a
+            // remapped Cmd+click) leave the current app in front. The hit-test
+            // runs off-thread, best-effort; only on button-down.
+            let activating_click = super::is_activating_click(
+                matches!(button, CGMouseButton::Left),
+                self.mods.has_cmd(),
+                self.mods.has_ctrl(),
+            );
+            let remap_on = super::MAP_CTRL_TO_CMD.load(std::sync::atomic::Ordering::Relaxed);
+            if down && (activating_click || remap_on) {
+                update_focus_from_click(self.last_x, self.last_y, activating_click);
             }
         }
 
         fn scroll(&mut self, vertical: i32, horizontal: i32) {
-            // Keep high-resolution wheel fragments on each axis without
-            // carrying a burst's excess lines into a later gesture.
-            let (v, v_remainder) = super::scroll_lines(self.scroll_v_accum, vertical);
-            let (h, h_remainder) = super::scroll_lines(self.scroll_h_accum, horizontal);
-            self.scroll_v_accum = v_remainder;
-            self.scroll_h_accum = h_remainder;
+            // RDP wheel rotation units are 120 per "tick", but this client
+            // slices a single gesture into many small legacy MOUSE PDU
+            // events (observed raw magnitude ~2-40 per event, not one
+            // 120-per-notch value). A flat per-event division
+            // truncates almost every one of those to zero — scroll never
+            // moves at all. Accumulate the raw delta across calls instead,
+            // and only emit whole lines once the running total crosses
+            // SCROLL_UNITS_PER_LINE (see `scroll_lines`).
+            //
+            // `--reverse-scroll` flips the direction first, so the
+            // accumulator only ever sees the direction actually posted.
+            let reverse = super::REVERSE_SCROLL.load(std::sync::atomic::Ordering::Relaxed);
+            let vertical = super::wheel_delta(vertical, reverse);
+            let horizontal = super::wheel_delta(horizontal, reverse);
+            let (v, v_accum) = super::scroll_lines(self.scroll_v_accum, vertical);
+            let (h, h_accum) = super::scroll_lines(self.scroll_h_accum, horizontal);
+            self.scroll_v_accum = v_accum;
+            self.scroll_h_accum = h_accum;
             if v == 0 && h == 0 {
                 return;
             }
@@ -1631,6 +2187,12 @@ mod macos {
             else {
                 return;
             };
+            // Carry the held modifiers so Shift+scroll (horizontal in most apps)
+            // and Cmd+scroll (zoom) work, same as clicks and drags. Deliberately
+            // NO Ctrl→Cmd swap here: the remap's promise is scoped to the
+            // primary button, and Ctrl+scroll is macOS's own screen-zoom
+            // accessibility gesture — silently rewriting it to Cmd+scroll would
+            // hijack a system binding.
             ev.set_flags(self.mods.cg_flags());
             ev.post(CGEventTapLocation::HID);
         }
@@ -1677,6 +2239,127 @@ mod macos {
         guard.insert(0, bundle.to_string());
     }
 
+    /// The app the user is in right now, as far as the app switcher knows —
+    /// last-wins across EVERY focus signal: our own switcher commits, the AX
+    /// focus poller, the NSWorkspace activation observer, and the click
+    /// hit-test. A fresh Cmd/Alt+Tab session starts from this app (when it's a
+    /// live regular app), so the first Tab lands on the app used before it —
+    /// even when the user got here by clicking, the Dock, or anything other
+    /// than the switcher. Without it the session fell back to
+    /// `effective_front_pid`, which under the headless modes keeps returning
+    /// the last app WE activated (NSWorkspace stops tracking), so switching by
+    /// click and then Alt+Tab "switched" to the app you were already in.
+    static SWITCHER_FRONT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// Live pid of the `SWITCHER_FRONT` app, for callers that need "the app
+    /// the user is in" outside a switcher session (Cmd+`). Prefers the
+    /// instance AX reports as focused, then the MRU-pinned instance, then the
+    /// first running one. None if unknown or no longer running.
+    fn switcher_front_pid() -> Option<libc::pid_t> {
+        let bundle = SWITCHER_FRONT.lock().ok().and_then(|g| g.clone())?;
+        let alive = |p: libc::pid_t| unsafe { libc::kill(p, 0) == 0 };
+        let is_bundle =
+            |p: libc::pid_t| alive(p) && bundle_identifier_for_pid(p).as_deref() == Some(&bundle);
+        if let Some(p) = ax_focused_application_pid().filter(|p| is_bundle(*p)) {
+            return Some(p);
+        }
+        let pinned = mru_map().lock().ok().and_then(|g| g.get(&bundle).copied());
+        if let Some(p) = pinned.filter(|p| is_bundle(*p)) {
+            return Some(p);
+        }
+        pid_for_bundle(&bundle)
+    }
+
+    /// The AX focused-app pid the focus poller last observed (0 = none yet).
+    /// The poller has already OFFERED every change it saw to `SWITCHER_FRONT`
+    /// (it may have been declined: mid-cycle, inside the post-commit settle
+    /// window, or a non-regular app), so a live AX read that DIFFERS from this
+    /// is a change nothing has considered yet — the case Cmd+` trusts AX for.
+    static AX_POLLER_LAST_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// Which source names the app Cmd+` should act on. The live AX focus is
+    /// trusted when it has changed since the poller last saw it (an unseen,
+    /// newer change); otherwise `SWITCHER_FRONT` wins, because it already
+    /// includes that AX observation plus clicks/commits AX can miss — in the
+    /// headless modes AX was observed still naming the last app the switcher
+    /// activated after a click into another app. Pure (unit-tested).
+    fn pick_front_for_window_cycle(
+        live_ax: Option<libc::pid_t>,
+        ax_is_regular_app: bool,
+        poller_last_seen: libc::pid_t,
+        switcher_front: Option<libc::pid_t>,
+    ) -> Option<libc::pid_t> {
+        match live_ax {
+            Some(ax) if ax_is_regular_app && ax != poller_last_seen => Some(ax),
+            _ => switcher_front.or(live_ax),
+        }
+    }
+
+    /// Bundle + time of the last switcher commit. Activation notifications for
+    /// apps merely cycled THROUGH are delivered asynchronously and can land
+    /// just after Cmd/Alt release; within this window only the landed app is
+    /// accepted from the non-user-driven feeders.
+    static LAST_COMMIT: std::sync::Mutex<Option<(Instant, String)>> = std::sync::Mutex::new(None);
+    const POST_COMMIT_SETTLE: Duration = Duration::from_millis(750);
+
+    /// Should a focus report for `bundle` be accepted as the user's current
+    /// app? Pure decision table for `note_focus_change` (unit-tested).
+    fn accept_focus_report(
+        cycle_active: bool,
+        user_driven: bool,
+        bundle: &str,
+        last_commit: Option<(Duration, &str)>,
+    ) -> bool {
+        if cycle_active || bundle.is_empty() || bundle == "<no-bundle-id>" {
+            return false;
+        }
+        match last_commit {
+            Some((since, committed)) if !user_driven && since < POST_COMMIT_SETTLE => {
+                bundle == committed
+            }
+            _ => true,
+        }
+    }
+
+    /// Record an observed focus change (not one we caused mid-cycle) into the
+    /// switcher's MRU and `SWITCHER_FRONT`. `user_driven` = a click hit-test,
+    /// which is direct evidence and bypasses the post-commit settle window.
+    fn note_focus_change(bundle: &str, user_driven: bool) {
+        let cycle_active = CYCLE_SESSION.lock().is_ok_and(|g| g.is_some());
+        let commit = LAST_COMMIT.lock().ok().and_then(|g| g.clone());
+        let accepted = accept_focus_report(
+            cycle_active,
+            user_driven,
+            bundle,
+            commit.as_ref().map(|(t, b)| (t.elapsed(), b.as_str())),
+        );
+        if !accepted {
+            return;
+        }
+        promote_bundle_to_front(bundle);
+        if let Ok(mut g) = SWITCHER_FRONT.lock() {
+            *g = Some(bundle.to_string());
+        }
+    }
+
+    /// Bundle id for a focus report about `pid`, or None when the pid is a
+    /// real NON-regular app (Dock, SystemUIServer, Control Center…) — those
+    /// take clicks but aren't switcher targets, and recording them would mask
+    /// the real front app. Helper processes (no bundle id of their own, e.g.
+    /// Electron renderers) resolve to their owning app.
+    fn switcher_bundle_for_pid(pid: libc::pid_t) -> Option<String> {
+        let own = unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) };
+        if let Some(app) = own {
+            let has_bundle = unsafe { app.bundleIdentifier() }.is_some_and(|b| !b.is_empty());
+            let regular =
+                unsafe { app.activationPolicy() } == NSApplicationActivationPolicy::Regular;
+            if has_bundle && !regular {
+                return None;
+            }
+        }
+        bundle_identifier_for_pid(pid).filter(|b| !b.is_empty())
+    }
+
     /// Active Cmd+Tab session. `snapshot` is the MRU-ordered candidate
     /// list frozen at session start; `cursor_pid` advances through it
     /// as the user holds Cmd and taps Tab. The snapshot does NOT
@@ -1707,6 +2390,90 @@ mod macos {
     }
 
     static CYCLE_SESSION: std::sync::Mutex<Option<CycleSession>> = std::sync::Mutex::new(None);
+
+    /// True while an app-switcher cycle is in flight — i.e. the switcher is up
+    /// and its modifier (Cmd, or Option with `--alt-tab-switch`) is held.
+    /// Lets `try_symbolic_hotkey` route Left/Right arrows into the switcher only
+    /// while it's showing, leaving bare arrows to reach the focused app
+    /// otherwise. A poisoned lock is treated as "no session" (fail open to the
+    /// app, never swallow the arrow).
+    fn cycle_session_active() -> bool {
+        CYCLE_SESSION.lock().is_ok_and(|g| g.is_some())
+    }
+
+    /// Q pressed while the switcher is up: quit the HIGHLIGHTED app, like the
+    /// native Cmd+Tab switcher, rather than whatever happens to be frontmost.
+    /// Each Tab step already activates the highlighted app, but posting Cmd+Q
+    /// would race that activation and leave the quit app in the frozen
+    /// snapshot (and the HUD). So: drop it from the snapshot, ask it to quit
+    /// (`terminate` is a normal quit — unsaved-changes prompts still appear),
+    /// and keep the session going with the selection on the next app, which we
+    /// activate the same way a Tab step does. The last app gone ends the
+    /// session. Returns false when no session is active (the caller lets the
+    /// key through). The quit and the AX/HUD work run after the session lock
+    /// is released, like `commit_cycle_session`.
+    fn quit_cycle_selection() -> bool {
+        let (quit_pid, next) = {
+            let Ok(mut guard) = CYCLE_SESSION.lock() else {
+                return false;
+            };
+            let Some(session) = guard.as_mut() else {
+                return false;
+            };
+            let Some(idx) = session
+                .snapshot
+                .iter()
+                .position(|(_, _, p)| *p == session.cursor_pid)
+            else {
+                return false;
+            };
+            let quit_pid = session.cursor_pid;
+            match super::remove_switcher_selection(&mut session.snapshot, idx) {
+                Some(next_idx) => {
+                    session.cursor_pid = session.snapshot[next_idx].2;
+                    session.last_press_at = Instant::now();
+                    let apps: Vec<(i32, String)> = session
+                        .snapshot
+                        .iter()
+                        .map(|(_, name, pid)| (*pid, name.clone()))
+                        .collect();
+                    (quit_pid, Some((apps, next_idx, session.cursor_pid)))
+                }
+                None => {
+                    *guard = None;
+                    (quit_pid, None)
+                }
+            }
+        };
+
+        // SAFETY: NSRunningApplication lookup + terminate are documented
+        // thread-safe; a pid that already exited just yields None.
+        let sent = unsafe {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(quit_pid)
+                .is_some_and(|app| app.terminate())
+        };
+        tracing::info!(pid = quit_pid, sent, "app switcher: quit the selected app");
+
+        let hud = super::APP_SWITCHER_HUD.load(std::sync::atomic::Ordering::Relaxed);
+        match next {
+            Some((apps, next_idx, next_pid)) => {
+                if hud {
+                    crate::switcher_hud::show(apps, next_idx);
+                }
+                ax_make_frontmost(
+                    next_pid,
+                    super::UNMINIMIZE_ON_SWITCH.load(std::sync::atomic::Ordering::Relaxed),
+                    false,
+                );
+            }
+            None => {
+                if hud {
+                    crate::switcher_hud::hide();
+                }
+            }
+        }
+        true
+    }
 
     /// Incremented every time both Cmd halves transition to released
     /// (see `commit_cycle_session` callers). A `CycleSession` stamps
@@ -1859,6 +2626,21 @@ mod macos {
         use std::sync::OnceLock;
         static START: OnceLock<Instant> = OnceLock::new();
         START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    /// Idle gap (ms) after which held modifiers are presumed stale and cleared
+    /// on the next input event — see `Inner::resync_modifiers_if_stale`.
+    /// `MACRDP_MODS_RESYNC_IDLE_MS` overrides; `0` disables the idle trigger
+    /// (the per-connection reset still applies). Read once.
+    fn mods_resync_idle_ms() -> u64 {
+        use std::sync::OnceLock;
+        static V: OnceLock<u64> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("MACRDP_MODS_RESYNC_IDLE_MS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(10_000)
+        })
     }
 
     /// Record that an RDP input event was just forwarded.
@@ -2049,7 +2831,8 @@ mod macos {
                 if let Some(bid) = bid {
                     let s = bid.to_string();
                     if !s.is_empty() {
-                        debug!(bundle = %s, "ctrl→cmd activation focus");
+                        debug!(bundle = %s, "activation focus");
+                        note_focus_change(&s, false);
                         if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
                             *g = Some(s);
                         }
@@ -2108,13 +2891,48 @@ mod macos {
     /// and resolves its owning app's bundle id. This is the only signal that
     /// catches an Electron app (VSCode) clicked into in a headless/virtual-display
     /// session: it takes key focus without emitting an activation, so the
-    /// activation observer and `AXFocusedApplication` never see it. Best-effort —
-    /// runs on the dedicated CFRunLoop thread (where AX is reliable, unlike the
-    /// input thread) and updates the cell before the user's next keystroke. Only
-    /// armed when `--map-ctrl-to-cmd` is on (the only consumer). No-op if AX can't
-    /// resolve a window/app at the point (menu bar, empty space).
-    fn update_focus_from_click(x: f64, y: f64) {
-        crate::runloop_thread::submit(move || unsafe {
+    /// activation observer and `AXFocusedApplication` never see it. Also feeds
+    /// the app switcher (`note_focus_change`) for activating clicks. No-op if AX
+    /// can't resolve a window/app at the point (menu bar, empty space).
+    ///
+    /// Runs on its OWN thread (`click-focus-hittest`), not the shared
+    /// `runloop_thread`, and coalesces latest-wins: a hit-test over a hung app
+    /// blocks until AX gives up (measured ~1.5 s), and since this now runs on
+    /// every plain left click for everyone, queueing those on the shared thread
+    /// would stall lazy file paste and the activation observer behind a few
+    /// clicks on a beachballing app. Here a hung app costs at most one blocked
+    /// hit-test; clicks that arrive meanwhile replace each other and only the
+    /// newest runs. (A shorter AX messaging timeout isn't used because setting
+    /// one on the system-wide element changes it process-wide, which would also
+    /// cut short the switcher's window raises on slow apps.)
+    fn update_focus_from_click(x: f64, y: f64, activating_click: bool) {
+        use std::sync::{Condvar, Mutex, OnceLock};
+        static SLOT: Mutex<Option<(f64, f64, bool)>> = Mutex::new(None);
+        static WAKE: Condvar = Condvar::new();
+        static STARTED: OnceLock<()> = OnceLock::new();
+        STARTED.get_or_init(|| {
+            let _ = std::thread::Builder::new()
+                .name("click-focus-hittest".into())
+                .spawn(|| loop {
+                    let job = {
+                        let mut g = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+                        while g.is_none() {
+                            g = WAKE.wait(g).unwrap_or_else(|e| e.into_inner());
+                        }
+                        g.take()
+                    };
+                    if let Some((x, y, activating)) = job {
+                        hit_test_click_focus(x, y, activating);
+                    }
+                });
+        });
+        *SLOT.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y, activating_click));
+        WAKE.notify_one();
+    }
+
+    /// The hit-test itself, for `update_focus_from_click`'s worker thread.
+    fn hit_test_click_focus(x: f64, y: f64, activating_click: bool) {
+        unsafe {
             use std::ffi::c_void;
             let systemwide = AXUIElementCreateSystemWide();
             if systemwide.is_null() {
@@ -2129,19 +2947,88 @@ mod macos {
             }
             let mut pid: libc::pid_t = 0;
             let pid_err = AXUIElementGetPid(element, &mut pid);
+            // A click on a Dock app icon activates THAT app, but the hit-test
+            // resolves to the Dock's own pid — and neither the activation
+            // observer nor the AX poller reliably reports the switch in the
+            // headless modes (observed live). Read the clicked icon's app.
+            let dock_target = if activating_click
+                && pid_err == AX_ERROR_SUCCESS
+                && bundle_identifier_for_pid(pid).as_deref() == Some("com.apple.dock")
+            {
+                dock_item_app_bundle(element)
+            } else {
+                None
+            };
+            // A menu-bar status item (menu extra) belongs to its app, but
+            // clicking it opens a menu without activating that app.
+            let menu_extra = ax_string_attr(element, "AXSubrole").as_deref() == Some("AXMenuExtra");
             CFRelease(element as *const c_void);
             if pid_err != AX_ERROR_SUCCESS || pid <= 0 {
                 return;
             }
+            if let Some(bundle) = dock_target {
+                debug!(bundle = %bundle, "click focus (Dock icon)");
+                note_focus_change(&bundle, true);
+                if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
+                    *g = Some(bundle);
+                }
+                return;
+            }
+            if activating_click && !menu_extra {
+                if let Some(bundle) = switcher_bundle_for_pid(pid) {
+                    note_focus_change(&bundle, true);
+                }
+            }
             if let Some(bundle) = bundle_identifier_for_pid(pid) {
                 if !bundle.is_empty() {
-                    debug!(pid, bundle = %bundle, "ctrl→cmd click focus");
+                    debug!(pid, bundle = %bundle, "click focus");
                     if let Ok(mut g) = LAST_FOCUS_BUNDLE.lock() {
                         *g = Some(bundle);
                     }
                 }
             }
-        });
+        }
+    }
+
+    /// Copy an AX attribute (+1 retained), or None if absent/failed.
+    unsafe fn ax_copy_attr(
+        element: *mut std::ffi::c_void,
+        name: &'static str,
+    ) -> Option<core_foundation::base::CFTypeRef> {
+        use core_foundation::base::TCFType;
+        let attr = core_foundation::string::CFString::from_static_string(name);
+        let mut v: core_foundation::base::CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef().cast(), &mut v);
+        (err == AX_ERROR_SUCCESS && !v.is_null()).then_some(v)
+    }
+
+    /// A string-valued AX attribute (e.g. AXRole/AXSubrole) of `element`.
+    unsafe fn ax_string_attr(element: *mut std::ffi::c_void, name: &'static str) -> Option<String> {
+        use core_foundation::base::TCFType;
+        let v = ax_copy_attr(element, name)?;
+        let cf = core_foundation::base::CFType::wrap_under_create_rule(v);
+        cf.downcast::<core_foundation::string::CFString>()
+            .map(|s| s.to_string())
+    }
+
+    /// Bundle id of the app a Dock element stands for, if it's an application
+    /// Dock item (`AXSubrole == AXApplicationDockItem`; folders, stacks, the
+    /// Trash and minimized-window tiles return None). Read from the item's
+    /// `AXURL` (the app's bundle path). `element` is borrowed, not released.
+    unsafe fn dock_item_app_bundle(element: *mut std::ffi::c_void) -> Option<String> {
+        use core_foundation::base::TCFType;
+        use core_foundation::url::CFURL;
+        if ax_string_attr(element, "AXSubrole").as_deref() != Some("AXApplicationDockItem") {
+            return None;
+        }
+        let url = ax_copy_attr(element, "AXURL")?;
+        let path = CFURL::wrap_under_create_rule(url.cast()).to_path()?;
+        let ns = objc2_foundation::NSString::from_str(path.to_str()?);
+        let bundle = objc2_foundation::NSBundle::bundleWithPath(&ns)?;
+        bundle
+            .bundleIdentifier()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
     }
 
     /// Find the pid of the first running app matching `bundle`. Walks
@@ -2163,6 +3050,7 @@ mod macos {
 
     fn ax_focus_mru_poller_loop() {
         let mut last_seen_pid: libc::pid_t = 0;
+        // (mirrored into AX_POLLER_LAST_SEEN for Cmd+`'s freshness check)
         loop {
             // Park while input-idle: no RDP input in the last minute (or ever)
             // means nobody is Cmd+Tab-ing or typing, so the system-wide AX
@@ -2181,6 +3069,7 @@ mod macos {
                 continue;
             }
             last_seen_pid = pid;
+            AX_POLLER_LAST_SEEN.store(pid, std::sync::atomic::Ordering::Relaxed);
 
             // Skip while a Cmd+Tab cycle is in flight — our own AX
             // activations are causing the focus changes the poller is
@@ -2194,13 +3083,10 @@ mod macos {
                 continue;
             }
 
-            let Some(bundle) = bundle_identifier_for_pid(pid) else {
+            let Some(bundle) = switcher_bundle_for_pid(pid) else {
                 continue;
             };
-            if bundle.is_empty() {
-                continue;
-            }
-            promote_bundle_to_front(&bundle);
+            note_focus_change(&bundle, false);
             debug!(
                 pid,
                 bundle = %bundle,
@@ -2249,6 +3135,12 @@ mod macos {
             .find(|(_, _, p)| *p == session.cursor_pid)
         {
             promote_bundle_to_front(bundle);
+            if let Ok(mut g) = SWITCHER_FRONT.lock() {
+                *g = Some(bundle.clone());
+            }
+            if let Ok(mut g) = LAST_COMMIT.lock() {
+                *g = Some((Instant::now(), bundle.clone()));
+            }
             // Record the landed app as the current focus for the Ctrl→Cmd
             // remap. Its `frontmost_is_excluded` reads LAST_FOCUS_BUNDLE
             // first, and our own Cmd+Tab/Option+Tab AX activation doesn't
@@ -2346,9 +3238,37 @@ mod macos {
             // the reconciled `front_pid` from here on means MRU
             // tracking actually survives a Cmd+Tab → release → Cmd+Tab
             // cycle.
-            let front_pid = effective_front_pid(workspace_front_pid, |p| {
+            let reconciled_front_pid = effective_front_pid(workspace_front_pid, |p| {
                 metas.iter().any(|m| m.pid == p && !m.terminated)
             });
+            // Prefer the switcher's own last-wins focus cell (commits + poller
+            // + activation observer + click hit-test): it tracks a click/Dock
+            // switch that the reconciliation above misses in headless setups.
+            // Only consulted at a FRESH session start — mid-hold, `front_pid`
+            // only feeds MRU-map pinning and the snapshot is frozen anyway.
+            let front_pid = SWITCHER_FRONT
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .and_then(|bundle| {
+                    let live = |p: libc::pid_t| {
+                        metas.iter().any(|m| {
+                            m.pid == p
+                                && !m.terminated
+                                && m.policy == NSApplicationActivationPolicy::Regular
+                                && m.bundle == bundle
+                        })
+                    };
+                    if live(reconciled_front_pid) {
+                        return Some(reconciled_front_pid);
+                    }
+                    let pinned = mru_map().lock().ok().and_then(|g| g.get(&bundle).copied());
+                    if let Some(p) = pinned.filter(|p| live(*p)) {
+                        return Some(p);
+                    }
+                    metas.iter().find(|m| live(m.pid)).map(|m| m.pid)
+                })
+                .unwrap_or(reconciled_front_pid);
 
             // Refresh MRU. Whichever bundle is currently frontmost is the
             // one the user just left (or was working in if this is their
@@ -2689,17 +3609,11 @@ mod macos {
                 *LAST_AX_ACTIVATED_PID
                     .lock()
                     .expect("last AX activated pid mutex poisoned") = Some(target_pid);
-                // Promote on every successful activation, not just on
-                // Cmd-release commit. Our cycle has no switcher UI, so
-                // each Tab press visibly switches apps and the user
-                // experiences every step as a real visit — MRU should
-                // reflect that or the next session's cycle order will
-                // disagree with what they just saw on screen. Snapshot
-                // is frozen so this doesn't disrupt the active cycle;
-                // it only affects what subsequent sessions consult.
-                if target_bundle != "<no-bundle-id>" {
-                    promote_bundle_to_front(&target_bundle);
-                }
+                // Deliberately NOT promoted to MRU here: like native macOS,
+                // only the app you LAND on (Cmd release → commit_cycle_session)
+                // becomes most-recent. Promoting every step made a quick
+                // Alt+Tab after cycling through A→B→C jump to B (the last
+                // app passed through) instead of the previously focused app.
                 debug!(target = %target_bundle, pid = target_pid, "cycle_apps: AX activation ok");
             } else {
                 warn!(
@@ -2761,6 +3675,7 @@ mod macos {
             value_ptr: *const std::ffi::c_void,
         ) -> core_foundation::base::CFTypeRef;
         fn CFRelease(cf: *const std::ffi::c_void);
+        fn CFRetain(cf: *const std::ffi::c_void) -> *const std::ffi::c_void;
         fn CFEqual(a: *const std::ffi::c_void, b: *const std::ffi::c_void) -> u8;
         fn CFBooleanGetValue(boolean: core_foundation::base::CFTypeRef) -> u8;
         fn CFArrayGetCount(arr: *const std::ffi::c_void) -> isize;
@@ -3114,6 +4029,48 @@ mod macos {
         frontmost_err
     }
 
+    /// A retained AX/CF reference (released on drop) so window elements can
+    /// be kept across Cmd+` presses.
+    struct AxRef(*const std::ffi::c_void);
+    // SAFETY: AXUIElementRef is a CF object; CF retain/release and the AX
+    // calls made on it are thread-safe, and the store is mutex-guarded.
+    unsafe impl Send for AxRef {}
+    impl AxRef {
+        fn retain(p: *const std::ffi::c_void) -> Self {
+            Self(unsafe { CFRetain(p) })
+        }
+    }
+    impl Drop for AxRef {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    /// The stable window order Cmd+` steps through, for the app it last
+    /// cycled (pid). Reset when the app changes.
+    static WINDOW_CYCLE_ORDER: std::sync::Mutex<Option<(libc::pid_t, Vec<AxRef>)>> =
+        std::sync::Mutex::new(None);
+
+    /// Merge the stored cycle order with the app's current windows: keep the
+    /// stored windows that still exist, in their stored order, then append new
+    /// ones in their current (z-)order. A fresh app starts from z-order.
+    fn reconcile_window_order<T>(
+        stored: Vec<T>,
+        current: Vec<T>,
+        eq: impl Fn(&T, &T) -> bool,
+    ) -> Vec<T> {
+        let mut order: Vec<T> = stored
+            .into_iter()
+            .filter(|w| current.iter().any(|c| eq(w, c)))
+            .collect();
+        for c in current {
+            if !order.iter().any(|w| eq(w, &c)) {
+                order.push(c);
+            }
+        }
+        order
+    }
+
     /// Cycle through windows of the currently-frontmost app, the way
     /// native Cmd+` does. Pulls the app's window list via
     /// `kAXWindowsAttribute`, locates `kAXFocusedWindow` in that list,
@@ -3127,7 +4084,13 @@ mod macos {
         use std::ffi::c_void;
         use std::ptr;
 
-        // Source-of-truth for "what app is the user actually in": prefer the
+        // Source-of-truth for "what app is the user actually in": see
+        // `pick_front_for_window_cycle` — a live AX focus the poller hasn't
+        // seen yet, else the switcher's last-wins cell (`switcher_front_pid`,
+        // fed by commits, click/Dock-icon hit-tests, the activation observer
+        // and the poller). Observed live: after a click into Chrome, AX
+        // still reported the last app the switcher activated (Finder), so
+        // trusting AX alone cycled the wrong app. Historically: the
         // AX system-wide focused-application pid (`ax_focused_application_pid`,
         // the same primitive the MRU poller uses) over
         // `NSWorkspace.frontmostApplication`. NSWorkspace stops tracking
@@ -3139,7 +4102,14 @@ mod macos {
         // reconciliation (`effective_front_pid`) only if AX can't resolve a
         // focused app at all (e.g. a transient AX hiccup).
         let pid = unsafe {
-            match ax_focused_application_pid() {
+            let live_ax = ax_focused_application_pid();
+            let ax_is_regular_app = live_ax.and_then(switcher_bundle_for_pid).is_some();
+            match pick_front_for_window_cycle(
+                live_ax,
+                ax_is_regular_app,
+                AX_POLLER_LAST_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+                switcher_front_pid(),
+            ) {
                 Some(ax_pid) => ax_pid,
                 None => {
                     let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
@@ -3201,23 +4171,39 @@ mod macos {
                 &mut focused,
             )
         };
-        let mut focused_idx: isize = 0;
+        // Step through a STABLE per-app window order, not AXWindows' z-order:
+        // raising the next z-order window puts it in front, so the following
+        // press stepped straight back — Cmd+` ping-ponged between the top two
+        // windows. Native macOS keeps a fixed order and visits every window.
+        let current: Vec<AxRef> = (0..count)
+            .map(|i| AxRef::retain(unsafe { CFArrayGetValueAtIndex(windows.cast(), i) }))
+            .collect();
+        let ax_eq = |a: &AxRef, b: &AxRef| unsafe { CFEqual(a.0, b.0) } != 0;
+        let mut order_guard = WINDOW_CYCLE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let stored = match order_guard.take() {
+            Some((p, order)) if p == pid => order,
+            _ => Vec::new(),
+        };
+        let order = reconcile_window_order(stored, current, ax_eq);
+        let focused_ref = (!focused.is_null()).then(|| AxRef::retain(focused));
         if !focused.is_null() {
-            for i in 0..count {
-                let w = unsafe { CFArrayGetValueAtIndex(windows.cast(), i) };
-                if unsafe { CFEqual(w, focused) } != 0 {
-                    focused_idx = i;
-                    break;
-                }
-            }
             unsafe { CFRelease(focused.cast()) };
         }
+        let focused_idx = focused_ref
+            .as_ref()
+            .and_then(|f| order.iter().position(|w| ax_eq(w, f)))
+            .unwrap_or(0);
+        let count = order.len() as isize;
+        let focused_idx = focused_idx as isize;
         let next_idx = if reverse {
             (focused_idx + count - 1) % count
         } else {
             (focused_idx + 1) % count
         };
-        let next_window = unsafe { CFArrayGetValueAtIndex(windows.cast(), next_idx) };
+        let next_window = order[next_idx as usize].0;
+        // Keep the order alive (and the retained refs) for the next press.
+        *order_guard = Some((pid, order));
+        drop(order_guard);
         // Multi-strategy window raise. Native Cocoa apps (Terminal,
         // Finder) honor AXRaise on a window — that alone is enough.
         // Electron apps (VSCode, Slack, Discord) expose AXRaise but
@@ -3297,73 +4283,6 @@ mod macos {
         }
         debug!("invoke_spotlight: AX menu-bar press failed, falling back to osascript");
         invoke_spotlight_via_osascript();
-    }
-
-    /// Invoke the default macOS Ctrl+Arrow system actions without relying on
-    /// WindowServer to accept our synthetic RDP key event.
-    fn invoke_ctrl_arrow(action: CtrlArrowAction) {
-        // Dock owns Mission Control/Spaces and exposes no public programmatic
-        // switch API. System Events can drive the user's enabled native
-        // shortcuts from a trusted Accessibility session. Use it for all four
-        // arrows: the target machine live-verified Left/Right, while directly
-        // executing Mission Control.app for Up/Down was killed by macOS with
-        // SIGKILL before it could notify Dock.
-        let label = match action {
-            CtrlArrowAction::MissionControl => "mission-control",
-            CtrlArrowAction::ApplicationWindows => "application-windows",
-            CtrlArrowAction::PreviousSpace => "previous-space",
-            CtrlArrowAction::NextSpace => "next-space",
-        };
-        let keycode = ctrl_arrow_system_events_keycode(action);
-        let script = format!(
-            r#"tell application "System Events" to key code {keycode} using {{control down}}"#
-        );
-        let mut command = Command::new("/usr/bin/osascript");
-        command.arg("-e").arg(&script);
-        spawn_symbolic_helper(&mut command, label);
-    }
-
-    /// Spawn a short-lived system shortcut helper and reap it off the input
-    /// thread. Capturing stderr makes a denied System Events request diagnosable
-    /// without ever blocking keyboard delivery.
-    fn spawn_symbolic_helper(command: &mut Command, label: &'static str) {
-        command
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        match command.spawn() {
-            Ok(child) => {
-                let child_pid = child.id();
-                debug!(label, child_pid, "symbolic shortcut helper spawned");
-                let _ = std::thread::Builder::new()
-                    .name(format!("shortcut-{label}-wait"))
-                    .spawn(move || match child.wait_with_output() {
-                        Ok(output) if output.status.success() => {
-                            debug!(label, child_pid, "symbolic shortcut helper completed");
-                        }
-                        Ok(output) => {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            warn!(
-                                label,
-                                child_pid,
-                                status = ?output.status,
-                                stderr = %stderr.trim(),
-                                "symbolic shortcut helper failed"
-                            );
-                        }
-                        Err(error) => {
-                            warn!(
-                                label,
-                                child_pid,
-                                error = %error,
-                                "symbolic shortcut helper wait failed"
-                            );
-                        }
-                    });
-            }
-            Err(error) => {
-                warn!(label, error = %error, "symbolic shortcut helper spawn failed");
-            }
-        }
     }
 
     /// Open Spotlight by synthesizing a real mouse click on its
@@ -3682,32 +4601,147 @@ mod macos {
             tm.tm_sec
         )
     }
+
     #[cfg(test)]
-    mod pointer_modifier_tests {
+    mod cycle_mru_tests {
         use super::*;
 
+        /// Only the app you LAND on (commit) becomes most-recent — apps passed
+        /// through mid-cycle must not, so a quick Alt+Tab afterwards goes back
+        /// to the app you were in before, like native macOS. One test because
+        /// MRU_BUNDLES / CYCLE_SESSION are process-global.
         #[test]
-        fn only_plain_control_maps_and_latched_click_preserves_command_on_release() {
-            let mut mods = ModifierState::default();
-            mods.apply(VK_RCTRL, true);
-            assert!(!mods.should_map_left_click(false));
-            assert!(mods.should_map_left_click(true));
-            let raw = mods.pointer_flags(false);
-            assert!(raw.contains(CGEventFlags::CGEventFlagControl));
-            assert_ne!(raw.bits() & NX_DEVICE_R_CTRL, 0);
-            let mapped = mods.pointer_flags(true);
-            assert!(mapped.contains(CGEventFlags::CGEventFlagCommand));
-            assert!(!mapped.contains(CGEventFlags::CGEventFlagControl));
-            assert_eq!(mapped.bits() & NX_DEVICE_R_CTRL, 0);
-            mods.apply(VK_LSHIFT, true);
-            assert!(!mods.should_map_left_click(true));
-            mods.apply(VK_RCTRL, false);
-            assert!(mods
-                .pointer_flags(true)
-                .contains(CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift));
-            assert!(!mods
-                .pointer_flags(false)
-                .contains(CGEventFlags::CGEventFlagCommand));
+        fn commit_promotes_only_the_landed_app() {
+            const A: &str = "test.cycle.a";
+            const B: &str = "test.cycle.b";
+            const C: &str = "test.cycle.c";
+            // Bogus pids: ax_make_frontmost on a nonexistent pid just errors.
+            let snapshot = vec![
+                (A.to_string(), "A".to_string(), 999_001),
+                (B.to_string(), "B".to_string(), 999_002),
+                (C.to_string(), "C".to_string(), 999_003),
+            ];
+            // A is frontmost (session origin); user cycles A→B→C, releasing on C.
+            *mru_bundles().lock().unwrap() = vec![A.into(), B.into(), C.into()];
+            *CYCLE_SESSION.lock().unwrap() = Some(CycleSession {
+                snapshot,
+                cursor_pid: 999_003,
+                last_press_at: Instant::now(),
+                cmd_release_gen: 0,
+            });
+            commit_cycle_session();
+
+            let mru = mru_bundles().lock().unwrap().clone();
+            assert_eq!(mru, vec![C, A, B], "landed app first, then the origin");
+            // Next session: front = C, first Tab target = index 1 = A, not B.
+            assert_eq!(mru[1], A);
+            assert_eq!(SWITCHER_FRONT.lock().unwrap().as_deref(), Some(C));
+
+            // Then the user clicks into B (not via the switcher): B becomes the
+            // front and C — the app they came from — is next.
+            note_focus_change(B, true);
+            assert_eq!(mru_bundles().lock().unwrap().clone(), vec![B, C, A]);
+            assert_eq!(SWITCHER_FRONT.lock().unwrap().as_deref(), Some(B));
+        }
+
+        #[test]
+        fn window_cycle_order_is_stable() {
+            let eq = |a: &i32, b: &i32| a == b;
+            // Fresh app: z-order.
+            let o = reconcile_window_order(vec![], vec![1, 2, 3], eq);
+            assert_eq!(o, vec![1, 2, 3]);
+            // After raising 2, z-order is [2,1,3] — the order must NOT follow,
+            // or the next step from 2 goes back to 1 (the ping-pong bug).
+            let o = reconcile_window_order(o, vec![2, 1, 3], eq);
+            assert_eq!(o, vec![1, 2, 3]);
+            // Closed window dropped, new window appended.
+            let o = reconcile_window_order(o, vec![4, 3, 1], eq);
+            assert_eq!(o, vec![1, 3, 4]);
+        }
+
+        #[test]
+        fn window_cycle_front_selection() {
+            // AX changed since the poller looked → newer than SWITCHER_FRONT.
+            assert_eq!(
+                pick_front_for_window_cycle(Some(7), true, 3, Some(5)),
+                Some(7)
+            );
+            // AX unchanged (possibly stale) → SWITCHER_FRONT, which already
+            // folds in that observation plus clicks AX missed.
+            assert_eq!(
+                pick_front_for_window_cycle(Some(3), true, 3, Some(5)),
+                Some(5)
+            );
+            // AX names a non-regular app (Dock etc.) → not trusted.
+            assert_eq!(
+                pick_front_for_window_cycle(Some(7), false, 3, Some(5)),
+                Some(5)
+            );
+            // Nothing recorded yet → whatever AX says.
+            assert_eq!(pick_front_for_window_cycle(Some(3), true, 3, None), Some(3));
+            assert_eq!(pick_front_for_window_cycle(None, false, 3, None), None);
+        }
+
+        #[test]
+        fn only_plain_left_clicks_switch_apps() {
+            assert!(super::super::is_activating_click(true, false, false));
+            assert!(
+                !super::super::is_activating_click(false, false, false),
+                "right/middle"
+            );
+            assert!(
+                !super::super::is_activating_click(true, true, false),
+                "Cmd+click"
+            );
+            assert!(
+                !super::super::is_activating_click(true, false, true),
+                "Ctrl+click"
+            );
+        }
+
+        #[test]
+        fn focus_reports_are_filtered() {
+            let just = Some((Duration::from_millis(100), "landed"));
+            let later = Some((Duration::from_secs(5), "landed"));
+            // Mid-cycle activations are ours, never the user's.
+            assert!(!accept_focus_report(true, true, "x", None));
+            // Late activation notice for an app cycled THROUGH: rejected…
+            assert!(!accept_focus_report(false, false, "passed", just));
+            // …but the landed app itself, a click, or anything later is fine.
+            assert!(accept_focus_report(false, false, "landed", just));
+            assert!(accept_focus_report(false, true, "clicked", just));
+            assert!(accept_focus_report(false, false, "other", later));
+            assert!(accept_focus_report(false, false, "other", None));
+            assert!(!accept_focus_report(false, false, "", None));
+            assert!(!accept_focus_report(false, false, "<no-bundle-id>", None));
+        }
+    }
+
+    #[cfg(test)]
+    mod modifier_state_tests {
+        use super::*;
+
+        /// The stale-modifier resync must drop every HELD modifier but leave
+        /// Caps Lock alone — it's a toggle reconciled by `synchronize()`, and
+        /// clearing it here would fight that path.
+        #[test]
+        fn clear_non_lock_drops_held_keys_but_preserves_caps_lock() {
+            let mut m = ModifierState::default();
+            assert!(!m.clear_non_lock(), "nothing held → nothing changed");
+
+            m.apply(VK_LCTRL, true);
+            m.apply(VK_RSHIFT, true);
+            m.apply(VK_CAPS_LOCK, true); // toggles ON
+            assert!(m.has_ctrl() && m.has_shift() && m.caps_lock);
+
+            assert!(m.clear_non_lock(), "held keys were cleared");
+            assert!(!m.any_held());
+            assert!(m.caps_lock, "Caps Lock toggle must survive a resync");
+            assert_eq!(
+                m.cg_flags().bits() & CGEventFlags::CGEventFlagControl.bits(),
+                0,
+                "no Control bit left on the wire flags"
+            );
         }
     }
 }

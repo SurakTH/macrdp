@@ -9,7 +9,13 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 ```
 --bind 0.0.0.0:3390       Listen address (3390 by default; 3389 needs root)
 --username NAME           Defaults to $USER
---password PASS           Skip the interactive prompt
+--password PASS           Skip the interactive prompt (visible in `ps`)
+--password-file PATH      Read the password from a file (mode 600, owned by
+                          you, no ACL; otherwise refused). Not visible in `ps`.
+                          One trailing newline is stripped. Config key
+                          PASSWORD_FILE (set USE_KEYCHAIN=0 with it; a
+                          config.env made by the menu-bar app has
+                          USE_KEYCHAIN=1, so change it to 0)
 --skip-auth               Bypass PAM (testing only)
 --keychain                Read password from macOS Keychain (service=macrdp)
 --allow-ip IP[,IP...]     Only accept clients with an exact IPv4/IPv6 address in
@@ -67,6 +73,16 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           --alt-tab-switch, for clients that forward Alt+` but
                           gate Win-key combos. Option+Shift+` cycles backward.
                           macOS-only.
+--alt-q-quit              Deliver Option+Q (Alt+Q from the client) as Cmd+Q, so
+                          a Windows client can quit the focused app without the
+                          Windows key. Off by default (Option+Q then reaches
+                          apps as a normal key). Plain Option only —
+                          Option+Shift+Q is NOT sent as Cmd+Shift+Q (log out).
+                          macOS-only.
+--alt-space-spotlight     Also accept Option+Space (Alt+Space from the client)
+                          as the Spotlight trigger, in addition to Cmd+Space.
+                          Off by default. For macOS clients, whose own Spotlight
+                          takes Cmd+Space first. macOS-only.
 --app-switcher-hud        Show a visual app-switcher overlay (icon row, like
                           macOS's native Cmd+Tab) on the remote during Cmd+Tab /
                           Option+Tab. Off by default. macrdp spawns a small helper
@@ -86,6 +102,12 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           apps with an embedded terminal that can't be auto-detected
                           (front app is the IDE, not a TTY), e.g.
                           --no-remap-apps com.microsoft.VSCode. macOS-only.
+--reverse-scroll          Reverse the mouse-wheel direction (vertical and
+                          horizontal) for the remote session. For a Mac with
+                          natural scrolling on: macOS applies it to macrdp's
+                          scroll events too, and a local tool that un-reverses
+                          the physical wheel (LinearMouse etc.) doesn't see
+                          them. Off by default. macOS-only.
 --keyboard-layout SPEC    Force a keyboard layout for non-US clients instead of
                           auto-detecting it from the client. By default the
                           layout is auto-detected from the client's announced
@@ -145,6 +167,11 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           to fall back to the eager path (downloads everything
                           on copy, auto-fires Cmd-V into Finder when done).
                           See [file-copy.md](file-copy.md).
+--no-rich-clipboard       Copy plain text and images only. By default formatted
+                          text also crosses the clipboard in both directions
+                          (Word, Outlook or a browser <-> Mail, Notes, Pages),
+                          at the cost of fetching the formatted version as well
+                          on every Windows copy. Config key: RICH_CLIPBOARD=0.
 --enable-drive-redirection  Let the connecting client redirect its local
                           drive(s) (mstsc: Local Resources → Drives; FreeRDP:
                           /drive:NAME,PATH); the Mac mounts each as a real
@@ -200,6 +227,31 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           to $TMPDIR and logs average luma; off by default.
                           macOS-only. See
                           [camera-extension-setup.md](camera-extension-setup.md).
+--enable-microphone-redirection  EXPERIMENTAL. Let the connecting client redirect
+                          its MICROPHONE; macrdp presents it as a real macOS input
+                          device — "macrdp Microphone" appears in System Settings →
+                          Sound → Input and in Zoom / FaceTime / QuickTime / Teams,
+                          carrying the client's live audio. Off by default (and the
+                          default runtime path is byte-identical when off).
+                          The client must opt in too: mstsc = Local Resources →
+                          Remote audio → Settings → "Record from this computer";
+                          FreeRDP = /microphone.
+                          REQUIRES the "macrdp Microphone" driver to be installed
+                          ONCE — macrdp.app bundles it; open the controller →
+                          Settings → Redirection → Microphone → "Install macrdp
+                          Microphone…" (one admin prompt; Core Audio restarts,
+                          briefly interrupting sound). The same place updates or
+                          removes it. Without the driver macrdp still receives the
+                          audio; it just has no device to feed.
+                          Privacy: other user accounts on this Mac can listen to the
+                          mic while a session is streaming (they cannot inject
+                          audio, and nothing is kept after the session ends).
+                          44.1 kHz only for now (16-bit PCM) — mstsc offers it; a
+                          client that can't gets no mic (macrdp logs why).
+                          For debugging, `MIC_DUMP=1` in config.env (env
+                          `MACRDP_MIC_DUMP=1`) writes the received audio to a WAV
+                          file under $TMPDIR instead of feeding the device.
+                          macOS-only.
 --no-mute-on-minimize     Opt out of muting audio while the client window is
                           minimized (default ON). When the client sends the
                           standard `SuppressOutput` PDU on minimize, the server
@@ -247,7 +299,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           Treat the machine as physically unsecured while a
                           session is engaged. Experimentally confirmed; see
                           known-quirks.md.
---enable-udp-multitransport  EXPERIMENTAL, opt-in. Offer RDP UDP multitransport
+--enable-udp-multitransport  Opt-in. Offer RDP UDP multitransport
                           (MS-RDPEMT over reliable RDPEUDP) and bind a UDP
                           listener on the same address/port as TCP. On its own,
                           EGFX still rides TCP (a proven safe spike) — add
@@ -272,7 +324,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           clear. So --bitrate becomes a ceiling, not a fixed
                           target: set it high (e.g. 8) and let it adapt. Off by
                           default.
---enable-lossy-audio      EXPERIMENTAL, opt-in (implies --enable-udp-multitransport;
+--enable-lossy-audio      Opt-in (implies --enable-udp-multitransport;
                           needs --enable-aac + --enable-h264). Stream RDPSND audio
                           over a LOSSY UDP/DTLS tunnel instead of TCP — the loss-
                           resilient audio path. AAC Wave2 data rides a lossy
@@ -389,6 +441,8 @@ BLANK_RECOVERY_MIN_QOE=24               # all-zero QoE reports (~3 s) to declare
 BLANK_RECOVERY_MAX_WAIT_MS=4000         # wall-clock fast-path: declare a STATIC blank after this many ms  [MACRDP_BLANK_RECOVERY_MAX_WAIT_MS]
 BLANK_RECOVERY_MIN_WALL_REPORTS=1       # min all-zero reports the fast-path needs (skips QoE-less clients)  [MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS]
 BLANK_RECOVERY_HEAL_CONFIRM_MS=8000     # after a reactivation, wait this long for a sustained heal before the fallback drop  [MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS]
+BLANK_RECOVERY_POST_ATTEMPT_ZEROS=3     # after a reactivation, drop on this many zero-render reports...  [MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS]
+BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS=10000  # ...within this window (0 disables)              [MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS]
 BLANK_RECOVERY_RETRY_MS=4000            # spacing between recovery attempts                              [MACRDP_BLANK_RECOVERY_RETRY_MS]
 BLANK_RECOVERY_MAX_ATTEMPTS=1           # forced to >=2 when REACTIVATE=1 so the drop can be attempt 2   [MACRDP_BLANK_RECOVERY_MAX_ATTEMPTS]
 BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # storm guard: stop dropping after N blank-drops with no heal between  [MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS]

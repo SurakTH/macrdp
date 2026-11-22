@@ -7,6 +7,41 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## In flight (needs an action)
 
+- [ ] **Open PRs — review state (as of 2026-11-21).** Labels track it: `waiting on author` = the
+  contributor owes a change; everything else is ours. Merged 11-12→21: #197 #200 #201 #204 #219 #228
+  #230 #240/#254 #255 #256 #257 #258 #259 #260 #262 #263 #264 #265 #267 #268 #270 #271 #272 #273.
+  - **#231 / #232** (@SferaDev, virtual display re-registered after display sleep / wake the displays) —
+    both conflict with `main` after #201, and with each other; asked to merge #231 first and rebase #232
+    on it. #231 has one picker now and records id changes mid-session; its rebase must make `recreate()`
+    keep HiDPI, the pixel size, and clear the recorded mode. Neither has said what was tested live; #232
+    also owes answers on `--allow-sleep` and the 3 s wait in `DetachedPrimary::drop`.
+  - **#235** (@JulyStar-Lv, connect-time network autodetect) — asked to rebase and make it opt-in
+    (11-13), then (11-16) to keep `FINALIZE_TIMEOUT` around its replacement login loop and to skip,
+    not fail on, unexpected frames during the measurement. No commits since 10-27.
+  - **Divergences (33)/(34)** are #201's (scale factors on `ConnectionInfo`) and #228's (RemoteFX surface
+    command, = upstream #2229 `e20a2147`, so (34) also drops at a rebase past it).
+  - **#225** (IronRDP changes on clintcan/IronRDP instead of `vendor/`): **done, closed 2026-11-21.**
+    #271 (rophy) moved every `ironrdp-*` crate to the fork's `macrdp` branch at `6d90c7e8`; #272 added
+    `scripts/check-ironrdp-pin.sh` (CI, the daily security workflow, before release builds). The fork's
+    Actions are off and only an admin can update `macrdp*`. See `docs/ironrdp-divergences.md`, "Keeping the
+    fork safe". A divergence change is now a PR into the fork's `macrdp`, then a rev bump on all pins here.
+  - **#186 upstream:** fixed by Devolutions/IronRDP#2432, merged 2026-11-14 as `e482e340`. Divergence (32)
+    drops out at the next rebase of the fork's `macrdp` branch onto any upstream rev at or after it.
+  - **Next rebase of the fork's `macrdp` branch onto newer upstream drops these `ironrdp-server`
+    divergences** (all merged upstream; keep the `conn_test` regression tests for (31) and (32)): (29)
+    pointer AND mask (≥ `fb25b47c`), (31) hidden/default pointer updates (≥ `904a7da6`), (32) negotiation
+    timeout (≥ `e482e340`), (34) RemoteFX surface command (≥ `e20a2147`). Also (30), once upstream
+    Devolutions/IronRDP#2465 (glamberson's fix for our #2280) merges. The rebase goes on a new branch,
+    `macrdp-<upstream-rev>`; the old one stays so older releases still build.
+
+
+- [ ] **Watch: connect-time A/V desync (picture behind sound until a minimize/restore).** Correlates with
+  video on TCP. Not reproduced on v0.10.5 (queue 2–60 ms in two sessions); the mini logs
+  `macrdp::h264=debug` so the next real occurrence shows whether a 1–2 s video backlog came with it.
+
+- [ ] **Next toolchain bump:** clippy on Rust 1.98 flags `chunks_exact_to_as_chunks` in our code (reported
+  by rophy on #228). We pin 1.95, so CI is unaffected until then.
+
 - [x] **SIEM/SOC audit forwarding — Tier 0 (structured JSON audit stream) — SHIPPED (v0.8.33);
   `event="auth"` (div18) + `event="fingerprint"` which-client (PR #163, 2026-07-18, merged, awaits
   next release) added since.** macrdp's `macrdp::audit`
@@ -28,8 +63,9 @@ then delete; promote a parked item to *In flight* when work actually starts.
   health-bounce / active-redirection-features / session-start onto `macrdp::audit`. Plan:
   `~/.claude/plans/tier0-siem-audit-json.md`; [[project_siem_audit_json_tier0]].
 
-- [ ] **Tier 2.4 — multi-day soak (foundation core PASSED 31 h 2026-07-03; full 48–72 h on
-  v0.8.24 still needed).** The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
+- [x] **Tier 2.4 — multi-day soak — DONE: 48 h met three times (v0.9.3, v0.9.6, and the e258f6a0 pin
+  bump 11-10→12, 0 panics). The notes below are the history.** (Was: foundation core PASSED 31 h
+  2026-07-03; full 48–72 h on v0.8.24 still needed.) The last leg of the production-readiness trio (TLS ✓ #104, auth ✓
   #105). Tooling: `scripts/soak-monitor.sh monitor` samples a resource CSV; `… analyze`
   summarizes. **2026-07-01 run (31 h / 1861 samples, pre-v0.8.22 / pre-ARC build; data recovered
   on a clean re-copy after a first transfer zero-filled):** CLEAN — **no memory leak** (RSS
@@ -49,7 +85,22 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Deferred — scoped, not started
 
-- [ ] **Microphone / audio-input redirection (MS-RDPEAI, the `AUDIO_INPUT` DVC) — present the CLIENT's mic as a macOS input device.**
+- [ ] **UDP: lossy audio and `--udp-migrate-egfx` can't both migrate in one session.** A connection gets one
+  Soft-Sync request, and with lossy audio on, the audio channel takes it (`mt_soft_sync_on_egfx`). Fixing it
+  means one Soft-Sync naming both channels on their tunnels. Low priority: both are opt-in.
+- [ ] **Windows App (macOS) intermittently doesn't announce client copies to the server — pre-existing,
+  NOT a pin-bump regression.** Found 2026-10-02 while live-testing the bump: after a copy on the MacBook,
+  clicking into the Windows App session sometimes sends no CLIPRDR FormatList at all, so the mini never
+  gets the text (the server logs nothing; the connect-time FormatList does arrive). A/B on the same
+  route: bump build 2/5 sessions delivered, **v0.9.6 1/2 — same failure on the old build**. mini→client
+  direction was fine throughout. Not yet known whether it's purely client-side or something macrdp's
+  handshake could influence (e.g. the connect-time FormatList/ack ordering). Test gotcha: in Terminal,
+  Cmd+V from Windows App arrives as Ctrl+V (`^V`; the Ctrl→Cmd remap is off in terminals) — paste via
+  Edit → Paste, and reset the mini's pasteboard to a marker first, or a stale paste looks like success.
+
+- [ ] **Microphone / audio-input redirection (MS-RDPEAI) — SHIPPED in v0.9.10 (experimental). Still open:
+  adopt upstream `ironrdp-rdpeai` in place of our vendored `audin.rs` (divergence (25)), decided 2026-09-30
+  below; the e258f6a0 bump didn't do it.** (Was: present the CLIENT's mic as a macOS input device.)
   Scoped 2026-07-27, prompted by the A4Tech FHD webcam (`09da:2692`) having a built-in mic:
   none of the three existing channels can carry it — **USB redirection** can't (USB audio streams over
   **isochronous** endpoints; macrdp's URBDRC path is bulk+interrupt only — the isoch gap; this cam's
@@ -84,12 +135,70 @@ then delete; promote a parked item to *In flight* when work actually starts.
     macrdp feeds received PCM into the plug-in via a **shared-memory ring** (the audio analogue of the CMIO
     sink stream), with **clock/drift handling** — the client mic clock vs the Mac audio clock will drift, so
     resample like `audio.rs` already does 48→44.1 (`rubato`), plus a small jitter buffer (RDPEAI over TCP).
-  - **Phasing (mirror the camera feature):** **P0** — the `AUDIO_INPUT` handshake behind the flag, inert:
-    negotiate + log the client streaming its mic, drop the audio (proves mstsc/FreeRDP will hand macrdp a mic;
-    the camera Phase-0 gate is the template). **P1** — accept the Data PDUs, produce a PCM stream, dump to
-    WAV under `MACRDP_MIC_DUMP=1` (like `MACRDP_CAMERA_DUMP`) to verify content. **P2** — the `AudioServerPlugIn`
-    virtual mic + the shared-memory feed → present "macrdp Microphone". **P3** — format/clock robustness,
-    disconnect cleanup, silence/mute handling.
+  - **Phasing (mirror the camera feature):** **P0 ✅ DONE + LIVE-VERIFIED GREEN** (2026-09-01) — the
+    `AUDIO_INPUT` handshake behind the flag, inert: negotiate + log the client streaming its mic, drop the
+    audio (proved a real Win11 mstsc hands macrdp a continuous PCM mic stream over a server-direction DVC).
+    **P1 ✅ DONE + LIVE-VERIFIED** (2026-09-01) — `MACRDP_MIC_DUMP=1` writes the received PCM to a WAV under
+    `$TMPDIR` (`src/audin/wav_dump.rs`, behind the `AudinSampleSink` seam); verified real 17 s mono 44.1 kHz
+    voice (peak 100 % / RMS 2803 / 72 % active). **P2 — the `AudioServerPlugIn` virtual mic** (route A, C, no
+    entitlement), sub-phased: **P2a ✅ DONE + LIVE-VERIFIED GREEN** (2026-09-01) — the HAL plug-in skeleton presenting "macrdp
+    Microphone" with an internal 440 Hz test tone (`audioplugin/macrdp_mic.c` + `packaging/make-audio-plugin.sh`
+    + `packaging/install-audio-plugin.sh`); universal Developer-ID-signed bundle. **coreaudiod loads it, the
+    device appears as a clean INPUT-only 2ch/44100/Virtual device, and it delivers the exact tone** — captured
+    via ffmpeg/AVFoundation: 440 Hz (zero-crossings), −26.02 dBFS peak (= amplitude 0.05), pure sine (peak−RMS
+    = 3.01 dB). Fixed live: scope-aware `Streams` (was reporting phantom output channels).
+    **P2b — the shared-memory feed.** **P2b-0 ✅ DONE + VERIFIED** (2026-09-01) — proved a HAL plug-in inside
+    coreaudiod's sandbox (user `_coreaudiod`) can read POSIX shm (`/macrdp_mic_ring`, 0666) written by an
+    external different-user process (the one real P2b unknown). The plug-in drains the ring in `DoIOOperation`
+    (overrun→drop to half-ring, underrun→silence), 440 Hz fallback otherwise. Proof via audio: a 220 Hz test
+    writer → recorded 220 Hz @ −20 dB, not the fallback. **P2b-1 ✅ DONE + VERIFIED** (2026-09-01) — the real
+    `SharedMemSink : AudinSampleSink` (`src/audin/shm_sink.rs`, byte-for-byte mirror of
+    `audioplugin/macrdp_mic_ring.h`, PCM16 mono→Float32 stereo, release/acquire ordering; wired in
+    `build_processor`: MIC_DUMP→WAV, else macOS→feed, else None). Verified client-free: a layout test pins the
+    Rust struct to the C offsets, and feeding 330 Hz through the real sink recorded 330 Hz @ −20 dB off macrdp
+    Microphone. **✅ FULL RDP CHAIN LIVE-VERIFIED + EAR-VERIFIED** (2026-09-01) — a real Win11 client's mic
+    plays through macrdp Microphone as natural voice at normal pitch (user-confirmed via QuickTime). Fixed live:
+    the macOS ftruncate-once shm quirk (`3ba1599` — 2nd ftruncate on reuse → EINVAL → silent tone fallback).
+    **P2c ✅ DONE + VERIFIED** (2026-09-01) — plug-in no-feed output → SILENCE (verified idle = digital zeros,
+    tone behind compile-time `MACRDP_MIC_FALLBACK_TONE`), and a latency bound (~0.75 s → ~100 ms, jitter-safe);
+    live-verified no dropouts. Resample / drift deferred (mstsc uses 44100, none observed).
+    **P3 — remaining before merge (status 2026-09-16):**
+    - [x] CLI help: `--enable-microphone-redirection` no longer claims "Phase 0 protocol gate only" (`ec389e5`).
+      The camera flag had the same stale text since v0.9.0, fixed in `0a6f13b`.
+    - [x] Install-from-app embedding (2026-09-30, `94bd1ed`): `make-app.sh` embeds `macrdp-mic.driver` + its
+      installer; the controller's Settings → Redirection → Microphone installs / updates / removes it
+      (status compares build numbers). Verified end to end in the controller.
+    - [ ] Disconnect cleanup + silence/mute handling.
+    - [x] Docs (2026-09-30): mic entries in `docs/features.md`, `docs/cli.md`, `docs/configuration.md`,
+      `docs/architecture.md`, a user guide section in `docs/audio.md` (linked from the README), the
+      `config.env.example` keys, and the `--help` text (now points at the controller install).
+    - [x] **2026-09-30 — the code-review findings verified and fixed (Mac side).** Confirmed + fixed: the shm
+      ring is now version 2 — created only once the client negotiates the mic (never pre-auth), exclusively,
+      **0644**, wiped + unlinked at session end, with a random session id; the plug-in maps it **read-only**
+      (private read position), validates the header and indexes with compile-time sizes (the OOB read), maps
+      and follows segments from a 1 s background timer (the never-retry bug), and never unmaps from `StopIO`
+      (retired mappings are unmapped ≥500 ms later); `MACRDP_MIC_DUMP` uses the camera's `=1`/`true` rule and
+      is bridged from `config.env`; `WavDumpSink` finalizes + resets on renegotiation; the Rust tests parse
+      the C header's `#define`s and the header `_Static_assert`s the offsets; `micfeed_test.c` speaks v2; an
+      `fstat` log read uninitialized memory. Trust boundary documented in `docs/macos-gotchas.md` (5): other
+      local accounts can still READ a live stream — POSIX shm has no finer grant. Two macOS facts found on
+      the way: `shm_open` applies its mode exactly (no umask) and `fchmod` fails with EINVAL on shm (the old
+      `fchmod` was silently failing); `fstat` reports inode 0 for shm objects (hence the session id).
+      **Needs a live re-test** (install the plug-in, record the device with a real client's mic).
+      Deferred: the 250 ms latency-skip → a smoothing ramp (tuning, not a bug). The protocol-side findings
+      (48 kHz advertisement, unchecked client format, version parsing) were fixed later the same day — see
+      below.
+    - [x] Renumbered vendored divergence (24) → (25) (2026-09-30); (24) stays reserved for PR #183.
+    - [x] Protocol-side review findings fixed (2026-09-30): only 16-bit PCM 44.1 kHz advertised/accepted, the
+      matching client entry opened by its index (was hard-coded 0), no Open without one, Format Change
+      followed only to an acceptable format; version handling tidied. Tests in `src/audin/mod.rs`.
+    - [ ] **Shipping AHEAD of the pin bump (decided 2026-09-30)** on divergence (25); adopt upstream
+      `ironrdp-rdpeai` at the bump (port the sinks; the Mac side carries over).
+    - [ ] **Decided 2026-09-30: adopt upstream's `ironrdp-rdpeai`** (#1645, merged 08-12; server integration
+      #1946, merged 09-22 — both after our 08-03 pin) at the next IronRDP version bump, in place of the
+      vendored `AudinServer`. (Superseded in part the same day: the mic ships ahead on divergence (25) —
+      see the item above — and the switch to upstream happens at the bump.)
+    - [x] Rebased onto `main` 2026-09-30 (20 commits; backup branch `feat/microphone-redirection-phase0-pre-p3`).
   - **Module placement:** new `src/audio_input/` (`mod.rs` = the `AUDIO_INPUT` DVC backend + factory/policy,
     `feed.rs` = the shared-memory producer into the HAL plug-in), mirroring `src/camera/`. The plug-in bundle:
     `gui/Sources/macrdpmic` (an `AudioServerPlugIn` `.driver`) + a `packaging/make-audio-plugin.sh` +
@@ -131,7 +240,8 @@ then delete; promote a parked item to *In flight* when work actually starts.
   VT decode). **Phase 3 COMPLETE — LIVE-VERIFIED GREEN 2026-07-20**: a client webcam redirected over MS-RDPECAM now
   presents as a **live macOS camera** (Photo Booth, ~30 fps, zero dropped frames) via a hand-assembled
   (no-Xcode) CoreMediaIO Camera system extension — 3a activation + 3b sink feed + 3c 420v format, all green.
-  As far as is known the first OSS RDP *server* to present a client-redirected webcam as a native OS camera.
+  As far as is known the first on macOS to present a client-redirected webcam as a native OS camera (NOT the first
+  OSS RDP server overall — gnome-remote-desktop 50 did it earlier on Linux; corrected 2026-09-30).
   **Four silent CMIO failure modes were found and are documented in `docs/camera-extension-setup.md` — read
   it before touching this**: bundle filename must == bundle id; `signingID` is literally "unknown" (so sink
   producer auth is impossible and a rejecting hook surfaces as a bogus `-4`); `kCMIOStreamPropertyDirection`
@@ -328,7 +438,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   encoder is pointless. The 1+1 redundancy stand-in (above) is the only loss-resilience
   lever reachable for a modern client. Would only reopen with legacy-Windows-8.x test
   machines, which isn't a realistic target. See the "Industry status" + "P2.3 FEC capture
-  RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/ironrdp-rdpeudp/CLAUDE.md`.
+  RESULT" notes in `docs/rdp-udp-multitransport-feasibility.md` + `vendor/macrdp-rdpeudp/CLAUDE.md`.
 
 - [ ] **Generic USB redirection (MS-RDPEUSB) — FreeRDP: DRIVE MOUNTS ✅✅ (Phase 3.2 bulk). mstsc: ENUMERATES + CONFIGURES + negotiates FORMAT ✅ (2026-07-07); only gap = client doesn't deliver bulk frames (mstsc-side). Remaining: camera-redirection channel, device-class streaming (isoch/interrupt), retract/multi-device.**
   **mstsc now enumerates, configures, and negotiates format end-to-end** (verified camera `09da:2692`
@@ -518,6 +628,14 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Parked — scoped, low priority
 
+- [ ] **Lossy audio + `--udp-migrate-egfx` on UDP together.** Today a connection gets one Soft-Sync, and
+  lossy audio takes it, so video stays on TCP. Fix: offer a reliable and a lossy tunnel, then one Soft-Sync
+  with two channel lists. The 2026-11-16 spike showed mstsc opens both tunnels (local stash `spike: second
+  reliable UDP offer`). The listener already keys peers by address; the work is per-tunnel state in
+  `mt/session.rs`, a list-taking `request_soft_sync` in the dvc fork, and per-tunnel recovery. Disconnect must
+  retire both tunnels' bound flags, or the listener reads the idle one as dead. Low value on a LAN, where
+  video over UDP gains little over TCP.
+
 - [x] **Headless-lock arc — LANDED on `main` 2026-07-23 (pending a release tag).** Merged this
   session: **`--shield-primary`** opt-in lockable headless blanking (#170; single-panel engage
   #171, @antonmos), the **`Ctrl+Alt+G` majority-area gather** (mostly-off windows now swept),
@@ -624,6 +742,30 @@ then delete; promote a parked item to *In flight* when work actually starts.
 
 ## Upstreaming watch (no action unless a release lands)
 
+- **▶ UPDATE 2026-09-16 — supersedes the "ZERO open clintcan PRs" note below.** clintcan has 0 open
+  upstream PRs and 2 open issues (#1484, #1969). Detail: the `project_upstream_ironrdp_open_prs` memory
+  and the divergence notes in `docs/ironrdp-divergences.md`.
+  - **Divergence (23), second-client preemption, is upstream — with traps.** #1476 MERGED 2026-09-08;
+    #1913 MERGED 2026-09-11 replaced its bool with `ConnectionPolicy { Queue (default), Reject, Preempt }`
+    via `with_connection_policy`. The bump must add `.with_connection_policy(ConnectionPolicy::Preempt)`
+    or takeover silently reverts to the pre-#174 hang. Not drop-in: upstream also invalidates the ARC
+    cookie on eviction, and has the #1969 bug. #1483 CLOSED 2026-09-15 as resolved by #1476 + #1913.
+  - **#1969** (filed 2026-09-16, reproduced + confirmed causal): under `ConnectionPolicy::Preempt`,
+    `on_connection_info` never reaches the handler, because `run()` takes the handler out for the race.
+    **FIXED upstream 2026-10-01 by antonmos's #2065** (merged by CBenoit; the handler is now shared via
+    `Rc<RefCell<…>>` instead of taken; your three repro tests ship with it). So (22)/(23) can de-vendor with
+    `.with_connection_policy(ConnectionPolicy::Preempt)`, and (18) is unblocked. #1934 (preemption as the
+    default under Hybrid) is still open — #2065 was its prerequisite. Repro test is committed locally on
+    the IronRDP clone branch `repro/preempt-drops-handler-hooks` (not pushed).
+  - **Divergence (18), `on_authenticated`, → #1484.** glamberson green-lit filing the patch 2026-09-05 (a
+    peer, not a maintainer). The held patch is 392 commits stale and conflicts; it was blocked on #1969, which is **now fixed (#2065,
+    2026-10-01)** — so it can be rebased and filed.
+  - **Overlapping upstream work to evaluate at the next bump:** divergence (12) multitransport ↔
+    glamberson's stack #1951 → #1953 → #1954, **all merged (#1954 on 2026-09-30)** (reliable-UDP EGFX only — no
+    lossy audio, no mid-session de-migration); the mic divergence (25) ↔ the `ironrdp-rdpeai` crate on master
+    (#1645, 2026-08-12) plus #1946's `ironrdp-server` integration (merged 2026-09-22).
+  - Merged since the previous update: #1556, #1690, #1417, #1711, #1769, #1691.
+
 - IronRDP forks are effectively permanent (each carries un-upstreamed divergences:
   multitransport, rdpdr server-direction, smartcard, acceptor KLID+MT, audio-lag/resize/dispatch,
   server ARC auto-reconnect cookie). **#1359 (rdpsnd) + #1397 (acceptor keyboard-layout on
@@ -711,7 +853,93 @@ then delete; promote a parked item to *In flight* when work actually starts.
   `start(&NegotiatedFormat)`), dropping the hand-rolled `wFormatNo` index logic; (b) past `d471bd06`
   → `main.rs` switches `set_honor_client_desktop_size(bool)` to the builder `with_honor_client_desktop_size`
   (and, once #1404 lands, re-route the shipped `--max-client-size` clamp — currently a local acceptor/server divergence extension, 2026-07-09 — through the upstream `Option<DesktopSize>` honor-size API).
-- [ ] **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
+- [x] **DONE — the e258f6a0 bump shipped in v0.10.0 (#194); history below.** **PIN BUMP a5d1c682 → e258f6a0 — DRY RUN DONE 2026-10-01** (branch `chore/pin-bump-e258f6a0`;
+  391 upstream commits; **no crate version changed**, so only the git revs move).
+  - **3-way merge (old base / our fork / new upstream), conflict hunks:** server **83** (`server.rs` 58,
+    `builder.rs` 14, `lib.rs` 4, `Cargo.toml` 4), rdpdr **39** (`esc/mod.rs` 20 = our smart-card side,
+    `efs.rs` 17 = our server-side decode vs upstream's new `src/server.rs`), acceptor **14**
+    (`connection.rs` 11), dvc **3** (`pdu.rs`, Soft-Sync vs upstream #1584). 139 total.
+  - **Build cascade (forks fail before `src/` compiles):** (1) the dvc fork MUST go — upstream's newer
+    `ironrdp-rdpeusb` needs upstream dvc's `DvcClientProcessor`, and the two-sided `[patch]` forces our old
+    fork on everyone; (2) rdpdr fork: `efs.rs:1606` call now takes 5 args; (3) acceptor fork: connector
+    `step()` gained a 4th param (3 sites) + a method gained an arg (4 sites); (4) with all three swapped
+    for upstream, the vendored server has **37 errors** (`server.rs` 18, `rdpdr.rs` 15, `rdpeusb.rs` 3,
+    `multitransport/mod.rs` 1) — mostly our own fork-only items (fingerprint fields, `ScardControlRequest`,
+    Soft-Sync `TUNNELTYPE_UDPFEC{L,R}` → upstream `SoftSyncTunnelType`), plus upstream removals
+    (`DrdynvcServer::get_channel_id_by_name`, `TsUrbResultPayload::Raw`). `src/` not reached yet.
+  - **Structural:** upstream added `server/src/multitransport.rs` (clashes with our
+    `src/multitransport/` dir — rename ours); upstream now has its OWN `ironrdp-rdpeudp` crate (name
+    clash with `vendor/ironrdp-rdpeudp` — rename via `package =` or drop ours); stray committed
+    `Cargo.toml.orig` in the vendored server to delete.
+  - **Triage correction:** acceptor (3) is only half group-1 — the client MT flags are upstream, but our
+    acceptor-side MT *offer* (`MultitransportOffer`, `multitransport_offered`) isn't (upstream offers via
+    #1951) → goes with the UDP work.
+  - **Order:** drop dvc fork (port Soft-Sync use) → rebase acceptor → rebase rdpdr (keep ESC) → rebase
+    server (group 1 drop, group 3 keep, group 2 as-is, rename multitransport dir) → `src/` →
+    tests → live mstsc/FreeRDP → 48–72 h soak incl. a headless mode → v0.10.0.
+  - **▶ PROGRESS 2026-10-01: code steps DONE** (commits `accaf99`..`134d2e5`): dvc fork shrunk to one
+    addition, acceptor/rdpdr/server re-vendored as upstream-verbatim + our files + marked hooks
+    (`docs/ironrdp-divergences.md`; old log frozen in `docs/ironrdp-divergence-history.md`), `vendor/ironrdp-rdpeudp`
+    → `vendor/macrdp-rdpeudp`, `src/` on the new API (`ConnectionHooks`, builder chain incl.
+    `ConnectionPolicy::Preempt`). 266 tests pass; fmt/clippy/deny clean on macOS; Linux = CI.
+    **NEXT — live tests:** ARC after a process RESTART (upstream HMAC now denies it), Preempt takeover,
+    FreeRDP minimize (upstream now advertises SuppressOutput), `/gfx:progressive` decline, UDP (mstsc
+    migrate-egfx, lossy audio, watchdog), RDPDR mstsc write + smart card, USB SelectConfiguration,
+    audio/AAC, NSCodec on Windows App, iOS taps + horizontal-scroll SIGN; also from the audit
+    caveats: a blank-recovery heal still works with the ARC cookie rotating on each reactivation,
+    the UDP offer still reaches mstsc (it's now gated on the MCS message channel), and no URBDRC
+    decode errors (upstream's stricter isoch-shaped completion decode). Then soak → v0.10.0 → close #182.
+  - **▶ LIVE on the Mac mini 2026-10-01/02** (draft PR #194, entitled build, Windows App + sdl-freerdp from
+    the MacBook). **PASS:** no-AVC `/gfx` client declined + stays up on legacy; FreeRDP minimize now sends
+    SuppressOutput (suppress→resume, IDR on restore); FreeRDP in-process auto-reconnect (2 network drops
+    overnight); Preempt takeover (Windows App evicted FreeRDP with ERRINFO, no ping-pong); Windows App
+    reconnect after a process restart (normal NLA logon, no cookie rejection — a client that PRESENTS a
+    stale cookie is still untested). **Found + fixed on main:** flaky pasteboard tests (#195), blank
+    recovery firing after a slow login (#196, live-verified: 6.7 s login, no reactivation). **Not a
+    regression:** client→mini clipboard intermittently missing on BOTH builds (see Deferred). **Also PASS
+    (10-02):** FreeRDP drive read + write (byte-exact both ways, mkdir/rename/delete; run inside the
+    session via `~/t.sh` — SSH can't touch the NFS mount); audio (Windows App, PCM, clear; FreeRDP
+    negotiated AAC); NSCodec (Windows App with H.264 off: sharp picture, ~1.5 Mbit/s — upstream logs no
+    codec choice, so that's inference + the `conn_test` canary). **Still to do:** mstsc UDP/RDPDR/smart
+    card, USB, iOS. Mini helpers: `~/swap.sh bump|v096`, backups
+    `~/macrdp.app.v0.9.6.prebump.bak` + `config.env.prebump.bak` + plist `.prebump.bak`.
+  - **▶ LIVE 2026-10-28, FreeRDP 3.26 from the MacBook over ZeroTier, build cbd4aff.** **PASS:** H.264
+    (picture live, checked by screenshot); AAC audio (client opened an AAC device, ~1,800 waves, 0
+    decode errors); minimize → 0 bytes in (video paused + audio muted) → restored; drive (3 MB read and
+    2 MB write byte-exact, append, mkdir + nested write, rename, delete — run in-session via
+    `open -a Terminal x.command`, since SSH can't touch the NFS mount); clipboard both ways
+    (sdl-freerdp only announces a local copy on focus-in — client behaviour); Preempt takeover with
+    ERRINFO; `/gfx:progressive` declined to legacy, stayed up.
+  - [x] **FIXED 2026-10-28 (vendored server divergence (30), d1412f7): falls back to a normal logon
+    instead; test `conn_test::a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon`, mutation-checked;
+    live-verified on the mini (restart under FreeRDP → one reconnect, normal logon, H.264, no lockout;
+    rollback `~/macrdp.app.bump-cbd4aff.bak`). Raised upstream 2026-10-29 as Devolutions/IronRDP#2280 (fix + test on local IronRDP branch `scratch/arc-fallback`, PR on request); drop (30) once the pin carries a fix. Still to do: check mstsc.**
+    Original report — **REGRESSION: a stale auto-reconnect cookie after a server restart denies the
+    connection, evicts the live session and locks out the client's IP.** Repro: FreeRDP with
+    `+auto-reconnect` connected, `launchctl kickstart -k` the agent. The client auto-reconnects
+    presenting its old cookie; CredSSP succeeds (`auth outcome=success`), then
+    `verify_auto_reconnect_cookie` fails → `send_access_denied` + `ServerError("cookie rejected")`
+    (`crates/ironrdp-server/src/server.rs` ~4577, (clintcan/IronRDP)). FreeRDP keeps the cookie and retries ~3/s with its
+    counter stuck at 0, and each try ends errored in < 1 s, so `auth_guard::classify_outcome` counts
+    it as a Failure → `reject reason=lockout` after 5 (30 s, then 59 s), blocking every client from
+    that IP. Preempt runs before the cookie check, so each try also EVICTS whoever is connected. `main`
+    is unaffected (its div 13 never validated the returning cookie). Likely fix: on an invalid cookie,
+    fall back to a normal logon (`is_auto_reconnect = false`, so the credential path still runs)
+    instead of denying — check MS-RDPBCGR's ARC rules first, and raise it upstream. mstsc likely hits
+    it too (it presents the cookie on auto-reconnect) — verify when at the Windows machine.
+  - [ ] **After the bump lands: lock the vendor-crate CI steps (supply chain).** *(2026-11-20, #225:
+    the server step now runs `--locked` on a checkout of clintcan/IronRDP; the rdpeudp step is left.)*
+    The rdpeudp step, and
+    the `ironrdp-server` unit-test step from #228, ran `cargo test --manifest-path vendor/…`
+    with no `--locked` and no committed lockfile (`.gitignore` has `vendor/*/Cargo.lock`), so every CI
+    run resolves crates.io fresh ("Locking 377 packages to latest…") and would execute a newly
+    published malicious release. Contained (no secrets, `contents: read`, harden-runner audit-only,
+    rust-cache keyed per job so release builds don't restore it), but unvetted code still runs.
+    Fix: un-ignore + commit those two `Cargo.lock`s, generated once against the new pin, and add
+    `--locked` to both steps; refresh them whenever a vendored crate changes. Running the server tests
+    from the root lockfile instead doesn't work: `cargo test -p ironrdp-server --lib --locked` fails
+    with "requires dev-dependencies and is not a member of the workspace" (checked 2026-10-27).
+- [x] **DONE — the e258f6a0 bump shipped in v0.10.0 (#194); history below.** **THE PIN BUMP — scoped 2026-07-08, harvest-triggered, DECIDED: hold for now (do NOT bump
   opportunistically).** Current pin `879ffed` (2026-05-25, ~6 wk stale); a bump is all-or-nothing
   (15 git pins + all 6 vendor forks are version-coupled; breaking `core 0.1→0.2` / `pdu 0.7→0.8` /
   `dvc 0.5→0.7` / `server 0.10→0.12`) and churns every vendored crate, so it runs as its OWN
@@ -745,7 +973,7 @@ then delete; promote a parked item to *In flight* when work actually starts.
   (do NOT file a competing PR): (a) the ironrdp-server seam = uchouT's OPEN PR #1417 (adds
   ServerBuilder::with_usb_factory + src/urbdrc.rs + UsbDeviceHandle + per-device backend — near-exact
   match to div 16; blocked by #1416, stale 07-15); (b) when #1417+#1394 merge + pin bump, macrdp adopts
-  upstream's with_usb_factory/UsbDeviceHandle/backend and DELETES vendor/ironrdp-server/src/rdpeusb.rs.
+  upstream's with_usb_factory/UsbDeviceHandle/backend and DELETES crates/ironrdp-server/src/rdpeusb.rs (clintcan/IronRDP).
   Only constructive move for us: VALIDATE #1417 from macrdp's real-URBDRC-server perspective (like the
   #1509 validation) once it's unblocked. Track it, don't file. Pin-bump-era adoption. -->
   clipboard, RDPDR, blank-recovery, USB if entitled) → ship as its own release with nothing else

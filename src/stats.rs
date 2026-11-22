@@ -82,6 +82,24 @@ pub struct SessionStats {
 }
 
 impl SessionStats {
+    /// Zeroes the per-session values; `aac` is process config.
+    pub fn session_ended(&self) {
+        self.end_video_session();
+        for v in [
+            &self.width,
+            &self.height,
+            &self.bitrate_bps,
+            &self.ceiling_bps,
+            &self.rtt_ms,
+            &self.queue_delay_ms,
+            &self.fps,
+        ] {
+            v.store(0, Ordering::Relaxed);
+        }
+        self.frames_sent.store(0, Ordering::Relaxed);
+        self.adaptive.store(false, Ordering::Relaxed);
+    }
+
     pub fn end_video_session(&self) {
         self.connected.store(false, Ordering::Relaxed);
         self.ack_samples.store(0, Ordering::Relaxed);
@@ -274,6 +292,25 @@ pub async fn serve(port: u16, stats: Arc<SessionStats>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_end_reports_disconnected_and_zeros() {
+        let s = SessionStats::default();
+        s.connected.store(true, Ordering::Relaxed);
+        s.width.store(3024, Ordering::Relaxed);
+        s.bitrate_bps.store(5_000_000, Ordering::Relaxed);
+        s.frames_sent.store(900, Ordering::Relaxed);
+        s.adaptive.store(true, Ordering::Relaxed);
+        s.aac.store(true, Ordering::Relaxed);
+        s.session_ended();
+        let j = s.to_json();
+        assert!(j.contains("\"connected\":false"));
+        assert!(j.contains("\"width\":0"));
+        assert!(j.contains("\"bitrate_bps\":0"));
+        assert!(j.contains("\"frames_sent\":0"));
+        assert!(j.contains("\"adaptive\":false"));
+        assert!(j.contains("\"aac\":true"), "aac is process config");
+    }
 
     #[test]
     fn video_end_hides_activity_and_invalidates_acks_without_resetting_counters() {

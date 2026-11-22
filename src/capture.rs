@@ -12,8 +12,14 @@ use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat, RdpServerDisplay,
-    RdpServerDisplayUpdates,
+    RdpServerDisplayUpdates, ServerError, ServerErrorExt as _, ServerResult,
 };
+
+/// The server's display traits use its own error type; capture code uses anyhow.
+/// Keeps the whole context chain in the message (the server logs it with `{:#}`).
+fn display_error(error: anyhow::Error) -> ServerError {
+    ServerError::reason("display capture", format!("{error:#}"))
+}
 use tokio::sync::Notify;
 
 use std::sync::atomic::AtomicU64;
@@ -114,79 +120,78 @@ pub const RESIZE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// monitor-layout PDU the client sends; the capture loop calls
 /// [`PendingResize::take_settled`] each iteration and only acts once
 /// [`RESIZE_DEBOUNCE`] has passed since the *last* PDU, so a multi-tick drag
-/// produces one resize, not one per tick, even on an idle desktop.
+/// produces one resize, not one per tick. Same epoch+millis pattern as
+/// [`ClickSignal`] — one `Arc`, lock-free.
 #[derive(Clone)]
 pub struct PendingResize {
     inner: Arc<PendingResizeInner>,
 }
 
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-struct ResizeRequest {
-    size: (u16, u16),
-    requested_at: Instant,
-}
-
 struct PendingResizeInner {
-    request: std::sync::Mutex<Option<ResizeRequest>>,
-    changed: Notify,
+    epoch: Instant,
+    /// Packed size of the most recently requested resize. Meaningless while
+    /// `last_update_ms == 0`.
+    size: AtomicU32,
+    /// Milliseconds since `epoch` of the last `request()` call; 0 = no
+    /// pending request (never requested, or already consumed).
+    last_update_ms: AtomicU64,
 }
 
 impl PendingResize {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PendingResizeInner {
-                request: std::sync::Mutex::new(None),
-                changed: Notify::new(),
+                epoch: Instant::now(),
+                size: AtomicU32::new(0),
+                last_update_ms: AtomicU64::new(0),
             }),
         }
     }
 
-    /// Replace the size and its timestamp together, then wake idle capture.
+    fn now_ms(&self) -> u64 {
+        self.inner.epoch.elapsed().as_millis() as u64
+    }
+
+    /// Record a resize request "now", superseding any not-yet-settled
+    /// request — only the most recent size in a drag matters.
     pub fn request(&self, width: u16, height: u16) {
-        *self.inner.request.lock().unwrap() = Some(ResizeRequest {
-            size: (width, height),
-            requested_at: Instant::now(),
-        });
-        self.inner.changed.notify_one();
-    }
-
-    fn clear(&self) {
-        *self.inner.request.lock().unwrap() = None;
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    pub fn has_pending(&self) -> bool {
-        self.inner.request.lock().unwrap().is_some()
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    fn deadline(&self, debounce: Duration) -> Option<Instant> {
         self.inner
-            .request
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|request| request.requested_at + debounce)
+            .size
+            .store(pack_size(width, height), Ordering::Relaxed);
+        // max(1) so a request at t≈0 isn't mistaken for "none pending".
+        self.inner
+            .last_update_ms
+            .store(self.now_ms().max(1), Ordering::Relaxed);
     }
 
-    #[cfg(any(target_os = "macos", test))]
-    async fn changed(&self) {
-        self.inner.changed.notified().await;
+    /// True if a request is outstanding (settled or not yet). The capture
+    /// loop uses this to decide whether to poll on a bounded timeout instead
+    /// of blocking indefinitely on the next camera sample.
+    pub fn has_pending(&self) -> bool {
+        self.inner.last_update_ms.load(Ordering::Relaxed) != 0
     }
 
-    /// Consume the latest request only after the drag settles.
-    #[cfg(any(target_os = "macos", test))]
+    /// If a request has been outstanding for at least `debounce` with no
+    /// newer request superseding it, consume and return it. Returns `None`
+    /// if nothing is pending or it hasn't settled yet.
     pub fn take_settled(&self, debounce: Duration) -> Option<(u16, u16)> {
-        let mut request = self.inner.request.lock().unwrap();
-        if request.as_ref()?.requested_at.elapsed() < debounce {
+        let last_ms = self.inner.last_update_ms.load(Ordering::Relaxed);
+        if last_ms == 0 {
             return None;
         }
-        request.take().map(|request| request.size)
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    fn take_settled_change(&self, debounce: Duration, current: (u16, u16)) -> Option<(u16, u16)> {
-        self.take_settled(debounce).filter(|&size| size != current)
+        if self.now_ms().saturating_sub(last_ms) < debounce.as_millis() as u64 {
+            return None;
+        }
+        // Only consume if nothing newer raced in since we read `last_ms`.
+        if self
+            .inner
+            .last_update_ms
+            .compare_exchange(last_ms, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        Some(unpack_size(self.inner.size.load(Ordering::Relaxed)))
     }
 }
 
@@ -297,7 +302,7 @@ impl Drop for CountedUpdates {
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for CountedUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         self.inner.next_update().await
     }
 }
@@ -316,9 +321,9 @@ pub struct CaptureDisplay {
     /// mirror-primary path when no explicit `--width`/`--height`/`--hidpi`
     /// was given; `--no-client-resolution` opts out.
     ///
-    /// The actual size negotiation happens in the vendored
-    /// `ironrdp-acceptor` (`honor_client_desktop_size`, wired via
-    /// `RdpServer::set_honor_client_desktop_size`): the client's true
+    /// The actual size negotiation happens in `ironrdp-acceptor`
+    /// (`set_honor_client_desktop_size`, wired via the server builder's
+    /// `with_honor_client_desktop_size`): the client's true
     /// request is only visible in its GCC Client Core Data, and the
     /// acceptor commits a size in Demand Active before any server code
     /// runs. This flag's job is the receiving end — adopt the negotiated
@@ -374,18 +379,20 @@ pub struct CaptureDisplay {
     /// Trailing flush frames re-sent after the last change to drain mstsc's
     /// presentation buffer (`--flush-frames`; EGFX/H.264 path only). 0 disables.
     pub flush_frames: u32,
-    /// Experimental trailing-picture cadence; None preserves capture cadence.
-    pub flush_interval: Option<std::time::Duration>,
+    /// `--capture-nv12` (experimental): ScreenCaptureKit delivers NV12 that the
+    /// encoder takes as-is, instead of BGRA it converts on the CPU. No effect
+    /// without H.264.
+    pub flush_interval: Option<Duration>,
+    pub capture_nv12: bool,
     /// Shared "client minimized" flag from the vendor server's
     /// `SuppressOutput` handler. When set, `next_update` short-circuits
     /// (no SCK pull, no encode, no ship) and waits on a short timer
-    /// until the flag clears, at which point H.264 forces an IDR and the
-    /// bitmap path forces one full repaint so the client resumes from a
-    /// clean surface. `None` disables the gate entirely (single-binary builds
+    /// until the flag clears, at which point the H.264 path forces an
+    /// IDR keyframe so the client can resume from a clean reference
+    /// frame. `None` disables the gate entirely (single-binary builds
     /// where the server doesn't expose the handle — e.g., the non-macOS
     /// stub).
     pub display_suppressed: Option<Arc<AtomicBool>>,
-    pub display_suppressed_changed: Arc<Notify>,
     /// Client-driven live-resize request in flight (MS-RDPEDISP monitor
     /// layout — the client resized its window mid-session). `request_layout`
     /// writes to it; the capture loop polls + debounces it into an actual
@@ -411,6 +418,14 @@ pub struct CaptureDisplay {
     /// pinned off there, and `updates()` re-modes the display to match
     /// `desktop_size` before each capture stream is built.
     pub virtual_display: Option<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
+    /// When the virtual display runs HiDPI (`--virtual-display-hidpi`). With
+    /// `Auto`, decided per connection from the client's desktop scale factor
+    /// in `sync_virtual_display`.
+    pub vd_hidpi: crate::virtual_display::HidpiPolicy,
+    /// The session's UI scale for the pointer (see `pointer_scale`): set at
+    /// connect and from each monitor layout, and read live by the capture
+    /// loop so a scale change resends the pointer.
+    pub pointer_ui_scale: Arc<std::sync::atomic::AtomicU32>,
 
     /// The `--capture-primary` blanking guard (shared with main.rs), so a live
     /// re-mode can **re-assert the gamma-black** after it: a display
@@ -437,6 +452,59 @@ pub struct CaptureDisplay {
         Option<Arc<std::sync::Mutex<Option<crate::virtual_display::ShieldedPrimary>>>>,
 }
 
+/// Which of ScreenCaptureKit's displays to mirror when no virtual display is
+/// set: the main display, which is the one input maps the mouse onto
+/// (`CGDisplay::main()`), falling back to the first. SCK doesn't list the main
+/// display first on every multi-monitor Mac, and mirroring another one put the
+/// picture on one monitor and the mouse on a different one (#205). Pure, so
+/// it's unit-tested on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mirror_display_index(display_ids: &[u32], main_id: u32) -> Option<usize> {
+    if display_ids.is_empty() {
+        return None;
+    }
+    Some(
+        display_ids
+            .iter()
+            .position(|&id| id == main_id)
+            .unwrap_or(0),
+    )
+}
+
+/// Vendor id on every macrdp virtual display descriptor ("macr").
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const VIRTUAL_DISPLAY_VENDOR: u32 = 0x6D616372;
+
+/// One display SCK lists, as the capture reopen sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct OnlineDisplay {
+    id: u32,
+    vendor: u32,
+    builtin: bool,
+    size_px: (u32, u32),
+}
+
+/// The id a lost virtual display came back under: the same id, else the only
+/// display with our vendor id, else the only external display of the session's
+/// size. `None` while it is not back. Waking can make WindowServer re-register
+/// the virtual display under a new id, and the old one never returns.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn pick_reopened_display(old: u32, online: &[OnlineDisplay], size_px: (u32, u32)) -> Option<u32> {
+    if online.iter().any(|d| d.id == old) {
+        return Some(old);
+    }
+    let unique = |f: &dyn Fn(&OnlineDisplay) -> bool| {
+        let mut it = online.iter().filter(|d| f(d));
+        match (it.next(), it.next()) {
+            (Some(d), None) => Some(d.id),
+            _ => None,
+        }
+    };
+    unique(&|d| d.vendor == VIRTUAL_DISPLAY_VENDOR)
+        .or_else(|| unique(&|d| !d.builtin && d.size_px == size_px))
+}
+
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
 ///
 /// Returns `None` on non-macOS targets so the caller can fall back to a stub
@@ -453,7 +521,11 @@ pub async fn primary_display_size() -> Result<Option<(u16, u16)>> {
             anyhow!("AsyncSCShareableContent::get failed (Screen Recording permission?): {e:?}")
         })?;
         let displays = content.displays();
-        let display = displays.first().context("no displays available")?;
+        let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
+        let main_id = core_graphics::display::CGDisplay::main().id;
+        let display = mirror_display_index(&ids, main_id)
+            .map(|i| &displays[i])
+            .context("no displays available")?;
         let w = u16::try_from(display.width()).context("display width > u16")?;
         let h = u16::try_from(display.height()).context("display height > u16")?;
         Ok(Some((w, h)))
@@ -484,7 +556,8 @@ fn adopt_client_size(
 ) -> Option<DesktopSize> {
     if auto_size
         && (client.width, client.height) != current
-        && valid_client_size(client.width, client.height)
+        && (200..=8192).contains(&client.width)
+        && (200..=8192).contains(&client.height)
     {
         Some(client)
     } else {
@@ -492,8 +565,21 @@ fn adopt_client_size(
     }
 }
 
-fn valid_client_size(width: u16, height: u16) -> bool {
-    (200..=8192).contains(&width) && (200..=8192).contains(&height)
+/// Clamp a client-requested size to `--max-client-size`, per dimension.
+///
+/// The acceptor clamps the size it negotiates in Demand Active, but
+/// `request_initial_size` receives the client's Confirm Active echo, which a
+/// client can fill with its own requested size instead (mstsc asking for
+/// 3840x2160 was observed doing so, issue #211). The echo is client-controlled,
+/// so the ceiling has to be applied here too, before anything is sized from it.
+fn cap_client_size(client: DesktopSize, max: Option<DesktopSize>) -> DesktopSize {
+    match max {
+        Some(max) => DesktopSize {
+            width: client.width.min(max.width),
+            height: client.height.min(max.height),
+        },
+        None => client,
+    }
 }
 
 #[async_trait::async_trait]
@@ -531,6 +617,12 @@ impl RdpServerDisplay for CaptureDisplay {
             return DesktopSize { width, height };
         }
 
+        // A new connection (reactivations we trigger returned above). The
+        // server has just published the scale this client announced.
+        self.pointer_ui_scale
+            .store(self.vd_hidpi.ui_scale(), Ordering::Relaxed);
+
+        let client_size = cap_client_size(client_size, self.max_client_size);
         if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), client_size) {
             tracing::info!(
                 client_w = adopted.width,
@@ -589,8 +681,20 @@ impl RdpServerDisplay for CaptureDisplay {
             return;
         };
 
+        // Moving the client window between displays of different scale (a
+        // Retina panel and a 1x monitor) can change the scale with or without
+        // the size, so this re-modes even when the size is unchanged.
+        let scale_changed = self
+            .vd_hidpi
+            .observe_client_scale(monitor.desktop_scale_factor());
+        let layout_ui_scale = self.vd_hidpi.ui_scale();
+        // Read live by the capture loop, so a change resends the pointer even
+        // when this layout doesn't re-mode the display.
+        self.pointer_ui_scale
+            .store(layout_ui_scale, Ordering::Relaxed);
+
         let (w, h) = monitor.dimensions();
-        let (Ok(mut width), Ok(mut height)) = (u16::try_from(w), u16::try_from(h)) else {
+        let (Ok(width), Ok(height)) = (u16::try_from(w), u16::try_from(h)) else {
             tracing::warn!(
                 w,
                 h,
@@ -599,33 +703,81 @@ impl RdpServerDisplay for CaptureDisplay {
             return;
         };
 
-        if let Some(max) = self.max_client_size {
-            width = width.min(max.width);
-            height = height.min(max.height);
-        }
+        let requested = cap_client_size(DesktopSize { width, height }, self.max_client_size);
+        let (cur_w, cur_h) = self.desktop_size.get();
+        let Some(adopted) = adopt_client_size(resizable, (cur_w, cur_h), requested) else {
+            // Size unchanged (or outside the protocol-legal band): only a
+            // scale change still needs a re-mode, at the current size.
+            if scale_changed {
+                tracing::info!(
+                    ui_scale = self.vd_hidpi.ui_scale(),
+                    "client display scale changed — re-moding at the same size (debounced)"
+                );
+                self.pending_resize.request(cur_w, cur_h);
+            }
+            return;
+        };
 
-        if valid_client_size(width, height) {
-            // A drag can return to the current size before the earlier
-            // request settles. Queue the final layout and compare at apply.
-            self.pending_resize.request(width, height);
-        }
+        tracing::info!(
+            client_w = adopted.width,
+            client_h = adopted.height,
+            prev_w = cur_w,
+            prev_h = cur_h,
+            desktop_scale_factor = ?monitor.desktop_scale_factor(),
+            ui_scale = self.vd_hidpi.ui_scale(),
+            "client resized its window — resizing the session (debounced)"
+        );
+        self.pending_resize.request(adopted.width, adopted.height);
     }
 
-    fn session_ended(&mut self) {
-        self.pending_resize.clear();
-        self.suppress_next_adopt.store(false, Ordering::Relaxed);
-    }
-
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
         let (width, height) = self.sync_virtual_display();
-        self.build_updates(width, height).await
+        self.build_updates(width, height)
+            .await
+            .map_err(display_error)
     }
 }
 
 impl CaptureDisplay {
+    /// How much to enlarge the pointer on the HiDPI virtual display, whose
+    /// cursor SkyLight returns as the 1× image (measured: a 28×40 arrow whose
+    /// NSCursor has 28×40 points, at both UI scales).
+    ///
+    /// The factor is the session's pixels per point: with "Optimize for
+    /// Retina displays" on, Windows App draws session pixels (pointer
+    /// included) 1:1, so a 2x session needs a 2x pointer and a 1x session a
+    /// 1x one. With `Auto` it comes from `pointer_ui_scale`, which follows
+    /// the client's monitor layouts; `On` uses the session width over points.
+    /// The pointer-scale cell for the capture loop to follow, with the
+    /// `--cursor-scale` multiplier it applies on top. `Some` only for `Auto`
+    /// on the HiDPI virtual display, where the pointer scale changes
+    /// mid-capture.
+    fn live_pointer_scale(&self) -> Option<(Arc<std::sync::atomic::AtomicU32>, f64)> {
+        let hidpi = self
+            .display_id
+            .is_some_and(crate::virtual_display::is_hidpi_virtual_display);
+        (hidpi && matches!(self.vd_hidpi, crate::virtual_display::HidpiPolicy::Auto(_)))
+            .then(|| (self.pointer_ui_scale.clone(), self.cursor_scale))
+    }
+
+    fn pointer_scale(&self, width: u16) -> f64 {
+        let hidpi = self
+            .display_id
+            .is_some_and(crate::virtual_display::is_hidpi_virtual_display);
+        if !hidpi {
+            return 1.0;
+        }
+        match self.vd_hidpi {
+            crate::virtual_display::HidpiPolicy::Auto(_) => {
+                f64::from(self.pointer_ui_scale.load(Ordering::Relaxed))
+            }
+            _ => f64::from(width) / self.screen_size_pts.0.max(1.0),
+        }
+    }
+
     /// Keep the virtual display's mode in sync with the session size,
     /// returning the (possibly corrected) size to serve.
     /// [`RdpServerDisplay::updates`] runs at connect AND after every
@@ -643,17 +795,20 @@ impl CaptureDisplay {
             return (width, height);
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
-        let (cur_w, cur_h) = vd.size_pts();
-        if (cur_w as u16, cur_h as u16) == (width, height) {
+        let ui_scale = self.vd_hidpi.ui_scale();
+        // Compare in pixels: on a HiDPI vd the points are the session size
+        // divided by the UI scale.
+        if vd.mode_px() == (u32::from(width), u32::from(height)) && vd.ui_scale() == ui_scale {
             return (width, height);
         }
-        match vd.resize(u32::from(width), u32::from(height)) {
+        match vd.resize(u32::from(width), u32::from(height), ui_scale) {
             Ok(()) => {
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
                     width,
                     height,
+                    ui_scale,
                     display_id = vd_id,
                     "virtual display re-moded to the client-requested session size"
                 );
@@ -789,16 +944,25 @@ impl CaptureDisplay {
                 (width, height)
             }
             Err(e) => {
-                let (w, h) = (cur_w as u16, cur_h as u16);
+                // Keep serving the size the client negotiated: by the time this
+                // runs the client has already accepted it in Demand Active, so
+                // switching to the display's old size would build the video
+                // surface at a size the client isn't showing (a client at
+                // 1728×1084 then sees the top-left quarter of a 3456×2170
+                // surface). Capture scales from whatever mode the display is
+                // in, and the next `updates()` retries the re-mode: a failed
+                // `resize` clears `mode_px`, so the retry happens even when
+                // the next client asks for the size that last succeeded.
+                // Input maps onto the display's current points.
+                self.screen_size_pts = vd.size_pts();
                 tracing::warn!(
                     error = ?e,
                     requested_w = width,
                     requested_h = height,
-                    "virtual display live resize failed — keeping the current \
-                     display mode and serving its size"
+                    "virtual display live resize failed — serving the requested size, \
+                     scaled from the display's current mode"
                 );
-                self.desktop_size.set(w, h);
-                (w, h)
+                (width, height)
             }
         }
     }
@@ -818,20 +982,21 @@ impl CaptureDisplay {
                 self.fps,
                 self.display_id,
                 self.screen_size_pts,
-                self.cursor_scale,
+                self.cursor_scale * self.pointer_scale(width),
                 self.warp_cursor_home,
                 self.gfx.clone(),
                 self.keyframe_on_change,
                 self.click_signal.clone(),
                 self.flush_frames,
                 self.flush_interval,
+                self.capture_nv12,
                 self.display_suppressed.clone(),
-                self.display_suppressed_changed.clone(),
                 self.auto_size,
                 self.stretch,
                 self.desktop_size.clone(),
                 self.pending_resize.clone(),
                 self.suppress_next_adopt.clone(),
+                self.live_pointer_scale(),
             )
             .await?,
         );
@@ -883,10 +1048,10 @@ fn capture_scaling_mode(
     (force_full_frame, letterbox)
 }
 
-/// Avoid an extra ScreenCaptureKit pacing slot if the display itself is
-/// already slow enough. Keep the requested limit for unknown or faster modes.
-/// Adopted from clintcan/macrdp#220 (0.5 Hz tolerance for nominal rates).
-#[cfg(any(target_os = "macos", test))]
+/// Whether SCK needs a 1/fps minimum frame interval. On a display refreshing
+/// no faster than `fps` (0.5 Hz slack so 59.94 counts as 60) the cap saves no
+/// frames but makes SCK hold each one back to its pacing slot, adding latency.
+/// An unknown refresh rate (0) keeps the cap.
 fn sck_needs_frame_cap(fps: u32, display_hz: f64) -> bool {
     !(display_hz > 0.0 && display_hz <= f64::from(fps) + 0.5)
 }
@@ -917,21 +1082,153 @@ mod macos {
     use super::*;
 
     use anyhow::{anyhow, Context};
-    use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
+    use screencapturekit::async_api::AsyncSCShareableContent;
+    use screencapturekit::cm::CMSampleBuffer;
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
     use screencapturekit::prelude::{
-        CMTime, PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration,
-        SCStreamOutputType,
+        CMTime, PixelFormat as SckPixelFormat, SCContentFilter, SCDisplay, SCError, SCStream,
+        SCStreamConfiguration, SCStreamOutputType,
     };
+    use screencapturekit::stream::delegate_trait::ErrorHandler;
+
+    /// SCK's surface-pool depth: its default (3) plus one for the frame the
+    /// flush burst keeps retained (`ScreenCaptureUpdates::last_frame`), so
+    /// holding it doesn't shrink the headroom SCK had before.
+    const SCK_QUEUE_DEPTH: u32 = 4;
+
+    /// SCK's surface-pool depth in NV12 mode (its maximum). There the encoder
+    /// holds capture surfaces too — VideoToolbox retains each frame until it is
+    /// encoded — on top of the async buffer, the frame being handled, and the
+    /// retained flush frame.
+    const SCK_QUEUE_DEPTH_NV12: u32 = 8;
 
     /// How long the shared SuppressOutput flag must remain `true` before
     /// the gate engages. A real minimize lasts seconds-to-minutes and
     /// trips easily; backpressure flaps under heavy local CPU/IO last
     /// tens of ms and are filtered out. 1 second is comfortably between.
     const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
+    /// How long after a capture starts a pre-EGFX frame is kept for
+    /// re-sending over H.264. The pipeline is normally ready ~100-250 ms
+    /// after the first frame; this only bounds the copy for a client that
+    /// never opens the graphics channel.
+    const EGFX_PENDING_FRAME_WINDOW: Duration = Duration::from_secs(5);
+
+    /// Samples kept for a consumer that falls behind; the oldest is dropped.
+    const SAMPLE_BUFFER: usize = 4;
+
+    #[derive(Default)]
+    struct SampleQueue {
+        samples: std::collections::VecDeque<CMSampleBuffer>,
+        stopped: bool,
+    }
+
+    #[derive(Default)]
+    struct Samples {
+        queue: std::sync::Mutex<SampleQueue>,
+        ready: tokio::sync::Notify,
+    }
+
+    /// An SCK display capture whose `next()` returns `None` once SCK stops it.
+    /// `AsyncSCStream` has no delegate, so a stream SCK stops (its display went
+    /// away, as on display sleep) would leave `next()` pending forever.
+    struct DisplayStream {
+        stream: SCStream,
+        samples: Arc<Samples>,
+        responsive_capture: bool,
+    }
+
+    impl DisplayStream {
+        fn start(display: &SCDisplay, config: &SCStreamConfiguration) -> Result<Self, SCError> {
+            let filter = SCContentFilter::create()
+                .with_display(display)
+                .with_excluding_windows(&[])
+                .build();
+            let samples = Arc::new(Samples::default());
+            let on_stop = Arc::clone(&samples);
+            let mut stream = SCStream::new_with_delegate(
+                &filter,
+                config,
+                ErrorHandler::new(move |error| {
+                    tracing::warn!(%error, "SCK stopped the capture");
+                    on_stop.queue.lock().unwrap().stopped = true;
+                    on_stop.ready.notify_one();
+                }),
+            );
+            let on_sample = Arc::clone(&samples);
+            stream.add_output_handler(
+                move |sample: CMSampleBuffer, _| {
+                    let mut q = on_sample.queue.lock().unwrap();
+                    if let Some(stats) = crate::stats::global() {
+                        stats.capture_samples.fetch_add(1, Ordering::Relaxed);
+                        if sample
+                            .frame_status()
+                            .is_some_and(|status| !status.has_content())
+                        {
+                            stats.capture_idle.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if q.samples.len() >= SAMPLE_BUFFER {
+                        q.samples.pop_front();
+                        if let Some(stats) = crate::stats::global() {
+                            stats.capture_superseded.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    q.samples.push_back(sample);
+                    drop(q);
+                    on_sample.ready.notify_one();
+                },
+                SCStreamOutputType::Screen,
+            );
+            stream.start_capture()?;
+            let responsive_capture = std::env::var("MACRDP_RESPONSIVE_CAPTURE")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
+            Ok(Self {
+                stream,
+                samples,
+                responsive_capture,
+            })
+        }
+
+        async fn next(&self) -> Option<CMSampleBuffer> {
+            loop {
+                {
+                    let mut q = self.samples.queue.lock().unwrap();
+                    if self.responsive_capture {
+                        if let Some(index) = q.samples.iter().rposition(|sample| {
+                            sample
+                                .frame_status()
+                                .is_none_or(|status| status.has_content())
+                        }) {
+                            if index > 0 {
+                                q.samples.drain(..index);
+                                if let Some(stats) = crate::stats::global() {
+                                    stats
+                                        .capture_superseded
+                                        .fetch_add(index as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(sample) = q.samples.pop_front() {
+                        return Some(sample);
+                    }
+                    if q.stopped {
+                        return None;
+                    }
+                }
+                self.samples.ready.notified().await;
+            }
+        }
+    }
 
     pub struct ScreenCaptureUpdates {
-        stream: AsyncSCStream,
+        stream: DisplayStream,
+        /// What `stream` captures, kept to reopen it after SCK stops it.
+        display_id: u32,
+        /// Whether `display_id` is the virtual display, which can come back under a new id.
+        follows_virtual_display: bool,
+        size_px: (u32, u32),
+        stream_config: SCStreamConfiguration,
         pending: std::collections::VecDeque<DisplayUpdate>,
         // Force a full-frame seed on the first sample so the client's
         // bitmap cache starts in a known-good state; SCK's dirty rects
@@ -968,23 +1265,51 @@ mod macos {
         /// Mouse-click hint for the post-click keyframe-threshold drop. Only
         /// consulted when `keyframe_on_change.enabled`.
         click_signal: Option<ClickSignal>,
-        /// Interval between trailing pictures and deferred-submit retries.
+        /// Interval between SCK frames (1/fps). Doubles as the flush-burst
+        /// timeout: when SCK goes idle we wait at most this long before
+        /// re-submitting the last frame to drain mstsc's presentation buffer.
         flush_interval: Duration,
-        responsive_capture: bool,
-        /// Number of trailing pictures before and after the quiet IDR refresh.
-        /// Zero disables the refresh burst, but not retries of deferred input.
+        frame_interval: Duration,
+        /// How many trailing flush frames to re-send after each change
+        /// (`--flush-frames`). Each is a tiny skip-P-frame; mstsc needs ≥2 to
+        /// display a frame, default 4 gives margin. 0 disables the burst.
         flush_frames: u32,
-        /// Drain presentation buffering immediately at frame cadence; after
-        /// 100 ms of quiet, refresh the latest surface with an IDR and drain again.
-        /// Only accepted submissions consume this budget.
-        flush_burst: crate::frame_flush::FrameFlush,
-        /// Latest capture retained until its deferred submission or refresh
-        /// burst completes. Only one CoreVideo surface is held at a time.
+        /// Trailing flush re-submits remaining after the last real change
+        /// (EGFX/H.264 path only). SCK stops delivering frames on a static
+        /// screen, so the last change before a pause (e.g. the final keystroke)
+        /// would otherwise sit in mstsc's ~2-frame AVC420 presentation buffer
+        /// until the next on-screen change or the periodic keyframe — that's
+        /// the "typing follows the keyframe" lag. We re-submit the last frame
+        /// `flush_frames` times to push it through within a couple of frame
+        /// intervals. Stays 0 (no-op) on the legacy bitmap path.
+        flush_remaining: u32,
+        /// Last frame submitted to EGFX, re-encoded as cheap skip-P-frames
+        /// during a flush burst. Held as a retained SCK pixel buffer rather
+        /// than a byte copy: copying the whole frame after every submit was
+        /// ~20% of macrdp's CPU at a large virtual display, and the flush
+        /// path only reads it on the few idle-edge ticks. Holding it pins one
+        /// surface of SCK's pool, which is why the stream's queue depth is
+        /// one above SCK's default (see `SCK_QUEUE_DEPTH`).
         last_frame: Option<CVPixelBuffer>,
+        /// A frame captured while the EGFX pipeline was still being negotiated
+        /// is waiting in `last_frame` to be re-sent over H.264 once it comes up
+        /// (see `promote_frame_to_egfx`).
+        egfx_pending_frame: bool,
+        /// When this capture started; bounds how long a frame is held for
+        /// `egfx_pending_frame` (a client that never opens the graphics
+        /// channel would otherwise have every legacy frame retained), and the
+        /// legacy hold of `Gfx::hold_legacy` is measured from it.
+        started_at: Instant,
+        /// Capturing NV12 for the encoder (`--capture-nv12`). Frames that still
+        /// ship as legacy bitmaps (before EGFX is ready, or a client without
+        /// AVC) are converted back to BGRA on the CPU.
+        nv12: bool,
+        /// BGRA converted from an NV12 frame for the legacy bitmap path.
+        /// Reused across frames; stays empty unless that path runs.
+        nv12_bgra: Vec<u8>,
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
         display_suppressed: Option<Arc<AtomicBool>>,
-        display_suppressed_changed: Arc<Notify>,
         /// Last observed value of `display_suppressed`, used to detect the
         /// false→true→false transition. On the un-suppress edge we force an
         /// IDR keyframe so the client resumes from a fresh reference frame
@@ -1002,6 +1327,25 @@ mod macos {
         /// (cargo build) and the audio mute thrashes — both audible as
         /// stutter even though no real minimize happened.
         suppressed_since: Option<Instant>,
+        /// True once the EGFX/H.264 encoder has accepted at least one
+        /// frame for this session (i.e., `gfx.submit_bgra` returned
+        /// `Ok(true)`). The suppress gate is a no-op until this is set —
+        /// mstsc's normal connect handshake includes a
+        /// `SuppressOutput { None }` *before* its display surface is
+        /// fully initialized, and stopping the first EGFX frame from
+        /// going through leaves mstsc with nothing to display + a
+        /// half-initialized surface that doesn't recover when we
+        /// un-suppress. FreeRDP doesn't do this. Tracking
+        /// "we've delivered the first frame" gives us a clean
+        /// "client is fully wired up" signal that's stricter than just
+        /// "connected" but cheap to maintain.
+        first_egfx_frame_sent: bool,
+        /// `last_frame` holds a frame captured while EGFX was still being
+        /// negotiated (legacy hold) and not yet sent anywhere. SCK sends
+        /// nothing more on a static screen, so the loop submits this frame to
+        /// EGFX once it is ready, or sends it as a legacy update when the hold
+        /// ends without EGFX.
+        held_frame: bool,
         /// When capturing a virtual display, the RDP session drives the cursor
         /// into that display's slot of the global coordinate space (to the
         /// right of / beyond the physical panels). On disconnect the cursor is
@@ -1030,9 +1374,131 @@ mod macos {
         /// reactivation's `request_initial_size` call doesn't re-adopt
         /// whatever size the client's Confirm Active echoes.
         suppress_next_adopt: Arc<AtomicBool>,
+        /// See `CaptureDisplay::live_pointer_scale`, plus the scale last
+        /// applied to `cursor`.
+        live_pointer_scale: Option<(Arc<std::sync::atomic::AtomicU32>, f64)>,
+        applied_pointer_scale: u32,
     }
 
     impl ScreenCaptureUpdates {
+        /// Once H.264 is up, re-send the frame captured before it was, and
+        /// drop the legacy bitmap strips still queued for that frame.
+        ///
+        /// The first frame of a connection is usually captured ~100 ms before
+        /// the EGFX channel is ready, so it goes out as legacy bitmaps: up to
+        /// eight 1280x720 strips at 3456x2168. Over a WAN those strips took
+        /// 38-68 s to send, and the H.264 stream waited behind them, so the
+        /// desktop painted strip by strip. The client draws the H.264 surface
+        /// over the whole desktop anyway, so the unsent strips are dropped.
+        fn promote_frame_to_egfx(&mut self) {
+            if !self.egfx_pending_frame {
+                return;
+            }
+            let Some(gfx) = self.gfx.as_ref() else {
+                self.egfx_pending_frame = false;
+                return;
+            };
+            if !gfx.pipeline_ready() {
+                if !gfx.pipeline_pending() {
+                    self.egfx_pending_frame = false; // declined, or the client left
+                }
+                return;
+            }
+            let queued = self.pending.len();
+            self.pending
+                .retain(|update| !matches!(update, DisplayUpdate::Bitmap(_)));
+            let Some(pb) = self.last_frame.as_ref() else {
+                self.egfx_pending_frame = false;
+                return;
+            };
+            match submit_to_gfx(gfx, pb, self.nv12, true, false) {
+                Ok(true) => {
+                    self.egfx_pending_frame = false;
+                    self.seeded = true;
+                    self.first_egfx_frame_sent = true;
+                    self.flush_remaining = self.flush_frames;
+                    tracing::info!(
+                        dropped_bitmap_updates = queued - self.pending.len(),
+                        "EGFX ready — re-sent the pre-EGFX frame over H.264"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    self.egfx_pending_frame = false;
+                    tracing::warn!(error = ?e, "EGFX submit_bgra failed");
+                }
+            }
+        }
+    }
+
+    impl ScreenCaptureUpdates {
+        /// The SCK stream sent no frame for one interval while a frame is held
+        /// for the EGFX negotiation (`held_frame`): submit it to EGFX if EGFX
+        /// is ready now, keep holding it while the hold lasts, or send it as a
+        /// full legacy picture once the hold ends without EGFX.
+        fn send_held_frame(&mut self) {
+            let (Some(gfx), Some(pb)) = (self.gfx.as_ref(), self.last_frame.as_ref()) else {
+                self.held_frame = false;
+                return;
+            };
+            // `submit_to_gfx` hands the buffer over as NV12 or locks it as BGRA,
+            // matching the capture format (`--capture-nv12`).
+            match submit_to_gfx(gfx, pb, self.nv12, true, false) {
+                Ok(true) => {
+                    self.held_frame = false;
+                    self.seeded = true;
+                    self.first_egfx_frame_sent = true;
+                    self.flush_remaining = self.flush_frames;
+                    tracing::debug!("EGFX ready — submitted the frame held during the negotiation");
+                }
+                Ok(false) if gfx.hold_legacy(self.started_at) => {}
+                Ok(false) => {
+                    // Hold over without EGFX: send the held frame as a full
+                    // legacy picture (converted back to BGRA in NV12 mode).
+                    self.held_frame = false;
+                    let guard = match pb.lock(CVPixelBufferLockFlags::READ_ONLY) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            tracing::warn!(error = ?e, "held frame: CVPixelBuffer::lock failed");
+                            return;
+                        }
+                    };
+                    let (Ok(w), Ok(h)) =
+                        (u16::try_from(guard.width()), u16::try_from(guard.height()))
+                    else {
+                        return;
+                    };
+                    let (src, stride): (&[u8], usize) = if self.nv12 {
+                        if let Err(e) = nv12_to_bgra(&guard, &mut self.nv12_bgra) {
+                            tracing::warn!(error = ?e, "held frame: NV12 to BGRA failed");
+                            return;
+                        }
+                        (&self.nv12_bgra, usize::from(w) * 4)
+                    } else {
+                        (guard.as_slice(), guard.bytes_per_row())
+                    };
+                    for (sx, sy, sw, sh) in split_strips(0, 0, w, h) {
+                        if let Some(update) = rect_update(src, stride, sx, sy, sw, sh) {
+                            self.pending.push_back(update);
+                        }
+                    }
+                    self.seeded = true;
+                    // EGFX may still come up after the hold: keep the frame
+                    // (already in `last_frame`) for `promote_frame_to_egfx`.
+                    if gfx.pipeline_pending()
+                        && self.started_at.elapsed() < EGFX_PENDING_FRAME_WINDOW
+                    {
+                        self.egfx_pending_frame = true;
+                    }
+                    tracing::debug!("legacy hold over — sent the held frame as legacy");
+                }
+                Err(e) => {
+                    self.held_frame = false;
+                    tracing::warn!(error = ?e, "EGFX held-frame submit failed");
+                }
+            }
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub async fn start(
             width: u16,
@@ -1047,13 +1513,14 @@ mod macos {
             click_signal: Option<ClickSignal>,
             flush_frames: u32,
             flush_interval: Option<Duration>,
+            capture_nv12: bool,
             display_suppressed: Option<Arc<AtomicBool>>,
-            display_suppressed_changed: Arc<Notify>,
             auto_size: bool,
             stretch: bool,
             desktop_size: SharedDesktopSize,
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
+            live_pointer_scale: Option<(Arc<std::sync::atomic::AtomicU32>, f64)>,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -1081,7 +1548,22 @@ mod macos {
                                 .join(", ")
                         )
                     })?,
-                None => displays.first().context("no displays available")?,
+                None => {
+                    // Mirror mode: follow the main display, as input does.
+                    let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
+                    let main_id = core_graphics::display::CGDisplay::main().id;
+                    let index = super::mirror_display_index(&ids, main_id)
+                        .context("no displays available")?;
+                    if ids.len() > 1 {
+                        tracing::info!(
+                            mirrored = ids[index],
+                            main = main_id,
+                            sck_displays = ?ids,
+                            "multiple displays: mirroring the main display"
+                        );
+                    }
+                    &displays[index]
+                }
             };
 
             let native_w = u16::try_from(display.width()).context("display width > u16")?;
@@ -1094,15 +1576,21 @@ mod macos {
             // --width/--height that asks SCK to scale) forces full frames,
             // because then dirty-rects arrive in source coords and misalign.
             let mode = core_graphics::display::CGDisplay::new(display.display_id()).display_mode();
-            let (backing_w, backing_h) = mode
-                .as_ref()
-                .and_then(|m| {
-                    Some((
-                        u16::try_from(m.pixel_width()).ok()?,
-                        u16::try_from(m.pixel_height()).ok()?,
-                    ))
-                })
-                .unwrap_or((native_w, native_h));
+            let (backing_w, backing_h) =
+                if crate::virtual_display::is_hidpi_virtual_display(display.display_id()) {
+                    // `CGDisplayCopyDisplayMode` returns nothing for a virtual
+                    // display, so the HiDPI vd's 2× backing is derived here.
+                    (native_w.saturating_mul(2), native_h.saturating_mul(2))
+                } else {
+                    mode.as_ref()
+                        .and_then(|m| {
+                            Some((
+                                u16::try_from(m.pixel_width()).ok()?,
+                                u16::try_from(m.pixel_height()).ok()?,
+                            ))
+                        })
+                        .unwrap_or((native_w, native_h))
+                };
             // See `capture_scaling_mode`: full frames when SCK scales (configured
             // size matches neither native points nor backing pixels), and
             // letterbox vs stretch on the auto-size path.
@@ -1129,68 +1617,66 @@ mod macos {
                 );
             }
 
-            let filter = SCContentFilter::create()
-                .with_display(display)
-                .with_excluding_windows(&[])
-                .build();
-
-            // The bitmap path is pull-driven by socket writes + software
-            // encoding. Keep only the newest SCK sample while it is busy so a
-            // slow full-screen repaint drops intermediate motion instead of
-            // turning into visible input lag. H.264 keeps a slightly deeper
-            // queue because its hardware encoder is independently bounded.
-            let responsive_capture =
-                gfx.is_some() && crate::multitransport::env_truthy("MACRDP_RESPONSIVE_CAPTURE");
-            // Leave space for a content sample followed by an idle callback,
-            // while limiting how far behind the consumer can fall.
-            let sample_buffer_capacity = match (gfx.is_some(), responsive_capture) {
-                (true, true) => 2,
-                (true, false) => 4,
-                (false, _) => 1,
+            let nv12 = gfx.is_some() && capture_nv12;
+            if nv12 {
+                tracing::info!(
+                    "capture: ScreenCaptureKit delivers full-range BT.709 NV12 to the \
+                     encoder (--capture-nv12, experimental)"
+                );
+            }
+            let display_hz = mode.map_or(0.0, |m| m.refresh_rate());
+            let frame_cap = sck_needs_frame_cap(fps, display_hz);
+            tracing::debug!(display_hz, fps, frame_cap, "SCK frame cap");
+            let min_frame_interval = if frame_cap {
+                CMTime::new(1, fps as i32)
+            } else {
+                CMTime::new(0, 1)
             };
 
-            let display_hz = mode.as_ref().map_or(0.0, |mode| mode.refresh_rate());
-            let frame_cap = sck_needs_frame_cap(fps, display_hz);
-            tracing::debug!(display_hz, fps, frame_cap, "ScreenCaptureKit frame pacing");
-            let config = if frame_cap {
-                SCStreamConfiguration::new().with_fps(fps)
-            } else {
-                SCStreamConfiguration::new().with_minimum_frame_interval(&CMTime::new(0, 1))
+            let config = SCStreamConfiguration::new()
+                .with_width(u32::from(width))
+                .with_height(u32::from(height))
+                .with_pixel_format(if nv12 {
+                    SckPixelFormat::YCbCr_420f
+                } else {
+                    SckPixelFormat::BGRA
+                })
+                .with_minimum_frame_interval(&min_frame_interval)
+                // Hide the macOS cursor in the captured framebuffer; we forward
+                // it separately as RGBAPointer so the client renders its own
+                // (real-shape) cursor without doubling up.
+                .with_shows_cursor(false)
+                // Aspect handling on a scaling (non-native) capture:
+                //   * letterbox=false (default for explicit --width/--height, or
+                //     auto-size + --stretch): stretch the source to fill the
+                //     output exactly — no black bars, but distorts on aspect
+                //     mismatch.
+                //   * letterbox=true (auto-size default): preserve the Mac's
+                //     aspect ratio, padding with black bars. input.rs maps mouse
+                //     coords into the centered content sub-rect to keep clicks
+                //     aligned (the stretch path needs no such correction, which
+                //     is why fill used to be the only mode).
+                //
+                // Apple replaced `scalesToFit` with `preservesAspectRatio`
+                // (inverse semantics) in macOS 14; on 14+ the newer property is
+                // what takes effect. `scales_to_fit(true)` stays set so the
+                // source scales to the output either way; `preserves_aspect_ratio`
+                // is the knob that picks letterbox vs stretch.
+                .with_scales_to_fit(true)
+                .with_preserves_aspect_ratio(letterbox)
+                .with_queue_depth(if nv12 {
+                    SCK_QUEUE_DEPTH_NV12
+                } else {
+                    SCK_QUEUE_DEPTH
+                });
+            // The encoder's NV12 is BT.709 (the session is tagged 709), and the
+            // BGRA path converts with that matrix too, so ask SCK for the same.
+            if nv12 {
+                set_color_matrix_709(&config);
+                tracing::debug!(color_matrix = ?config.color_matrix(), "capture: NV12 colour matrix");
             }
-            .with_width(u32::from(width))
-            .with_height(u32::from(height))
-            .with_pixel_format(SckPixelFormat::BGRA)
-            // Hide the macOS cursor in the captured framebuffer; we forward
-            // it separately as RGBAPointer so the client renders its own
-            // (real-shape) cursor without doubling up.
-            .with_shows_cursor(false)
-            // Aspect handling on a scaling (non-native) capture:
-            //   * letterbox=false (default for explicit --width/--height, or
-            //     auto-size + --stretch): stretch the source to fill the
-            //     output exactly — no black bars, but distorts on aspect
-            //     mismatch.
-            //   * letterbox=true (auto-size default): preserve the Mac's
-            //     aspect ratio, padding with black bars. input.rs maps mouse
-            //     coords into the centered content sub-rect to keep clicks
-            //     aligned (the stretch path needs no such correction, which
-            //     is why fill used to be the only mode).
-            //
-            // Apple replaced `scalesToFit` with `preservesAspectRatio`
-            // (inverse semantics) in macOS 14; on 14+ the newer property is
-            // what takes effect. `scales_to_fit(true)` stays set so the
-            // source scales to the output either way; `preserves_aspect_ratio`
-            // is the knob that picks letterbox vs stretch.
-            .with_scales_to_fit(true)
-            .with_preserves_aspect_ratio(letterbox);
 
-            let stream = AsyncSCStream::new(
-                &filter,
-                &config,
-                sample_buffer_capacity,
-                SCStreamOutputType::Screen,
-            );
-            stream
-                .start_capture()
+            let stream = DisplayStream::start(display, &config)
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
 
             // Cursor scale = session framebuffer px ÷ display backing px.
@@ -1207,6 +1693,8 @@ mod macos {
             // native pixels while upscaling the desktop image to their window,
             // which can make a native-size pointer look small. Clamped to a
             // sane band; the hotspot stays accurate at any value.
+            // On the HiDPI virtual display the multiplier already includes
+            // the pointer enlargement (`CaptureDisplay::pointer_scale`).
             let cursor_scale = cursor_scale_multiplier.clamp(0.1, 8.0);
             tracing::debug!(
                 native_w,
@@ -1234,6 +1722,10 @@ mod macos {
 
             Ok(Self {
                 stream,
+                display_id: display.display_id(),
+                follows_virtual_display: target_display_id.is_some(),
+                size_px: (u32::from(width), u32::from(height)),
+                stream_config: config,
                 pending: std::collections::VecDeque::new(),
                 seeded: false,
                 force_full_frame,
@@ -1243,21 +1735,219 @@ mod macos {
                 keyframe_on_change,
                 kf_armed: true,
                 click_signal,
-                flush_interval: flush_interval.unwrap_or(frame_interval),
-                responsive_capture,
+                frame_interval,
                 flush_frames,
-                flush_burst: crate::frame_flush::FrameFlush::default(),
+                flush_interval: flush_interval.unwrap_or(frame_interval),
+                flush_remaining: 0,
                 last_frame: None,
+                egfx_pending_frame: false,
+                started_at: Instant::now(),
+                nv12,
+                nv12_bgra: Vec::new(),
                 display_suppressed,
-                display_suppressed_changed,
                 was_suppressed: false,
                 suppressed_since: None,
+                first_egfx_frame_sent: false,
+                held_frame: false,
                 warp_cursor_home,
                 pending_resize,
                 desktop_size,
                 suppress_next_adopt,
+                applied_pointer_scale: live_pointer_scale
+                    .as_ref()
+                    .map_or(0, |(cell, _)| cell.load(Ordering::Relaxed)),
+                live_pointer_scale,
             })
         }
+
+        /// Waits for the display of a capture SCK stopped to come back (a
+        /// display sleep removes it until wake), then captures it again.
+        async fn reopen_stream(&mut self) {
+            let started = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let Ok(content) = AsyncSCShareableContent::get().await else {
+                    continue;
+                };
+                let displays = content.displays();
+                let id = if self.follows_virtual_display {
+                    let online: Vec<_> = displays
+                        .iter()
+                        .map(|d| online_display(d.display_id()))
+                        .collect();
+                    match super::pick_reopened_display(self.display_id, &online, self.size_px) {
+                        Some(id) => id,
+                        None => continue,
+                    }
+                } else {
+                    self.display_id
+                };
+                let Some(display) = displays.iter().find(|d| d.display_id() == id) else {
+                    continue;
+                };
+                if id != self.display_id {
+                    tracing::warn!(
+                        old = self.display_id,
+                        new = id,
+                        "virtual display came back under a new id"
+                    );
+                    self.display_id = id;
+                }
+                match DisplayStream::start(display, &self.stream_config) {
+                    Ok(stream) => {
+                        self.stream = stream;
+                        // The screen changed while the capture was down.
+                        self.seeded = false;
+                        tracing::info!(
+                            display_id = self.display_id,
+                            after_ms = started.elapsed().as_millis() as u64,
+                            "SCK capture reopened"
+                        );
+                        return;
+                    }
+                    Err(e) => tracing::debug!(error = ?e, "reopening the SCK capture failed"),
+                }
+            }
+        }
+    }
+
+    fn online_display(id: u32) -> super::OnlineDisplay {
+        extern "C" {
+            fn CGDisplayVendorNumber(display: u32) -> u32;
+        }
+        let d = core_graphics::display::CGDisplay::new(id);
+        let size_px = d.display_mode().map_or((0, 0), |m| {
+            (m.pixel_width() as u32, m.pixel_height() as u32)
+        });
+        super::OnlineDisplay {
+            id,
+            vendor: unsafe { CGDisplayVendorNumber(id) },
+            builtin: d.is_builtin(),
+            size_px,
+        }
+    }
+
+    /// Set `SCStreamConfiguration.colorMatrix` to BT.709.
+    ///
+    /// Not `with_color_matrix`: the crate stores a temporary CFString built
+    /// from its `&str`, but the property doesn't retain its value (Apple
+    /// expects one of the CoreGraphics constants), so `SCStream` later copies
+    /// a freed string and the process traps in `CFStringCreateCopy`. Hand it
+    /// the real, never-freed constant instead.
+    fn set_color_matrix_709(config: &SCStreamConfiguration) {
+        /// Opaque `struct __CFString`, so the argument carries the
+        /// `^{__CFString=}` type encoding objc2 checks against the method.
+        #[repr(C)]
+        struct CFStringOpaque {
+            _private: [u8; 0],
+        }
+        // SAFETY: matches CoreFoundation's declaration of `CFStringRef`.
+        unsafe impl objc2::encode::RefEncode for CFStringOpaque {
+            const ENCODING_REF: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
+                &objc2::encode::Encoding::Struct("__CFString", &[]),
+            );
+        }
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            static kCGDisplayStreamYCbCrMatrix_ITU_R_709_2: *const CFStringOpaque;
+        }
+        // SAFETY: `SCStreamConfiguration` is `#[repr(transparent)]` over the
+        // retained `SCStreamConfiguration *`, so this reads that pointer; it
+        // stays valid while `config` is borrowed. `setColorMatrix:` takes a
+        // CFStringRef, and the constant lives for the process.
+        unsafe {
+            let obj =
+                *(config as *const SCStreamConfiguration as *const *mut objc2::runtime::AnyObject);
+            let matrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
+            let () = objc2::msg_send![obj, setColorMatrix: matrix];
+        }
+    }
+
+    /// The colour matrix must survive the configuration copy `SCStream` makes
+    /// (`-[SCStreamConfiguration copyWithZone:]`). The crate's own setter left
+    /// a dangling string there and the copy trapped, killing the server on
+    /// connect.
+    #[cfg(test)]
+    #[test]
+    fn color_matrix_survives_the_configuration_copy() {
+        let config = SCStreamConfiguration::new().with_pixel_format(SckPixelFormat::YCbCr_420f);
+        set_color_matrix_709(&config);
+        assert_eq!(config.color_matrix().as_deref(), Some("ITU_R_709_2"));
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let obj =
+                *(&config as *const SCStreamConfiguration as *const *mut objc2::runtime::AnyObject);
+            let copy: *mut objc2::runtime::AnyObject = objc2::msg_send![obj, copy];
+            assert!(!copy.is_null());
+            let () = objc2::msg_send![copy, release];
+        });
+    }
+
+    /// Hand one captured frame to the H.264 pipeline: the buffer itself in NV12
+    /// mode, its locked BGRA bytes otherwise. Same return contract as
+    /// [`crate::h264::Gfx::submit_bgra`].
+    fn submit_to_gfx(
+        gfx: &crate::h264::Gfx,
+        pixel_buffer: &CVPixelBuffer,
+        nv12: bool,
+        request_keyframe: bool,
+        flush: bool,
+    ) -> Result<bool> {
+        if nv12 {
+            return gfx.submit_nv12(pixel_buffer, request_keyframe, flush);
+        }
+        let guard = pixel_buffer
+            .lock(CVPixelBufferLockFlags::READ_ONLY)
+            .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))?;
+        gfx.submit_bgra(
+            guard.as_slice(),
+            guard.bytes_per_row(),
+            request_keyframe,
+            flush,
+        )
+    }
+
+    /// Convert a locked NV12 capture frame to tightly packed BGRA in `out`.
+    fn nv12_to_bgra(
+        guard: &screencapturekit::cv::CVPixelBufferLockGuard<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let y = guard
+            .plane_data(0)
+            .ok_or_else(|| anyhow!("NV12 frame has no luma plane"))?;
+        let cbcr = guard
+            .plane_data(1)
+            .ok_or_else(|| anyhow!("NV12 frame has no chroma plane"))?;
+        crate::videotoolbox::nv12_full_range_to_bgra(
+            y,
+            guard.bytes_per_row_of_plane(0),
+            cbcr,
+            guard.bytes_per_row_of_plane(1),
+            guard.width(),
+            guard.height(),
+            out,
+        )
+    }
+
+    /// Spike diagnostic, once per session: the luma range of the first NV12
+    /// frame. A desktop with true black and white reaches 0 and 255 when the
+    /// buffer really is full range; 16..235 would mean video range.
+    fn log_nv12_luma_range(pixel_buffer: &CVPixelBuffer) {
+        let Ok(guard) = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) else {
+            return;
+        };
+        let Some(y) = guard.plane_data(0) else {
+            return;
+        };
+        let (min, max) = y
+            .iter()
+            .step_by(61)
+            .fold((u8::MAX, u8::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        tracing::info!(
+            pixel_format = format_args!("{:#010x}", pixel_buffer.pixel_format()),
+            luma_min = min,
+            luma_max = max,
+            "capture: first NV12 frame"
+        );
     }
 
     /// Build a `BitmapUpdate` for a sub-rectangle of the captured frame by
@@ -1293,7 +1983,7 @@ mod macos {
 
     impl Drop for ScreenCaptureUpdates {
         fn drop(&mut self) {
-            let _ = self.stream.stop_capture();
+            let _ = self.stream.stream.stop_capture();
             // On a virtual-display session the cursor was last posted into the
             // virtual display's region of the global coordinate space, which is
             // off every physical panel. The virtual display outlives this
@@ -1321,16 +2011,10 @@ mod macos {
         }
     }
 
-    #[async_trait::async_trait]
-    impl RdpServerDisplayUpdates for ScreenCaptureUpdates {
-        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    impl ScreenCaptureUpdates {
+        /// The capture loop. Kept on anyhow; the trait impl below converts at the boundary.
+        async fn capture_next_update(&mut self) -> Result<Option<DisplayUpdate>> {
             loop {
-                // A buffered SCK sample is immediately ready and does not
-                // consume Tokio's cooperative budget. H.264 also continues
-                // here without returning a DisplayUpdate. Yield explicitly so
-                // sibling input/event dispatch in client_loop can run even
-                // when the mouse is still and SCK never becomes Pending.
-                crate::capture_fairness::yield_capture_turn().await;
                 // EXPERIMENTAL blank-recovery: if the H.264 blank detector armed
                 // a bare core reactivation (BlankAction::Reactivate), emit a
                 // no-op DisplayUpdate::Resize to the same size. The vendored
@@ -1340,6 +2024,16 @@ mod macos {
                 // — the one untested lever for the mstsc reconnect-blank. A
                 // forced IDR was already armed on the ctx.
                 if let Some(gfx) = self.gfx.as_ref() {
+                    // Manual A/V resync hotkey (Ctrl+Alt+Shift+R, set in
+                    // input.rs via crate::RESYNC_VIDEO): force a clean IDR
+                    // keyframe to repaint a stale/idle-blanked mstsc presentation.
+                    // Deliberately lighter than the full core reactivation
+                    // (gfx.request_reactivation), which on the headless
+                    // virtual-display path cascades into a visible session
+                    // re-cycle — see Gfx::force_keyframe.
+                    if crate::RESYNC_VIDEO.swap(false, Ordering::Relaxed) {
+                        gfx.force_keyframe();
+                    }
                     if let Some((w, h)) = gfx.take_reactivate_request() {
                         // See `CaptureDisplay::suppress_next_adopt`: without
                         // this, the reactivation's `request_initial_size`
@@ -1386,14 +2080,7 @@ mod macos {
                 // Active, and not the size it just told us via the
                 // MonitorLayout PDU) — silently snapping the resize back
                 // before the next frame ships.
-                if let Some((w, h)) = self
-                    .pending_resize
-                    .take_settled_change(RESIZE_DEBOUNCE, self.desktop_size.get())
-                {
-                    // Never submit a retained old-size buffer into the fresh
-                    // surface/encoder that the resize is about to create.
-                    self.flush_burst.clear();
-                    self.last_frame = None;
+                if let Some((w, h)) = self.pending_resize.take_settled(RESIZE_DEBOUNCE) {
                     self.desktop_size.set(w, h);
                     self.suppress_next_adopt.store(true, Ordering::Relaxed);
                     if let Some(gfx) = self.gfx.as_ref() {
@@ -1419,6 +2106,18 @@ mod macos {
                     .is_none_or(|t| t.elapsed() >= CURSOR_POLL_INTERVAL);
                 if poll_due {
                     self.last_cursor_poll = Some(Instant::now());
+                    if let Some((cell, multiplier)) = self.live_pointer_scale.as_ref() {
+                        let scale = cell.load(Ordering::Relaxed);
+                        if scale != self.applied_pointer_scale {
+                            self.applied_pointer_scale = scale;
+                            self.cursor
+                                .set_scale(multiplier.clamp(0.1, 8.0) * f64::from(scale));
+                            tracing::info!(
+                                pointer_ui_scale = scale,
+                                "resending the pointer at a new scale"
+                            );
+                        }
+                    }
                     let mut cursor_updates = self.cursor.poll();
                     if !cursor_updates.is_empty() {
                         let first = cursor_updates.remove(0);
@@ -1429,27 +2128,31 @@ mod macos {
                     }
                 }
 
+                self.promote_frame_to_egfx();
+
                 if let Some(update) = self.pending.pop_front() {
                     return Ok(Some(update));
                 }
 
                 // Client minimized (sent `SuppressOutput { desktop_rect: None }`)
                 // — stop pulling SCK samples and stop encoding/shipping. Without
-                // this, mstsc accumulates frames during a long minimize and the
-                // refocus chew-through locks up its input dispatch for seconds.
-                // This applies to both EGFX and legacy bitmap sessions. On a
-                // bitmap resume we invalidate the seed so the next SCK sample
-                // repaints the whole surface; EGFX instead forces an IDR below.
-                // Re-check every ~100 ms so resume is responsive.
+                // this, mstsc accumulates EGFX frames during a long minimize and
+                // the refocus chew-through locks up its input dispatch for
+                // seconds (typing/clicks queue behind decode-and-paint of every
+                // buffered frame). Also tear down any in-flight flush burst —
+                // re-submitting stale frames during a minimize is pointless.
+                // Cursor + pending bitmap branches above still flow (they're
+                // tiny and harmless to buffer at the client). Re-check the flag
+                // every ~100 ms so resume is responsive.
                 //
-                // **Only honor suppress after the first display frame has shipped.**
+                // **Only honor suppress after the first EGFX frame has shipped.**
                 // mstsc's normal connect handshake includes a
                 // `SuppressOutput { None }` *before* its display surface is
                 // ready; blocking the first frame leaves it with a half-init'd
                 // surface that doesn't recover when we un-suppress (mstsc
-                // freezes on the connection). For EGFX that milestone is
-                // the first queued EGFX frame; for bitmap it is a fully drained
-                // initial seed (`seeded`, with `pending` already empty here).
+                // freezes on the connection). FreeRDP doesn't issue suppress
+                // during connect, so it was never affected. Gate the gate on
+                // `first_egfx_frame_sent` so the handshake completes normally.
                 //
                 // **Debounce so transient flaps don't oscillate the pipeline.**
                 // Under heavy local CPU/IO (cargo build) mstsc backs off
@@ -1461,223 +2164,98 @@ mod macos {
                 // engage the gate once the flag has been steady-`true` for
                 // `SUPPRESS_DEBOUNCE`. Real multi-second minimizes still trip
                 // normally.
-                if let Some(flag) = self.display_suppressed.as_ref() {
-                    if flag.load(Ordering::Relaxed) {
-                        let ready = if let Some(gfx) = self.gfx.as_ref() {
-                            gfx.has_queued_video()
-                        } else {
-                            self.seeded
-                        };
-                        if ready {
+                if self.first_egfx_frame_sent {
+                    if let Some(flag) = self.display_suppressed.as_ref() {
+                        if flag.load(Ordering::Relaxed) {
                             let started = *self.suppressed_since.get_or_insert_with(Instant::now);
                             if started.elapsed() >= SUPPRESS_DEBOUNCE {
                                 self.was_suppressed = true;
-                                self.flush_burst.clear();
-                                tokio::select! {
-                                    _ = self.display_suppressed_changed.notified() => {}
-                                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                                }
+                                self.flush_remaining = 0;
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                                 continue;
                             }
-                        }
-                    } else {
-                        self.suppressed_since = None;
-                        if self.was_suppressed {
-                            self.was_suppressed = false;
-                            if let Some(gfx) = self.gfx.as_ref() {
-                                gfx.demigrate_on_resume();
-                                if self.last_frame.is_some() {
-                                    // A static desktop may produce only idle
-                                    // callbacks after restore. Repaint from
-                                    // the last retained surface immediately.
-                                    self.flush_burst
-                                        .repaint_now(self.flush_frames, Instant::now());
-                                }
-                            } else {
-                                // The bitmap client may have discarded its
-                                // surface while minimized.
-                                self.seeded = false;
-                                self.pending.clear();
-                            }
+                        } else {
+                            self.suppressed_since = None;
                         }
                     }
                 }
 
-                // Reevaluate display state even if capture is completely idle.
-                // A suppression edge wakes us; the deadline completes debounce.
-                let resize_deadline = self.pending_resize.deadline(RESIZE_DEBOUNCE);
-                let suppress_deadline =
-                    self.suppressed_since.map(|since| since + SUPPRESS_DEBOUNCE);
-                let deadline = [
-                    self.flush_burst.deadline(),
-                    resize_deadline,
-                    suppress_deadline,
-                ]
-                .into_iter()
-                .flatten()
-                .min();
-                let next = tokio::select! {
-                    biased;
-                    _ = self.pending_resize.changed() => continue,
-                    _ = self.display_suppressed_changed.notified() => continue,
-                    _ = crate::RESYNC_VIDEO.notified(), if self.gfx.is_some() => {
-                        if let Some(gfx) = self.gfx.as_ref() {
-                            gfx.force_keyframe();
-                        }
-                        if self.last_frame.is_some() && !self.was_suppressed {
-                            self.flush_burst.repaint_now(self.flush_frames, Instant::now());
-                        }
-                        continue;
-                    }
-                    _ = async {
-                        if let Some(deadline) = deadline {
-                            tokio::time::sleep_until(deadline.into()).await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    } => Err(()),
-                    sample = self.stream.next() => Ok(sample),
-                };
-                if next.is_err() && resize_deadline.is_some_and(|due| due <= Instant::now()) {
-                    // Apply the new layout at the loop head before sending any
-                    // additional frames from the old surface.
-                    continue;
-                }
-                // With responsive capture, look at one extra callback. A
-                // ready content sample can replace an older captured image
-                // or take priority over a duplicate flush. Idle callbacks
-                // cannot displace an image or postpone a flush.
-                let mut coalesced = false;
-                let flush_due = next.is_err()
-                    && self
-                        .flush_burst
-                        .deadline()
-                        .is_some_and(|due| due <= Instant::now());
-                let capture_queued = matches!(&next, Ok(Some(_))) && self.last_frame.is_some();
-                let next = if self.responsive_capture
-                    && (flush_due || capture_queued)
-                    && !self.pending_resize.has_pending()
+                // While a flush burst OR a debounced resize is pending, don't
+                // block indefinitely on SCK: it stops delivering frames on a
+                // static screen, so wait at most one frame interval before
+                // looping back to the top (where the flush burst re-submits the
+                // last frame, and a settled resize gets picked up promptly
+                // instead of stalling until the next real desktop change).
+                // Neither pending — the common idle case — still wakes at the
+                // cursor-poll interval, so a pointer-shape change on a static
+                // screen (the resize arrows at a window edge, which change no
+                // pixels because the captured frame excludes the cursor) gets
+                // polled and sent instead of waiting for the next redraw.
+                // A frame held during the EGFX negotiation also waits at most
+                // one frame interval, so it goes out once EGFX is ready even
+                // when the screen is static.
+                let sample = if self.flush_remaining > 0
+                    || self.pending_resize.has_pending()
+                    || self.held_frame
                 {
-                    if let Some(sample) = self.stream.try_next() {
-                        let renderable = sample
-                            .frame_status()
-                            .is_none_or(|status| status.has_content());
-                        if renderable && sample.image_buffer().is_some() {
-                            if let Ok(Some(previous)) = &next {
-                                coalesced = true;
-                                if let Some(stats) = crate::stats::global() {
-                                    stats.capture_samples.fetch_add(1, Ordering::Relaxed);
-                                    stats.capture_superseded.fetch_add(1, Ordering::Relaxed);
-                                    if previous
-                                        .frame_status()
-                                        .is_some_and(|status| !status.has_content())
-                                    {
-                                        stats.capture_idle.fetch_add(1, Ordering::Relaxed);
+                    let wait = if self.pending_resize.has_pending() || self.held_frame {
+                        self.frame_interval
+                    } else {
+                        self.flush_interval
+                    };
+                    match tokio::time::timeout(wait, self.stream.next()).await {
+                        Ok(sample) => sample,
+                        Err(_) => {
+                            if self.held_frame {
+                                self.send_held_frame();
+                                continue;
+                            }
+                            if self.flush_remaining > 0 {
+                                self.flush_remaining -= 1;
+                                if let Some(gfx) = self.gfx.as_ref() {
+                                    if let Some(pb) = self.last_frame.as_ref() {
+                                        if let Err(e) =
+                                            submit_to_gfx(gfx, pb, self.nv12, false, true)
+                                        {
+                                            tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
+                                        }
                                     }
                                 }
                             }
-                            Ok(Some(sample))
-                        } else {
-                            if let Some(stats) = crate::stats::global() {
-                                stats.capture_samples.fetch_add(1, Ordering::Relaxed);
-                                if !renderable {
-                                    stats.capture_idle.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            next
+                            continue;
                         }
-                    } else {
-                        next
                     }
                 } else {
-                    next
-                };
-                let sample = match next {
-                    Ok(Some(sample)) => sample,
-                    Ok(None) => return Ok(None),
-                    Err(_) => {
-                        if self
-                            .flush_burst
-                            .deadline()
-                            .is_some_and(|due| due <= Instant::now())
-                        {
-                            let mut submitted = false;
-                            if let Some(gfx) = self.gfx.as_ref() {
-                                if let Some(pixel_buffer) = self.last_frame.as_ref() {
-                                    match pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) {
-                                        Ok(guard) => {
-                                            let src = guard.as_slice();
-                                            if !src.is_empty() {
-                                                match gfx.submit_bgra(
-                                                    src,
-                                                    guard.bytes_per_row(),
-                                                    self.flush_burst.force_keyframe(),
-                                                ) {
-                                                    Ok(crate::h264::FrameSubmission::Submitted) => {
-                                                        submitted = true;
-                                                        if let Some(stats) = crate::stats::global()
-                                                        {
-                                                            stats
-                                                                .encode_retained_submitted
-                                                                .fetch_add(1, Ordering::Relaxed);
-                                                        }
-                                                    }
-                                                    Ok(crate::h264::FrameSubmission::Inactive) => {
-                                                        self.flush_burst.clear()
-                                                    }
-                                                    Ok(crate::h264::FrameSubmission::Deferred) => {}
-                                                    Err(e) => {
-                                                        tracing::warn!(error = ?e, "EGFX flush submit_bgra failed")
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => tracing::warn!(
-                                            os_status = e,
-                                            "EGFX flush could not lock retained pixel buffer"
-                                        ),
-                                    }
-                                }
-                            }
-                            self.flush_burst.attempted(
-                                submitted,
-                                Instant::now(),
-                                self.flush_interval,
-                            );
-                        }
-                        continue;
+                    match tokio::time::timeout(CURSOR_POLL_INTERVAL, self.stream.next()).await {
+                        Ok(sample) => sample,
+                        Err(_) => continue,
                     }
                 };
+                let Some(sample) = sample else {
+                    self.reopen_stream().await;
+                    continue;
+                };
 
-                if let Some(stats) = crate::stats::global() {
-                    stats.capture_samples.fetch_add(1, Ordering::Relaxed);
-                }
                 // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
                 if let Some(status) = sample.frame_status() {
                     if !status.has_content() {
-                        if let Some(stats) = crate::stats::global() {
-                            stats.capture_idle.fetch_add(1, Ordering::Relaxed);
-                        }
                         continue;
                     }
                 }
-
-                let Some(pixel_buffer) = sample.image_buffer() else {
-                    continue;
-                };
 
                 if let Some(stats) = crate::stats::global() {
                     stats.capture_content.fetch_add(1, Ordering::Relaxed);
                 }
-                let guard = pixel_buffer
-                    .lock(CVPixelBufferLockFlags::READ_ONLY)
-                    .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))?;
+                let Some(pixel_buffer) = sample.image_buffer() else {
+                    continue;
+                };
 
-                let pb_width = u16::try_from(guard.width()).context("pixel buffer width > u16")?;
+                // Dimensions come from the buffer itself, no lock: in NV12 mode
+                // the EGFX path never needs the pixels on the CPU at all.
+                let pb_width =
+                    u16::try_from(pixel_buffer.width()).context("pixel buffer width > u16")?;
                 let pb_height =
-                    u16::try_from(guard.height()).context("pixel buffer height > u16")?;
-                let stride_bytes = guard.bytes_per_row();
-                let src = guard.as_slice();
+                    u16::try_from(pixel_buffer.height()).context("pixel buffer height > u16")?;
 
                 // Log the dimensions SCK actually delivers, once per session.
                 // `pb_width`/`pb_height` are the real captured buffer size — at
@@ -1688,17 +2266,20 @@ mod macos {
                     tracing::debug!(
                         pb_width,
                         pb_height,
-                        stride_bytes,
+                        pixel_format = format_args!("{:#010x}", pixel_buffer.pixel_format()),
                         force_full_frame = self.force_full_frame,
                         "capture: first frame delivered"
                     );
+                    if self.nv12 {
+                        log_nv12_luma_range(&pixel_buffer);
+                    }
                 }
 
                 // EGFX/H.264 path: submit the full frame to the encoder. Once
-                // EGFX has negotiated (`Submitted` or `Deferred`), it owns the display — skip
+                // EGFX has negotiated (`Ok(true)`), it owns the display — skip
                 // the legacy BitmapUpdate emission entirely (cursor still flows
                 // via the poll at the top of the loop). Before negotiation, or
-                // for non-EGFX clients (`Inactive`), fall through to legacy.
+                // for non-EGFX clients (`Ok(false)`), fall through to legacy.
                 if let Some(gfx) = self.gfx.as_ref() {
                     // On-demand keyframes (opt-in via --keyframe-on-change). A
                     // large change at once (window raised to front, scroll, app
@@ -1759,50 +2340,97 @@ mod macos {
                     } else {
                         false
                     };
-                    // A fresh capture may supersede the retained repaint.
-                    // Preserve the keyframe requirement when that happens.
-                    let repaint = self.flush_burst.explicit_repaint_pending();
-                    match gfx.submit_bgra(src, stride_bytes, big_change || repaint) {
-                        Ok(
-                            outcome @ (crate::h264::FrameSubmission::Submitted
-                            | crate::h264::FrameSubmission::Deferred),
-                        ) => {
+                    // Force an IDR on the first frame after un-suppress: the
+                    // P-frames we would have sent during the minimize depend
+                    // on a reference frame mstsc may no longer hold (or its
+                    // decoder state may have been torn down). Without a fresh
+                    // keyframe the resume frame would decode against missing
+                    // state and render garbled.
+                    let resume_keyframe = if self.was_suppressed {
+                        self.was_suppressed = false;
+                        tracing::debug!("client un-suppress edge — forcing IDR on next encode");
+                        // If EGFX is on the reliable UDP tunnel, mstsc's surface
+                        // won't survive the minimize/restore — switch back to TCP
+                        // BEFORE shipping the restore frame into the now-stale
+                        // tunnel (no-op on TCP/lossy/default; see
+                        // `Gfx::demigrate_on_resume`).
+                        gfx.demigrate_on_resume();
+                        true
+                    } else {
+                        false
+                    };
+                    match submit_to_gfx(
+                        gfx,
+                        &pixel_buffer,
+                        self.nv12,
+                        big_change || resume_keyframe,
+                        false,
+                    ) {
+                        Ok(true) => {
+                            self.held_frame = false;
                             self.seeded = true;
-                            // Keep the CoreVideo surface itself for the bounded
-                            // flush burst. `image_buffer()` returned an owned
-                            // retained reference, so moving it here prevents
-                            // SCK from recycling its backing store until we are
-                            // done, without copying the full BGRA frame.
-                            drop(guard);
-                            let submitted = outcome == crate::h264::FrameSubmission::Submitted;
-                            let now = Instant::now();
-                            if repaint {
-                                self.flush_burst
-                                    .attempted(submitted, now, self.flush_interval);
-                            } else {
-                                self.flush_burst.arm(
-                                    self.flush_frames,
-                                    submitted,
-                                    now,
-                                    self.flush_interval,
+                            // First-EGFX-frame milestone: arms the suppress
+                            // gate (see `first_egfx_frame_sent` in the struct).
+                            if !self.first_egfx_frame_sent {
+                                self.first_egfx_frame_sent = true;
+                                tracing::debug!(
+                                    "first EGFX frame shipped — suppress gate now armed"
                                 );
                             }
-                            // Keep just the most recent surface for an explicit
-                            // repaint even after the ordinary flush has drained.
-                            self.last_frame = Some(pixel_buffer);
+                            // Stash this frame and arm the flush burst so that,
+                            // once SCK goes idle after this change, we re-submit
+                            // it enough times to drain mstsc's presentation
+                            // buffer. A retain, not a copy (see `last_frame`).
+                            self.last_frame = Some(pixel_buffer.clone());
+                            self.flush_remaining = self.flush_frames;
                             continue;
                         }
-                        Ok(crate::h264::FrameSubmission::Inactive) => {}
+                        // EGFX still negotiating on this connection: do not send
+                        // the frame as a legacy update (Windows 10 mstsc can stay
+                        // frozen on a legacy picture sent just before EGFX starts;
+                        // see `hold_legacy_for_egfx`). Keep it: on a static screen
+                        // no other frame may come (see `held_frame`).
+                        Ok(false) if gfx.hold_legacy(self.started_at) => {
+                            self.last_frame = Some(pixel_buffer.clone());
+                            self.held_frame = true;
+                            continue;
+                        }
+                        Ok(false) => {
+                            // Not ready yet: this frame goes out as legacy
+                            // bitmaps, but retain it to re-send over H.264
+                            // once the pipeline comes up (a retain, not a
+                            // copy — see `last_frame`).
+                            if gfx.pipeline_pending()
+                                && self.started_at.elapsed() < EGFX_PENDING_FRAME_WINDOW
+                            {
+                                self.last_frame = Some(pixel_buffer.clone());
+                                self.egfx_pending_frame = true;
+                            }
+                        }
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
                     }
                 }
+
+                // This frame goes out as legacy, so a held one is obsolete.
+                self.held_frame = false;
+
+                // Legacy bitmap path: needs the pixels as BGRA on the CPU.
+                let guard = pixel_buffer
+                    .lock(CVPixelBufferLockFlags::READ_ONLY)
+                    .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))?;
+                let (src, stride_bytes): (&[u8], usize) = if self.nv12 {
+                    nv12_to_bgra(&guard, &mut self.nv12_bgra)?;
+                    (&self.nv12_bgra, usize::from(pb_width) * 4)
+                } else {
+                    (guard.as_slice(), guard.bytes_per_row())
+                };
 
                 // Decide the rect set to emit. On the first frame we always
                 // send the full frame so the client's bitmap cache is seeded.
                 // After that, SCK's dirty_rects tells us what changed; if the
                 // attachment is missing (older macOS, no key), fall back to
                 // the full frame.
-                let dirty = if !self.seeded || self.force_full_frame || coalesced {
+                let dirty = if !self.seeded || self.force_full_frame {
                     None
                 } else {
                     sample.dirty_rects()
@@ -1814,17 +2442,16 @@ mod macos {
                         .filter_map(|r| {
                             let origin = r.origin();
                             let size = r.size();
-                            let x0 = origin.x.max(0.0).floor() as u32;
-                            let y0 = origin.y.max(0.0).floor() as u32;
-                            let x1 = (origin.x.max(0.0) + size.width.max(0.0)).ceil() as u32;
-                            let y1 = (origin.y.max(0.0) + size.height.max(0.0)).ceil() as u32;
-
-                            let x = u16::try_from(x0.min(u32::from(pb_width))).ok()?;
-                            let y = u16::try_from(y0.min(u32::from(pb_height))).ok()?;
-                            let max_w = u32::from(pb_width.saturating_sub(x));
-                            let max_h = u32::from(pb_height.saturating_sub(y));
-                            let w = u16::try_from(x1.saturating_sub(x0).min(max_w)).ok()?;
-                            let h = u16::try_from(y1.saturating_sub(y0).min(max_h)).ok()?;
+                            let x = origin.x.max(0.0).round() as u32;
+                            let y = origin.y.max(0.0).round() as u32;
+                            let w = size.width.max(0.0).round() as u32;
+                            let h = size.height.max(0.0).round() as u32;
+                            let x = u16::try_from(x.min(u32::from(pb_width))).ok()?;
+                            let y = u16::try_from(y.min(u32::from(pb_height))).ok()?;
+                            let w =
+                                u16::try_from(w.min(u32::from(pb_width.saturating_sub(x)))).ok()?;
+                            let h = u16::try_from(h.min(u32::from(pb_height.saturating_sub(y))))
+                                .ok()?;
                             if w == 0 || h == 0 {
                                 None
                             } else {
@@ -1835,14 +2462,10 @@ mod macos {
                     _ => vec![(0, 0, pb_width, pb_height)],
                 };
 
-                // Clear any leftover strips from previous ticks so stale older
-                // frames never overwrite newer screen updates (eliminates ghosting).
-                self.pending.clear();
-
                 // Split oversized rects into strips so each BitmapUpdate stays
                 // within the size mstsc will render (see split_strips). No-op
                 // for already-small rects.
-                for (x, y, w, h) in crate::bitmap_damage::coalesce_damage(rects) {
+                for (x, y, w, h) in rects {
                     for (sx, sy, sw, sh) in split_strips(x, y, w, h) {
                         if let Some(update) = rect_update(src, stride_bytes, sx, sy, sw, sh) {
                             self.pending.push_back(update);
@@ -1851,6 +2474,13 @@ mod macos {
                 }
                 self.seeded = true;
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for ScreenCaptureUpdates {
+        async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
+            self.capture_next_update().await.map_err(display_error)
         }
     }
 }
@@ -1912,7 +2542,7 @@ mod stub {
 
     #[async_trait::async_trait]
     impl RdpServerDisplayUpdates for StubUpdates {
-        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
             if let Some(u) = self.queue.pop_front() {
                 return Ok(Some(u));
             }
@@ -1929,6 +2559,56 @@ mod stub {
 mod tests {
     use super::*;
 
+    fn online(id: u32, vendor: u32, builtin: bool, size_px: (u32, u32)) -> OnlineDisplay {
+        OnlineDisplay {
+            id,
+            vendor,
+            builtin,
+            size_px,
+        }
+    }
+
+    #[test]
+    fn a_reregistered_virtual_display_is_found_by_vendor_then_by_size() {
+        const PANEL: u32 = 0x610;
+        const ODD: u32 = 1;
+        let ours = VIRTUAL_DISPLAY_VENDOR;
+        let session = (3024, 1898);
+        let same = [online(22, ours, false, session)];
+        assert_eq!(pick_reopened_display(22, &same, session), Some(22));
+        let by_vendor = [
+            online(1, PANEL, true, (3024, 1964)),
+            online(23, ours, false, session),
+        ];
+        assert_eq!(pick_reopened_display(22, &by_vendor, session), Some(23));
+        let by_size = [
+            online(1, PANEL, true, session),
+            online(23, ODD, false, session),
+        ];
+        assert_eq!(pick_reopened_display(22, &by_size, session), Some(23));
+        let ambiguous = [
+            online(23, ODD, false, session),
+            online(24, ODD, false, session),
+        ];
+        assert_eq!(pick_reopened_display(22, &ambiguous, session), None);
+        let gone = [online(1, PANEL, true, (3024, 1964))];
+        assert_eq!(pick_reopened_display(22, &gone, session), None);
+    }
+
+    /// #205: mirror the main display even when SCK lists another first.
+    #[test]
+    fn mirror_display_prefers_the_main_display() {
+        // Main display listed second: pick it, not the first.
+        assert_eq!(mirror_display_index(&[3, 1, 7], 1), Some(1));
+        // Main listed first, or the only display: unchanged from before.
+        assert_eq!(mirror_display_index(&[1, 3], 1), Some(0));
+        assert_eq!(mirror_display_index(&[1], 1), Some(0));
+        // Main not in SCK's list at all: fall back to the first, as before.
+        assert_eq!(mirror_display_index(&[3, 7], 1), Some(0));
+        // No displays: nothing to mirror.
+        assert_eq!(mirror_display_index(&[], 1), None);
+    }
+
     #[test]
     fn shared_desktop_size_roundtrips() {
         let size = SharedDesktopSize::new(1512, 982);
@@ -1939,35 +2619,6 @@ mod tests {
         let clone = size.clone();
         clone.set(u16::MAX, 1);
         assert_eq!(size.get(), (u16::MAX, 1));
-    }
-
-    #[test]
-    fn sck_cap_only_paces_faster_or_unknown_displays() {
-        for display_hz in [30.0, 59.94, 60.0, 60.5] {
-            assert!(!sck_needs_frame_cap(60, display_hz), "rate {display_hz}");
-        }
-        for display_hz in [0.0, f64::NAN, 60.51, 120.0] {
-            assert!(sck_needs_frame_cap(60, display_hz), "rate {display_hz}");
-        }
-        assert!(sck_needs_frame_cap(30, 60.0));
-    }
-
-    #[tokio::test]
-    async fn resize_wakes_idle_capture_and_replaces_the_deadline() {
-        let pending = PendingResize::new();
-        let request = pending.clone();
-        let debounce = Duration::from_secs(1);
-        let writer = tokio::spawn(async move { request.request(1280, 720) });
-        tokio::time::timeout(Duration::from_secs(1), pending.changed())
-            .await
-            .expect("resize must wake capture without an SCK sample");
-        writer.await.unwrap();
-        let first = pending.deadline(debounce).unwrap();
-        pending.request(1920, 1080);
-        assert!(pending.deadline(debounce).unwrap() >= first);
-        assert_eq!(pending.take_settled(debounce), None);
-        assert_eq!(pending.take_settled(Duration::ZERO), Some((1920, 1080)));
-        assert_eq!(pending.deadline(debounce), None);
     }
 
     #[test]
@@ -1999,18 +2650,6 @@ mod tests {
         pr.request(1024, 768);
         pr.request(1920, 1080);
         assert_eq!(pr.take_settled(Duration::ZERO), Some((1920, 1080)));
-    }
-
-    #[test]
-    fn resize_drag_back_to_current_size_cancels_the_earlier_change() {
-        let pending = PendingResize::new();
-        pending.request(1280, 720);
-        pending.request(1920, 1080);
-        assert_eq!(
-            pending.take_settled_change(Duration::ZERO, (1920, 1080)),
-            None
-        );
-        assert!(!pending.has_pending());
     }
 
     #[test]
@@ -2129,6 +2768,34 @@ mod tests {
                 height: 8192
             })
         );
+    }
+
+    #[test]
+    fn cap_client_size_applies_the_operator_maximum() {
+        let size = |width, height| DesktopSize { width, height };
+        let max = Some(size(1920, 1080));
+        // Issue #211: a client echoing 3840x2160 under a 1920x1080 cap.
+        assert_eq!(cap_client_size(size(3840, 2160), max), size(1920, 1080));
+        // Per dimension: a smaller side is kept.
+        assert_eq!(cap_client_size(size(1280, 2160), max), size(1280, 1080));
+        assert_eq!(cap_client_size(size(1280, 720), max), size(1280, 720));
+        // No cap: unchanged.
+        assert_eq!(cap_client_size(size(3840, 2160), None), size(3840, 2160));
+        // Served at the cap already, the oversized echo is not adopted.
+        assert_eq!(
+            adopt_client_size(true, (1920, 1080), cap_client_size(size(3840, 2160), max)),
+            None
+        );
+    }
+
+    #[test]
+    fn sck_frame_cap_only_for_a_faster_or_unknown_display() {
+        assert!(!sck_needs_frame_cap(60, 60.0));
+        assert!(!sck_needs_frame_cap(60, 59.94));
+        assert!(!sck_needs_frame_cap(120, 60.0));
+        assert!(sck_needs_frame_cap(60, 120.0));
+        assert!(sck_needs_frame_cap(15, 60.0));
+        assert!(sck_needs_frame_cap(60, 0.0));
     }
 
     #[test]

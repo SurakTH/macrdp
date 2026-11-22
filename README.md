@@ -5,7 +5,13 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-buy%20me%20a%20coffee-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/clintcan)
 
-A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, Microsoft Remote Desktop, or FreeRDP to drive your Mac desktop with keyboard, mouse, real-cursor-shape forwarding, text + image clipboard sync, Mac↔Windows file copy, **read-write drive redirection** (mount the client's drives in Finder), **smart-card redirection** (use the client's smart card from macOS apps), system audio forwarding, and optional hardware-encoded H.264 video (EGFX/AVC420 or opt-in AVC444). NLA/CredSSP is supported. Authenticates against your local Mac account via PAM.
+A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, the Windows App / Microsoft Remote Desktop, or FreeRDP and drive your Mac — authenticated against your local Mac account (NLA/CredSSP, TLS). What you get:
+
+- **Desktop:** H.264 video (hardware-encoded, opt-in, with optional adaptive bitrate) or legacy bitmaps; keyboard (non-US layouts auto-detected) and mouse with the real cursor shape; the session follows your client's resolution.
+- **Clipboard & files:** text, images and rich text both ways; copy files and folders between Mac and Windows.
+- **Audio:** Mac audio to the client; the client's microphone as a real Mac input device *(experimental)*.
+- **Devices from the client:** drives mounted in Finder (read-write), smart cards for macOS apps, the webcam as a real Mac camera, and USB devices *(experimental)*.
+- **Headless:** serve a virtual display so the Mac needs no monitor, with the physical screen blanked while you're connected.
 
 This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
@@ -17,23 +23,42 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 ## Status
 
-**Fork pre-release: v0.9.6.2**, based on upstream **v0.9.6**. Cargo and the
-macOS app bundles report the internal version **0.96.2**. The upstream project
-maintains its independent release line.
+v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-Start with **Connection → Stable** for the tested 1080p AVC420 settings.
-The Controller now supports personal presets and live video diagnostics.
-4K/60, Fast flush, TCP video pacing and AVC444 diagnostics remain experimental.
-See the [v0.9.6.2 release notes](docs/releases/v0.9.6.2.md) for upgrade details
-and Windows validation.
+**Fork download: [v0.9.6.2](https://github.com/SurakTH/macrdp/releases/tag/v0.9.6.2)**. The installer includes the server and the menu-bar Controller. The app reports the internal version `0.96.2`.
+
+**Upstream integration preview:** this branch brings in [clintcan/macrdp v0.10.9](https://github.com/clintcan/macrdp/releases/tag/v0.10.9), including changes to Windows App startup, connection-quality reporting and the IronRDP dependency. Use the Stable Controller profile when comparing with the previous fork release. Fast flush and AVC444 are experimental, and 4K/60 still needs client validation.
+
+**Recent upstream releases**
+
+- **v0.10.7** (2026-11-20) — no frozen start on Windows 10 mstsc, an ack-lag cap, UDP out of experimental
+- **v0.10.6** (2026-11-16) — no restart loop on a wrong password, a HiDPI virtual display, Windows 10 mstsc pictures
+- **v0.10.5** (2026-11-13) — UDP multitransport fixes: mstsc's tunnel stays up, lossy audio plays again
+- **v0.10.4** (2026-11-13) — true-colour cursors, native-style app switching, `--reverse-scroll`, pre-login timeout
+- **v0.10.3** (2026-11-13) — Finder writes to redirected drives; the keyframe backoff works
+- **v0.10.2** (2026-11-13) — no session freezes from Universal Clipboard items; no stuck drive mount after a restart
+- **v0.10.1** (2026-11-12) — mstsc fixes: no drop after a blank-screen recovery, no adaptive-bitrate stutter on a LAN
+- **v0.10.0** (2026-11-12) — IronRDP update: stalled-client timeout, iOS Windows App cursor, mute-on-minimize for FreeRDP/Thincast
+- **v0.9.11** (2026-10-01) — input fixes: held modifiers on clicks, Ctrl+click→Cmd+click under `--map-ctrl-to-cmd`
+- **v0.9.10** (2026-09-30) — microphone redirection *(experimental)*; `--lock-on-disconnect` no longer locks under a reconnecting client
+- **v0.9.9** (2026-09-29) — rich-text clipboard in both directions
+- **v0.9.8** (2026-09-27) — lock while away: `--lock-on-disconnect` + `--auto-unlock` *(experimental)*
+- **v0.9.7** (2026-09-19) — security patch: rustls, cryptoki and h2 advisories
+- **v0.9.6** (2026-08-16) — fixes a scroll-down regression and an unauthenticated denial of service
+- **v0.9.5** (2026-08-06) — IronRDP update; two vendored forks retired
+- **v0.9.4** (2026-08-05) — security hotfix for a pre-TLS denial of service
+- **v0.9.3** (2026-07-29) — a second client takes over the session; blank-recovery storm-guard fix
+- **v0.9.2** (2026-07-26) — blank recovery no longer drops a session that is working
+- **v0.9.1** (2026-07-23) — `--shield-primary`: headless and still lockable
+- **v0.9.0** (2026-07-20) — the client's webcam as a real Mac camera
 
 Full per-release notes (what shipped, what was verified live, and the war stories): **[docs/release-history.md](docs/release-history.md)**.
 
 ## Production readiness
 
-Short version: **a polished v0 daily-driver for trusted LANs and your own VPN — not an enterprise RDP server.** Use it to reach your own Mac over a network you control; don't put it on a public IP or treat it as multi-user/critical infrastructure.
+Short version: **production-ready for single-user use on a LAN or VPN** — soak-tested past 48 h twice with no leaks or panics, hardened, and abuse-tested. **Not an enterprise RDP server:** one session at a time, a solo project with no SLA, and features marked *experimental* (for example USB, microphone, lock-on-disconnect/auto-unlock) haven't been soak-tested. **Never expose it — or any RDP server — on a public IP;** reach it over a VPN or RD Gateway.
 
-**Solid (verified on real mstsc / Microsoft Remote Desktop / FreeRDP):** TLS + NLA/CredSSP auth against your Mac account (Keychain-backed, real CA certs supported, per-IP rate-limiting + lockout + audit log); the full daily workflow (display, input incl. non-US layouts, clipboard/files both ways, audio, drive + smart-card redirection, headless virtual displays); H.264 with congestion-responsive rate control that degrades gracefully instead of freezing; signed/notarized packaging with a LaunchAgent, menu-bar controller, and a health-check watchdog; 160+ tests in CI.
+**Solid (verified on real mstsc / Microsoft Remote Desktop / FreeRDP):** TLS + NLA/CredSSP auth against your Mac account (Keychain-backed, real CA certs supported, per-IP rate-limiting + lockout + audit log); the full daily workflow (display, input incl. non-US layouts, clipboard/files both ways, audio, drive + smart-card redirection, headless virtual displays); H.264 with congestion-responsive rate control that degrades gracefully instead of freezing; signed/notarized packaging with a LaunchAgent, menu-bar controller, and a health-check watchdog; soak-tested past 48 h twice (v0.9.3, v0.9.6; no leaks, 0 panics) and abuse-tested; 250+ tests in CI.
 
 **Know before relying on it:** single session/single user; no multi-monitor or printer redirection; DRM video and password-manager windows capture black (macOS policy, not fixable); synthetic input can't reach the login window/secure fields (same); reconnecting *mstsc* can briefly show a blank screen (client quirk — the server now auto-heals it in ~4 s by reactivating the RDP core in place, no user action); the UDP paths are opt-in and newer than the TCP core; it's a solo v0 on vendored [IronRDP] forks, no SLA. **Never expose any RDP server on a raw public IP — reach it over a VPN or RD Gateway.**
 
@@ -45,6 +70,20 @@ builds. The October hardening changes require reinstalling the smart-card IFD
 handler together with the server; see [smart-card setup](docs/smart-card-redirection.md#ipc-authentication-and-upgrading).
 
 ## Quick start
+
+**With Homebrew** (Apple Silicon, macOS 14+), installing the same notarized build as the releases:
+
+```bash
+brew tap clintcan/tap
+brew trust clintcan/tap    # current Homebrew asks you to trust third-party taps
+brew install --cask macrdp
+```
+
+Then open **macrdpController** from /Applications. It's a menu-bar app, so nothing appears in the Dock; the first time, a short welcome points you to it. Look for a small display icon in the menu bar (dimmed while the server isn't running), click it and choose **Start (first run sets up)**. That asks for your Mac password, stores it in the Keychain, and sets the server to start at login; then turn on Screen Recording and Accessibility for macrdp in System Settings › Privacy & Security (the controller offers to open it). If you can't see the icon, it may be hidden behind the notch or by the Menu Bar settings in System Settings. After `brew upgrade`, restart the server with `launchctl kickstart -k gui/$UID/com.clintcan.macrdp`. It's a cask rather than a formula on purpose: only the signed app carries the entitlement USB redirection needs, and it keeps your permission grants across upgrades.
+
+**After a reboot, someone has to log in before you can connect.** macrdp runs in your user session, which only starts once you log in, so it can't show the login screen ([#237](https://github.com/clintcan/macrdp/issues/237)). With FileVault on, no remote-desktop server can, since the disk unlocks before macOS starts any network service. To get in after a reboot, log in once with macOS Screen Sharing (VNC) and then connect over RDP. For a planned reboot with FileVault on, `sudo fdesetup authrestart` unlocks the disk for that one restart. Automatic login (System Settings › Users & Groups, FileVault off only) also works, at the cost of the Mac booting straight to an unlocked desktop.
+
+**From source:**
 
 ```bash
 ./start.sh doctor   # read-only preflight; does not build or start the server
@@ -100,7 +139,7 @@ macrdp reimplements the macOS symbolic hotkeys in user space (WindowServer won't
 | **Ctrl+Alt+G** | Gather windows stranded off the virtual display (headless `--capture-primary`/`--detach-primary` modes) |
 | **Ctrl+Alt+Shift+R** | On-demand A/V resync — repaint a stale/idle-blanked screen (forced keyframe) and re-sync drifted audio, without disconnecting. Handy for mstsc after hours idle. |
 
-Optional flags: `--alt-tab-switch` / `--alt-backtick-switch` accept **Option+Tab** / **Option+\`** as the same triggers; `--app-switcher-hud` draws a visible switcher overlay; `--map-ctrl-to-cmd` remaps Windows **Ctrl+C/V/X/…** editing shortcuts to their **Cmd** equivalents.
+Optional flags: `--alt-tab-switch` / `--alt-backtick-switch` / `--alt-space-spotlight` accept **Option+Tab** / **Option+\`** / **Option+Space** as the same triggers; `--alt-q-quit` sends **Option+Q** (Alt+Q from the client) as **Cmd+Q** to quit apps; `--app-switcher-hud` draws a visible switcher overlay; `--map-ctrl-to-cmd` remaps Windows **Ctrl+C/V/X/…** editing shortcuts to their **Cmd** equivalents.
 
 > **mstsc tip:** if **Cmd+Tab** seems ignored, set **Local Resources → Keyboard → "Apply Windows key combinations"** to **"On the remote computer"** (or go full-screen) — the windowed default eats **Win+Tab** locally as Task View.
 
@@ -151,10 +190,9 @@ Pushing a `v*` tag runs the [release workflow](.github/workflows/release.yml), w
 | `macrdp-<ver>-aarch64-apple-darwin-app.zip` | the full **`macrdp.app`**, with the embedded smart-card IFD handler + installer — the only standalone artifact that carries everything `--enable-smartcard-redirection` needs |
 | `SHA256SUMS` | checksums for every downloadable archive |
 
-The CI-built apps are **ad-hoc signed, not notarized** — open each app once via
-**right-click → Open**. The DMG contains both apps, but it does not remove this
-Gatekeeper step. For a Developer-ID-signed + notarized build, build locally with
-[packaging/make-app.sh](packaging/README.md) and the matching controller/DMG scripts.
+Both are **ad-hoc signed, not notarized** — open the app once via **right-click → Open** (or `xattr -dr com.apple.quarantine macrdp.app`).
+
+Each release also carries **`macrdp-<ver>-usb.dmg`**, built and attached by hand rather than in CI: the **Developer-ID-signed, notarized, entitled** build with both the server and the menu-bar controller app. It's the only build in which `--enable-usb-redirection` works, and it's what the [Homebrew cask](#quick-start) installs. To make your own signed build, use [packaging/make-app.sh](packaging/README.md).
 
 ## Documentation
 
@@ -163,7 +201,7 @@ Gatekeeper step. For a Developer-ID-signed + notarized build, build locally with
 | **[Performance & quality tuning record](docs/performance-quality-tuning.md)** | Consolidated record of the H.264 zero-copy/allocation work, Native HiDPI bitmap tuning, codec-quality choices, launcher behavior, trade-offs, and verification status. |
 | **[Configuration & CLI](docs/configuration.md)** | Every flag, the auth-hardening environment variables (rate-limit/lockout/audit), headless mode (`--virtual-display`, `--detach-primary`/`--capture-primary`), and a full set of example invocations. |
 | **[Video](docs/video.md)** | The H.264/EGFX pipeline, Retina capture (`--hidpi`), client-resolution auto-adopt and letterboxing, bitrate/keyframe tuning, the mstsc reconnect-blank quirk and its in-place auto-recovery, and the vImage color-conversion benchmarks. |
-| **[Audio](docs/audio.md)** | RDPSND PCM, opt-in AAC compression (`--enable-aac`), the self-healing capture stream, and mute-on-minimize. |
+| **[Audio](docs/audio.md)** | RDPSND PCM, opt-in AAC compression (`--enable-aac`), the self-healing capture stream, mute-on-minimize — and the experimental **microphone redirection** (`--enable-microphone-redirection`): the client's mic as a real macOS input device. |
 | **[File copy](docs/file-copy.md)** | Mac↔Windows clipboard file copy (files and folder trees), lazy vs eager paste, and the two Windows-side gotchas (Explorer folder-copy, archive shell extensions). |
 | **[Drive redirection](docs/drive-redirection.md)** | Mounting the client's drives as read-write Finder volumes (`--enable-drive-redirection`) — how the in-process NFS bridge works and what to expect from permissions. |
 | **[Camera redirection](docs/camera-extension-setup.md)** | Presenting the client's **webcam as a real macOS camera** (`--enable-camera-redirection`) — the one-time system-extension setup and activation, how the MS-RDPECAM → VideoToolbox → CoreMediaIO pipeline fits together, and the four CoreMediaIO failure modes that all fail *silently*. **For a webcam use this, not USB redirection** — it's the path mstsc feeds. |
@@ -171,7 +209,7 @@ Gatekeeper step. For a Developer-ID-signed + notarized build, build locally with
 | **[Audit log & SIEM](docs/audit-log.md)** | The security audit events (accept / reject / auth / disconnect) — every field and how to interpret them — plus [forwarding the JSON stream](docs/siem-forwarding.md) to a SIEM/SOC collector (Vector / Fluent Bit / rsyslog) and a runnable [OpenSearch SIEM tutorial](docs/siem-tutorial.md) that detects an RDP brute-force end-to-end. |
 | **[vs. other OSS RDP servers](docs/oss-rdp-server-comparison.md)** | Two parts. **Part 1** — the evidence behind every "first" claim in these docs, verified adversarially against FreeRDP/xrdp and re-checked in the source, including what macrdp is **not** first at and how to re-verify when upstreams move. **Part 2** — an honest head-to-head against the other native macOS RDP servers (`x6nux/macrdp`, `RDPonMAC`), written steelmanning theirs, including where they beat us. |
 | **[Release history](docs/release-history.md)** | Per-release narrative of what shipped and what was live-verified. |
-| [CLAUDE.md](CLAUDE.md) | Developer/agent reference — architecture, feature status, macOS gotchas, known quirks. |
+| [CLAUDE.md](CLAUDE.md) | Developer/agent index — current release, plus pointers to the feature list, architecture, macOS gotchas and known quirks. |
 
 ## Why this was made
 

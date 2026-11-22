@@ -16,9 +16,9 @@
 //! `MacInputHandler`), so the test is fully cross-platform — it runs on Linux CI
 //! AND locally on macOS without touching the screen-capture backend.
 //!
-//! What it asserts: with `set_honor_client_desktop_size(true)`, a client that
+//! What it asserts: with `with_honor_client_desktop_size(Some(..))`, a client that
 //! requests 1920×1080 gets a session negotiated at 1920×1080 even though the
-//! server's display starts at 1024×768 — i.e. the vendored acceptor's
+//! server's display starts at 1024×768 — i.e. the acceptor's
 //! client-resolution auto-adopt works across a real handshake. With it off, the
 //! client gets the server's own size. (Pure-fn coverage of the adopt decision
 //! lives in `capture.rs::adopt_client_size`; this proves the wire path.)
@@ -31,8 +31,9 @@ use ironrdp_connector::sspi::generator::NetworkRequest;
 use ironrdp_connector::{ClientConnector, Config, ConnectorResult, Credentials, DesktopSize};
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec};
 use ironrdp_server::{
-    ConnectionHandler, DesktopSize as ServerDesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent,
-    RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
+    ConnectionHandler, ConnectionPolicy, DesktopSize as ServerDesktopSize, DisplayUpdate,
+    KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
+    RdpServerInputHandler, ServerAutoReconnect,
 };
 use ironrdp_tokio::TokioFramed;
 use tokio_rustls::{rustls, TlsConnector};
@@ -51,7 +52,7 @@ impl RdpServerInputHandler for TestInput {
 struct TestUpdates;
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for TestUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
         std::future::pending::<()>().await;
         Ok(None)
     }
@@ -65,7 +66,7 @@ impl RdpServerDisplay for TestDisplay {
     async fn size(&mut self) -> ServerDesktopSize {
         self.size
     }
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&mut self) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(TestUpdates))
     }
 }
@@ -218,7 +219,7 @@ fn client_config(width: u16, height: u16) -> Config {
         // Added to connector Config in the a5d1c682 pin bump; Lan is the canonical
         // default (client config / testsuite / web all use it).
         connection_type: ConnectionType::Lan,
-        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
@@ -244,6 +245,14 @@ fn client_config(width: u16, height: u16) -> Config {
         timezone_info: TimezoneInfo::default(),
         alternate_shell: String::new(),
         work_dir: String::new(),
+        // Added to connector Config by the e258f6a0 pin bump; values as upstream's
+        // own e2e tests use, except no RAIL (this client doesn't use it).
+        monitor_layout: None,
+        enable_standard_rdp_security: false,
+        enable_audio_capture: false,
+        support_dyn_vc_gfx_protocol: false,
+        remote_application_mode: false,
+        rail_support_level: ironrdp_pdu::rdp::capability_sets::RailSupportLevel::empty(),
     }
 }
 
@@ -308,19 +317,25 @@ fn build_test_server_full(
     } else {
         None
     };
-    let mut server = RdpServer::builder()
+    RdpServer::builder()
         .with_addr((Ipv4Addr::LOCALHOST, port))
         .with_tls(server_tls_acceptor())
         .with_input_handler(TestInput)
         .with_display_handler(display)
         .with_sound_factory(sound)
         .with_bitmap_codecs(codecs)
-        .build();
-    server.set_honor_client_desktop_size(honor);
-    server.set_honor_client_desktop_size_max(
-        max.map(|(width, height)| ServerDesktopSize { width, height }),
-    );
-    server
+        .with_honor_client_desktop_size(honor_client_size(honor, max))
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .build()
+}
+
+/// The honored-size setting as `main.rs` builds it: the operator ceiling, or
+/// MS-RDPBCGR's own 8192 maximum, when auto-adopt is on.
+fn honor_client_size(honor: bool, max: Option<(u16, u16)>) -> Option<ServerDesktopSize> {
+    honor.then(|| {
+        let (width, height) = max.unwrap_or((8192, 8192));
+        ServerDesktopSize { width, height }
+    })
 }
 
 /// Drive a real IronRDP client through the full connect handshake (X.224 nego →
@@ -349,23 +364,17 @@ async fn connect_client<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
-    let (result, framed) =
-        connect_client_with_channels(client_io, client_w, client_h, None).await?;
-    Ok((
-        (result.desktop_size.width, result.desktop_size.height),
-        framed,
-    ))
+    connect_client_with_cookie(client_io, client_w, client_h, None).await
 }
 
-async fn connect_client_with_channels<S>(
+/// [`connect_client`], presenting `cookie` in the Client Info PDU the way a client
+/// auto-reconnecting after a dropped connection does.
+async fn connect_client_with_cookie<S>(
     client_io: S,
     client_w: u16,
     client_h: u16,
-    dynamic_channels: Option<ironrdp_dvc::DrdynvcClient>,
-) -> anyhow::Result<(
-    ironrdp_connector::ConnectionResult,
-    TokioFramed<tokio_rustls::client::TlsStream<S>>,
-)>
+    cookie: Option<ServerAutoReconnect>,
+) -> anyhow::Result<((u16, u16), TokioFramed<tokio_rustls::client::TlsStream<S>>)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
@@ -374,8 +383,8 @@ where
         client_config(client_w, client_h),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
     );
-    if let Some(channel) = dynamic_channels {
-        connector.attach_static_channel(channel);
+    if let Some(cookie) = cookie {
+        connector = connector.with_auto_reconnect_cookie(cookie);
     }
     let mut framed = TokioFramed::new(client_io);
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
@@ -407,7 +416,10 @@ where
         None,
     )
     .await?;
-    Ok((result, tls_framed))
+    Ok((
+        (result.desktop_size.width, result.desktop_size.height),
+        tls_framed,
+    ))
 }
 
 /// Run one full client→server connect over an in-memory duplex with the given
@@ -446,280 +458,6 @@ async fn negotiate(
             size
         })
         .await
-}
-
-#[tokio::test]
-async fn client_suppress_and_restore_wake_an_idle_display() -> Result<()> {
-    use ironrdp_core::WriteBuf;
-    use ironrdp_pdu::geometry::InclusiveRectangle;
-    use ironrdp_pdu::rdp::headers::{encode_share_data, ShareDataPdu};
-    use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
-    use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
-    use tokio::time::{timeout, Duration};
-
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let mut server =
-        build_test_server_full(0, 1024, 768, false, None, crate::bitmap_codecs(), true);
-    let suppressed = server.display_suppressed_handle();
-    let wakeup = Arc::new(tokio::sync::Notify::new());
-    server.set_display_suppressed_wakeup(wakeup.clone());
-    let desktop = InclusiveRectangle {
-        left: 0,
-        top: 0,
-        right: 1023,
-        bottom: 767,
-    };
-    let suppress = || ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect: None });
-    let restore = ShareDataPdu::SuppressOutput(SuppressOutputPdu {
-        desktop_rect: Some(desktop.clone()),
-    });
-    let refresh = ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
-        areas_to_refresh: vec![desktop],
-    });
-
-    tokio::task::LocalSet::new()
-        .run_until(timeout(Duration::from_secs(3), async move {
-            let server_task =
-                tokio::task::spawn_local(async move { server.run_connection(server_io).await });
-            let (channels, mut client) =
-                connect_client_with_channels(client_io, 1024, 768, None).await?;
-            for (pdu, expected) in [
-                (suppress(), true),
-                (restore, false),
-                (suppress(), true),
-                (refresh, false),
-            ] {
-                let mut encoded = WriteBuf::new();
-                encode_share_data(
-                    channels.user_channel_id,
-                    channels.io_channel_id,
-                    channels.share_id,
-                    pdu,
-                    &mut encoded,
-                )?;
-                ironrdp_tokio::FramedWrite::write_all(&mut client, encoded.filled()).await?;
-                wakeup.notified().await;
-                assert_eq!(
-                    suppressed.load(std::sync::atomic::Ordering::Relaxed),
-                    expected
-                );
-            }
-            server_task.abort();
-            Ok::<_, anyhow::Error>(())
-        }))
-        .await??;
-    Ok(())
-}
-
-#[tokio::test]
-async fn client_monitor_layout_reactivates_existing_connection() -> Result<()> {
-    use ironrdp_connector::{connection_activation::ConnectionActivationState, Sequence};
-    use ironrdp_core::{decode, WriteBuf};
-    use ironrdp_displaycontrol::{client::DisplayControlClient, pdu::DisplayControlMonitorLayout};
-    use ironrdp_dvc::DrdynvcClient;
-    use ironrdp_pdu::input::{InputEvent, InputEventPdu, ScanCodePdu};
-    use ironrdp_pdu::mcs::McsMessage;
-    use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
-    use ironrdp_pdu::rdp::headers::{
-        encode_share_data, ShareControlHeader, ShareControlPdu, ShareDataPdu,
-    };
-    use ironrdp_pdu::x224::X224;
-    use ironrdp_svc::client_encode_svc_messages;
-    use ironrdp_tokio::FramedWrite;
-    use tokio::sync::oneshot;
-    use tokio::time::{timeout, Duration};
-
-    struct ResizeDisplay {
-        request: Option<oneshot::Receiver<ServerDesktopSize>>,
-        resize: Option<oneshot::Sender<ServerDesktopSize>>,
-    }
-    #[async_trait::async_trait]
-    impl RdpServerDisplay for ResizeDisplay {
-        async fn size(&mut self) -> ServerDesktopSize {
-            ServerDesktopSize {
-                width: 1024,
-                height: 768,
-            }
-        }
-        async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-            Ok(Box::new(ResizeUpdates(self.request.take())))
-        }
-        fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
-            if let Some(reply) = self.resize.take() {
-                let (width, height) = layout.monitors()[0].dimensions();
-                let _ = reply.send(ServerDesktopSize {
-                    width: u16::try_from(width).unwrap(),
-                    height: u16::try_from(height).unwrap(),
-                });
-            }
-        }
-    }
-
-    struct ResizeUpdates(Option<oneshot::Receiver<ServerDesktopSize>>);
-    #[async_trait::async_trait]
-    impl RdpServerDisplayUpdates for ResizeUpdates {
-        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-            if let Some(receiver) = &mut self.0 {
-                let size = receiver.await?;
-                self.0 = None;
-                return Ok(Some(DisplayUpdate::Resize(size)));
-            }
-            std::future::pending().await
-        }
-    }
-
-    struct ResizeInput(Option<oneshot::Sender<()>>);
-    impl RdpServerInputHandler for ResizeInput {
-        fn keyboard(&mut self, event: KeyboardEvent) {
-            if matches!(
-                event,
-                KeyboardEvent::Pressed {
-                    code: 0x1e,
-                    extended: false
-                }
-            ) {
-                if let Some(sender) = self.0.take() {
-                    let _ = sender.send(());
-                }
-            }
-        }
-        fn mouse(&mut self, _: MouseEvent) {}
-    }
-
-    let (input, received_input) = oneshot::channel();
-    let (resize, request) = oneshot::channel();
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let mut server = RdpServer::builder()
-        .with_addr((Ipv4Addr::LOCALHOST, 0))
-        .with_tls(server_tls_acceptor())
-        .with_input_handler(ResizeInput(Some(input)))
-        .with_display_handler(ResizeDisplay {
-            request: Some(request),
-            resize: Some(resize),
-        })
-        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
-        .with_bitmap_codecs(crate::bitmap_codecs())
-        .build();
-
-    tokio::task::LocalSet::new()
-        .run_until(timeout(Duration::from_secs(3), async move {
-            let task =
-                tokio::task::spawn_local(async move { server.run_connection(server_io).await });
-            let dvc = DrdynvcClient::new()
-                .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
-            let (mut connection, mut client) =
-                connect_client_with_channels(client_io, 1024, 768, Some(dvc)).await?;
-            assert_eq!(connection.desktop_size.width, 1024);
-            assert_eq!(connection.desktop_size.height, 768);
-            let svc_id = connection
-                .static_channels
-                .get_channel_id_by_type::<DrdynvcClient>()
-                .ok_or_else(|| anyhow::anyhow!("DRDYNVC channel not negotiated"))?;
-            let mut layout_sent = false;
-
-            let mut deactivated = false;
-            let demand = loop {
-                let (_, bytes) = client.read_pdu().await?;
-                let Ok(X224(McsMessage::SendDataIndication(data))) = decode(&bytes) else {
-                    continue;
-                };
-                if data.channel_id == svc_id {
-                    let svc = connection
-                        .static_channels
-                        .get_by_channel_id_mut(svc_id)
-                        .unwrap();
-                    let replies = svc.process(&data.user_data)?;
-                    if !replies.is_empty() {
-                        let encoded = client_encode_svc_messages(
-                            replies,
-                            svc_id,
-                            connection.user_channel_id,
-                        )?;
-                        client.write_all(&encoded).await?;
-                    }
-                    let dvc = svc
-                        .channel_processor_downcast_ref::<DrdynvcClient>()
-                        .unwrap();
-                    if let Some(channel) = dvc.get_dvc_by_type_id::<DisplayControlClient>() {
-                        let display = channel
-                            .channel_processor_downcast_ref::<DisplayControlClient>()
-                            .unwrap();
-                        if display.ready() && !layout_sent {
-                            let messages = display.encode_single_primary_monitor(
-                                channel.channel_id().unwrap(),
-                                1600,
-                                900,
-                                None,
-                                None,
-                            )?;
-                            let encoded = client_encode_svc_messages(
-                                messages,
-                                svc_id,
-                                connection.user_channel_id,
-                            )?;
-                            client.write_all(&encoded).await?;
-                            layout_sent = true;
-                        }
-                    }
-                    continue;
-                }
-                let Ok(header) = decode::<ShareControlHeader>(&data.user_data) else {
-                    continue;
-                };
-                match header.share_control_pdu {
-                    ShareControlPdu::ServerDeactivateAll(_) => deactivated = true,
-                    ShareControlPdu::ServerDemandActive(demand) => {
-                        let advertised = demand.pdu.capability_sets.iter().find_map(|cap| {
-                            if let CapabilitySet::Bitmap(bitmap) = cap {
-                                Some((bitmap.desktop_width, bitmap.desktop_height))
-                            } else {
-                                None
-                            }
-                        });
-                        assert!(layout_sent && deactivated);
-                        assert_eq!(advertised, Some((1600, 900)));
-                        break bytes;
-                    }
-                    _ => {}
-                }
-            };
-
-            let mut activation = connection.activation_factory.create();
-            let mut encoded = WriteBuf::new();
-            activation.step(&demand, &mut encoded)?;
-            client.write_all(encoded.filled()).await?;
-            let share_id = loop {
-                if let ConnectionActivationState::Finalized {
-                    desktop_size,
-                    share_id,
-                    ..
-                } = activation.connection_activation_state()
-                {
-                    assert_eq!((desktop_size.width, desktop_size.height), (1600, 900));
-                    break share_id;
-                }
-                ironrdp_tokio::single_sequence_step(&mut client, &mut activation, &mut encoded)
-                    .await?;
-            };
-
-            encoded.clear();
-            encode_share_data(
-                connection.user_channel_id,
-                connection.io_channel_id,
-                share_id,
-                ShareDataPdu::Input(InputEventPdu(vec![InputEvent::ScanCode(ScanCodePdu {
-                    flags: ironrdp_pdu::input::scan_code::KeyboardFlags::empty(),
-                    key_code: 0x1e,
-                })])),
-                &mut encoded,
-            )?;
-            client.write_all(encoded.filled()).await?;
-            received_input.await?;
-            task.abort();
-            Ok::<_, anyhow::Error>(())
-        }))
-        .await??;
-    Ok(())
 }
 
 #[tokio::test]
@@ -835,89 +573,43 @@ async fn no_shared_codec_falls_back_and_connects() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A client returning with an auto-reconnect cookie the server can't verify (one
+/// issued before a server restart) still gets in, through a normal logon. That is
+/// MS-RDPBCGR 3.3.5.3.11 and vendored divergence (30). Upstream denied it, and
+/// FreeRDP then retried the same cookie about three times a second, which tripped
+/// the auth lockout for its address (found live, 2026-10-28).
 #[tokio::test]
-async fn real_disconnect_releases_input_before_reconnect() -> Result<()> {
-    struct DisplayEnd(tokio::sync::mpsc::UnboundedSender<()>);
-    #[async_trait::async_trait]
-    impl RdpServerDisplay for DisplayEnd {
-        async fn size(&mut self) -> ServerDesktopSize {
-            ServerDesktopSize {
-                width: 1280,
-                height: 800,
-            }
-        }
-        async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-            Ok(Box::new(TestUpdates))
-        }
-        fn session_ended(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
+async fn a_stale_auto_reconnect_cookie_falls_back_to_a_normal_logon() -> anyhow::Result<()> {
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    // A live session (see `KeepAliveSound`), so a served connection stays up and the
+    // only way `run_connection` ends early is the cookie check denying it. The client
+    // can't tell on its own: it counts as connected before the server checks the cookie.
+    let mut server =
+        build_test_server_full(3389, 1280, 800, false, None, crate::bitmap_codecs(), true);
+    server.set_auto_reconnect_cookie(Some(ServerAutoReconnect {
+        logon_id: 1,
+        random_bits: [0x11; 16],
+    }));
+    let stale = ServerAutoReconnect {
+        logon_id: 1,
+        random_bits: [0x22; 16],
+    };
 
-    struct InputEnd(tokio::sync::mpsc::UnboundedSender<()>);
-    impl RdpServerInputHandler for InputEnd {
-        fn keyboard(&mut self, _: KeyboardEvent) {}
-        fn mouse(&mut self, _: MouseEvent) {}
-        fn session_ended(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
-
-    let rounds = std::env::var("MACRDP_TCP_SOAK_RECONNECTS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|rounds| *rounds >= 2)
-        .unwrap_or(2);
-
-    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let addr = probe.local_addr()?;
-    drop(probe);
-    tokio::task::LocalSet::new()
+    let local = tokio::task::LocalSet::new();
+    local
         .run_until(async move {
-            let (tx, mut ended) = tokio::sync::mpsc::unbounded_channel();
-            let (display_tx, mut display_ended) = tokio::sync::mpsc::unbounded_channel();
-            let mut server = RdpServer::builder()
-                .with_addr(addr)
-                .with_tls(server_tls_acceptor())
-                .with_input_handler(InputEnd(tx))
-                .with_display_handler(DisplayEnd(display_tx))
-                .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
-                .build();
-            server.set_honor_client_desktop_size(true);
-            let task = tokio::task::spawn_local(async move { server.run().await });
-            for i in 0..rounds {
-                let (width, height) = if i % 2 == 0 {
-                    (1280, 800)
-                } else {
-                    (1920, 1080)
-                };
-                let stream = connect_with_retry(addr).await?;
-                let (size, client) = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    connect_client(stream, width, height),
-                )
-                .await??;
-                assert_eq!(size, (width, height), "wrong negotiated size on round {i}");
-                assert!(matches!(
-                    ended.try_recv(),
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-                ));
-                drop(client);
-                assert_eq!(
-                    tokio::time::timeout(std::time::Duration::from_secs(3), ended.recv()).await?,
-                    Some(()),
-                    "session cleanup did not run on round {i}"
-                );
-                assert_eq!(
-                    display_ended.try_recv(),
-                    Ok(()),
-                    "display cleanup did not run on round {i}"
-                );
+            let server_task = tokio::task::spawn_local(async move { server.run_connection(server_io).await });
+            let (size, _framed) = connect_client_with_cookie(client_io, 1280, 800, Some(stale)).await?;
+            assert_eq!(size, (1280, 800));
+
+            // Still serving a second later; a denied connection ends at once with an error.
+            match tokio::time::timeout(std::time::Duration::from_secs(1), server_task).await {
+                Err(_elapsed) => Ok(()),
+                Ok(ended) => Err(anyhow::anyhow!(
+                    "the server ended the connection instead of falling back to a normal logon: {ended:?}"
+                )),
             }
-            task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-            eprintln!("{rounds} TCP sessions negotiated and cleaned up");
-            Ok(())
         })
         .await
 }
@@ -1165,8 +857,9 @@ async fn preemption_does_not_evict_a_session_the_handler_would_reject() -> anyho
                 .with_connection_handler(Some(Box::new(RejectAfterFirst {
                     accepted_once: false,
                 })))
+                .with_honor_client_desktop_size(honor_client_size(true, None))
+                .with_connection_policy(ConnectionPolicy::Preempt)
                 .build();
-            server.set_honor_client_desktop_size(true);
 
             let server_task = tokio::task::spawn_local(async move {
                 let _ = server.run().await;
@@ -1267,8 +960,9 @@ async fn a_preempting_candidate_clears_on_accept_exactly_once() -> anyhow::Resul
                 .with_connection_handler(Some(Box::new(CountingAccepts {
                     count: Arc::clone(&accept_count),
                 })))
+                .with_honor_client_desktop_size(honor_client_size(true, None))
+                .with_connection_policy(ConnectionPolicy::Preempt)
                 .build();
-            server.set_honor_client_desktop_size(true);
 
             let server_task = tokio::task::spawn_local(async move {
                 let _ = server.run().await;
@@ -1461,6 +1155,127 @@ async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()>
         .await
 }
 
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
+/// A test server like [`build_test_server_full`] (keep-alive sound, so a
+/// session stays up) with macrdp's real H.264 `Gfx` as its EGFX factory.
+fn build_test_server_with_gfx(port: u16, gfx: crate::h264::Gfx) -> RdpServer {
+    let display = TestDisplay {
+        size: ServerDesktopSize {
+            width: 1024,
+            height: 768,
+        },
+    };
+    RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, port))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(display)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .with_gfx_factory(Some(Box::new(gfx)))
+        // Without this the default `Queue` policy never starts a candidate, and
+        // the bare-connect assertion below would pass without testing anything.
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .build()
+}
+
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
+fn test_gfx() -> crate::h264::Gfx {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    crate::h264::Gfx::new(
+        crate::capture::SharedDesktopSize::new(1024, 768),
+        30,
+        5_000_000,
+        2.0,
+        2,
+        0, // tcp_max_unacked_frames: off
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        true,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    )
+}
+
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
+/// Wait (briefly) for the H.264 pipeline's active connection to become
+/// something other than `not`.
+async fn wait_for_active_connection(
+    gfx: &crate::h264::Gfx,
+    not: Option<usize>,
+) -> anyhow::Result<usize> {
+    for _ in 0..250 {
+        match gfx.active_connection() {
+            Some(id) if Some(id) != not => return Ok(id),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    anyhow::bail!("the H.264 pipeline never switched to a new connection")
+}
+
+/// A bare TCP connect during a live session must not touch the live session's
+/// H.264 state. The accept loop starts a preemption candidate for any peer
+/// `on_accept` lets through, and building the candidate's channels used to
+/// replace the process-wide EGFX context with a fresh, not-ready one — so the
+/// live session silently fell back to legacy bitmaps under its still-mapped
+/// EGFX surface, before the peer had sent a single byte. A candidate that does
+/// win must still get a fresh context of its own.
+#[cfg(target_os = "macos")] // crate::h264 is macOS-only
+#[tokio::test]
+async fn a_bare_connect_does_not_replace_the_live_h264_context() -> anyhow::Result<()> {
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let gfx = test_gfx();
+            let mut server = build_test_server_with_gfx(addr.port(), gfx.clone());
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // A: the live session.
+            let a = connect_with_retry(addr).await?;
+            let (_size_a, _framed_a) = connect_client(a, 1280, 800).await?;
+            let live = wait_for_active_connection(&gfx, None).await?;
+
+            // `nc`: connect, send nothing. The candidate's channels are built
+            // straight away, before it negotiates anything.
+            let bare = connect_with_retry(addr).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                gfx.active_connection(),
+                Some(live),
+                "a bare TCP connect replaced the live session's H.264 context"
+            );
+
+            // The bare peer goes away; the live session is still the one served.
+            drop(bare);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(gfx.active_connection(), Some(live));
+
+            // A real client that preempts gets a fresh context of its own.
+            let b = connect_with_retry(addr).await?;
+            let (_size_b, _framed_b) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                connect_client(b, 1920, 1080),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("the preempting client was never served"))??;
+            let winner = wait_for_active_connection(&gfx, Some(live)).await?;
+            assert_ne!(winner, live);
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
 /// The listener needs a moment to bind after `run()` is spawned; retry briefly
 /// so the test isn't racy on a loaded machine.
 async fn connect_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {
@@ -1519,4 +1334,723 @@ fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
             other => panic!("expected VerticalScroll for {units}, got {other:?}"),
         }
     }
+}
+
+/// Input must keep flowing while a server write is blocked on a client that is
+/// not reading. `dispatch_events` holds the server lock across its socket
+/// writes, and the PDU loop used to need that lock for every PDU it read, so a
+/// stalled write froze input until the client drained its socket.
+#[tokio::test]
+async fn input_is_read_while_a_server_write_is_blocked() -> anyhow::Result<()> {
+    use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent, KeyboardFlags};
+    use tokio::io::AsyncWriteExt as _;
+
+    struct ForwardInput(tokio::sync::mpsc::UnboundedSender<KeyboardEvent>);
+    impl RdpServerInputHandler for ForwardInput {
+        fn keyboard(&mut self, e: KeyboardEvent) {
+            let _ = self.0.send(e);
+        }
+        fn mouse(&mut self, _e: MouseEvent) {}
+    }
+
+    /// Sends full-screen frames forever, so a client that stops reading
+    /// leaves the server's socket write blocked. Each frame differs from the
+    /// last, because the bitmap encoder skips an unchanged frame.
+    struct FloodUpdates(usize);
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for FloodUpdates {
+        async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
+            tokio::task::yield_now().await;
+            const SIDE: std::num::NonZeroU16 = std::num::NonZeroU16::new(256).unwrap();
+            const STRIDE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(256 * 4).unwrap();
+            let data: Vec<u8> = (0..STRIDE.get() * usize::from(SIDE.get()))
+                .map(|i| ((i * 7919 + self.0) % 251) as u8)
+                .collect();
+            self.0 += 1;
+            Ok(Some(DisplayUpdate::Bitmap(ironrdp_server::BitmapUpdate {
+                x: 0,
+                y: 0,
+                width: SIDE,
+                height: SIDE,
+                format: ironrdp_server::PixelFormat::BgrA32,
+                data: data.into(),
+                stride: STRIDE,
+            })))
+        }
+    }
+
+    struct FloodDisplay;
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for FloodDisplay {
+        async fn size(&mut self) -> ServerDesktopSize {
+            ServerDesktopSize {
+                width: 256,
+                height: 256,
+            }
+        }
+        async fn updates(
+            &mut self,
+        ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            Ok(Box::new(FloodUpdates(0)))
+        }
+    }
+
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(ForwardInput(input_tx))
+        .with_display_handler(FloodDisplay)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+    let events = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let (_size, framed) = connect_client(client_io, 256, 256).await?;
+            let (mut stream, _leftover) = framed.into_inner();
+
+            // Stop reading so the frames fill the pipe, then queue an event
+            // whose write takes the server lock and blocks behind them.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            events
+                .send(ironrdp_server::ServerEvent::EvictedByOtherConnection)
+                .map_err(|_| anyhow::anyhow!("server event channel closed"))?;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let key = FastPathInput::single(FastPathInputEvent::KeyboardEvent(
+                KeyboardFlags::empty(),
+                0x1e,
+            ));
+            stream.write_all(&ironrdp_core::encode_vec(&key)?).await?;
+            stream.flush().await?;
+
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(2), input_rx.recv()).await;
+            server_task.abort();
+            assert!(
+                matches!(received, Ok(Some(_))),
+                "a key press sent while a server write was blocked never reached the input handler"
+            );
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A pointer update with no payload (hidden, default) must still reach the
+/// client. The fast-path fragmenter at our pin stopped on an empty payload
+/// and wrote nothing, so `HidePointer` and `DefaultPointer` were silently
+/// dropped (vendored server divergence 31, from upstream #2274).
+#[tokio::test]
+async fn hidden_and_default_pointer_updates_reach_the_client() -> anyhow::Result<()> {
+    use ironrdp_core::{Decode as _, ReadCursor};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, UpdateCode};
+
+    struct PointerUpdates(Vec<DisplayUpdate>);
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for PointerUpdates {
+        async fn next_update(&mut self) -> ironrdp_server::ServerResult<Option<DisplayUpdate>> {
+            if let Some(update) = self.0.pop() {
+                return Ok(Some(update));
+            }
+            std::future::pending::<()>().await;
+            Ok(None)
+        }
+    }
+
+    struct PointerDisplay;
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for PointerDisplay {
+        async fn size(&mut self) -> ServerDesktopSize {
+            ServerDesktopSize {
+                width: 256,
+                height: 256,
+            }
+        }
+        async fn updates(
+            &mut self,
+        ) -> ironrdp_server::ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            // Popped from the back: hidden first, then default.
+            Ok(Box::new(PointerUpdates(vec![
+                DisplayUpdate::DefaultPointer,
+                DisplayUpdate::HidePointer,
+            ])))
+        }
+    }
+
+    init_tracing();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_no_input()
+        .with_display_handler(PointerDisplay)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let (_size, mut framed) = connect_client(client_io, 256, 256).await?;
+
+            let mut codes = Vec::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while codes.len() < 2 {
+                let Ok(read) = tokio::time::timeout_at(deadline, framed.read_pdu()).await else {
+                    break;
+                };
+                let (action, bytes) = read?;
+                if action != ironrdp_pdu::Action::FastPath {
+                    continue;
+                }
+                let mut cursor = ReadCursor::new(&bytes);
+                FastPathHeader::decode(&mut cursor)?;
+                while !cursor.is_empty() {
+                    let update = FastPathUpdatePdu::decode(&mut cursor)?;
+                    if matches!(
+                        update.update_code,
+                        UpdateCode::HiddenPointer | UpdateCode::DefaultPointer
+                    ) {
+                        // A First/Next fragment would leave a real client
+                        // waiting for the rest; it has to be one Single frame.
+                        assert_eq!(
+                            update.fragmentation,
+                            ironrdp_pdu::fast_path::Fragmentation::Single
+                        );
+                        codes.push(update.update_code);
+                    }
+                }
+            }
+            server_task.abort();
+            assert_eq!(
+                codes,
+                [UpdateCode::HiddenPointer, UpdateCode::DefaultPointer],
+                "empty-payload pointer updates never reached the client"
+            );
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A peer that sends an X.224 Connection Request and then goes silent must not
+/// hold the serving connection forever (#186): the pre-finalize phase is
+/// bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s, vendored divergence 32). The
+/// clock is paused, so the wait is virtual.
+#[tokio::test(start_paused = true)]
+async fn a_silent_peer_cannot_hold_the_serving_connection() -> anyhow::Result<()> {
+    use ironrdp_pdu::nego::{ConnectionRequest, RequestFlags, SecurityProtocol};
+    use ironrdp_pdu::x224::X224;
+    use tokio::io::AsyncWriteExt as _;
+
+    init_tracing();
+    let (mut client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_no_input()
+        .with_display_handler(TestDisplay {
+            size: ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            },
+        })
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+
+            let request = X224(ConnectionRequest {
+                nego_data: None,
+                flags: RequestFlags::empty(),
+                protocol: SecurityProtocol::SSL | SecurityProtocol::HYBRID,
+                correlation_info: None,
+            });
+            client_io.write_all(&ironrdp_core::encode_vec(&request)?).await?;
+            client_io.flush().await?;
+
+            // Still waiting just short of the budget: a slow human typing a
+            // password inside this phase must not be cut off early.
+            tokio::time::sleep(std::time::Duration::from_secs(59)).await;
+            assert!(
+                !server_task.is_finished(),
+                "the serving connection gave up before the 60 s budget"
+            );
+
+            let done = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
+            assert!(
+                done.is_ok(),
+                "a peer that went silent after its Connection Request still holds the serving connection"
+            );
+            drop(client_io);
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// A do-nothing client DVC, so the client accepts the server's Create Request
+/// for the channel `NAME` names. The two audio channels need distinct types,
+/// because the client keys its pre-registered DVCs on the Rust type.
+struct NamedDvc<const LOSSY: bool>;
+
+impl<const LOSSY: bool> ironrdp_dvc::DvcProcessor for NamedDvc<LOSSY> {
+    fn channel_name(&self) -> &str {
+        if LOSSY {
+            "AUDIO_PLAYBACK_LOSSY_DVC"
+        } else {
+            "AUDIO_PLAYBACK_DVC"
+        }
+    }
+
+    fn start(&mut self, _channel_id: u32) -> ironrdp_pdu::PduResult<Vec<ironrdp_dvc::DvcMessage>> {
+        Ok(Vec::new())
+    }
+
+    fn process(
+        &mut self,
+        _channel_id: u32,
+        _payload: &[u8],
+    ) -> ironrdp_pdu::PduResult<Vec<ironrdp_dvc::DvcMessage>> {
+        Ok(Vec::new())
+    }
+}
+
+impl<const LOSSY: bool> ironrdp_dvc::DvcClientProcessor for NamedDvc<LOSSY> {}
+
+impl<const LOSSY: bool> ironrdp_core::AsAny for NamedDvc<LOSSY> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Offers the lossy (UdpFecL) tunnel, as `--enable-lossy-audio` does.
+struct LossyOffer;
+
+impl ironrdp_server::MultitransportProvider for LossyOffer {
+    fn requested_protocol(&self) -> ironrdp_pdu::rdp::multitransport::RequestedProtocol {
+        ironrdp_pdu::rdp::multitransport::RequestedProtocol::UdpFecL
+    }
+}
+
+/// Lossy UDP audio is only heard if the connection's one Soft-Sync request names
+/// `AUDIO_PLAYBACK_LOSSY_DVC` for the lossy tunnel. Since v0.10.0's IronRDP update,
+/// mstsc answers the UDP offer with `S_OK` on the message channel after the session
+/// is up, and macrdp spent the Soft-Sync on an empty request when that answer
+/// arrived: the audio channel never moved, and mstsc dropped every wave streamed
+/// into the tunnel (silent from v0.10.0 to v0.10.4, found by hand). This drives a
+/// real IronRDP client through that order of events: accept the lossy offer, bind
+/// the tunnel the way the UDP listener does (taking its cookie from the registry),
+/// answer `S_OK` again once the session is running, then let an EGFX event open the
+/// Soft-Sync gate.
+#[tokio::test]
+async fn the_soft_sync_moves_lossy_audio_onto_the_lossy_tunnel() -> anyhow::Result<()> {
+    use ironrdp_dvc::pdu::SoftSyncTunnelType;
+    use ironrdp_dvc::DrdynvcClient;
+    use ironrdp_pdu::gcc::MultiTransportFlags;
+    use ironrdp_pdu::mcs::{McsMessage, SendDataRequest};
+    use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+    use ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu;
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_tokio::FramedWrite as _;
+
+    init_tracing();
+    let registry = ironrdp_server::CookieRegistry::new();
+    let mut server =
+        build_test_server_full(3389, 1024, 768, false, None, crate::bitmap_codecs(), true);
+    server.set_multitransport_provider(Some(Box::new(LossyOffer)));
+    server.set_multitransport_cookie_registry(Some(registry.clone()));
+    server.set_multitransport_lossy_audio_formats(Some(vec![ironrdp_rdpsnd::pdu::AudioFormat {
+        format: ironrdp_rdpsnd::pdu::WaveFormat::PCM,
+        n_channels: 2,
+        n_samples_per_sec: 44_100,
+        n_avg_bytes_per_sec: 176_400,
+        n_block_align: 4,
+        bits_per_sample: 16,
+        data: None,
+    }]));
+    let events = server.event_sender().clone();
+
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            // Every 100 ms, the event that EGFX traffic raises. The gate retries
+            // until the lossy channel is open, and sends the Soft-Sync only once.
+            let egfx_ticks = tokio::task::spawn_local(async move {
+                loop {
+                    let _ = events.send(ironrdp_server::ServerEvent::Egfx(
+                        ironrdp_server::EgfxServerMessage::SendMessages {
+                            messages: Vec::new(),
+                        },
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            });
+
+            let mut config = client_config(1024, 768);
+            config.multitransport_flags = Some(
+                MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
+                    | MultiTransportFlags::TRANSPORT_TYPE_UDP_FECL
+                    | MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
+            );
+            let mut drdynvc = DrdynvcClient::new()
+                .with_dynamic_channel(NamedDvc::<false>)
+                .with_dynamic_channel(NamedDvc::<true>);
+            drdynvc.enable_soft_sync_tunnel(SoftSyncTunnelType::LOSSY_UDP);
+            let mut connector =
+                ClientConnector::new(config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .with_static_channel(drdynvc);
+
+            let mut framed = TokioFramed::new(client_io);
+            let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+            let initial = framed.into_inner_no_leftover();
+            let mut tls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+                .with_no_client_auth();
+            tls_cfg.resumption = rustls::client::Resumption::disabled();
+            let tls_stream = TlsConnector::from(Arc::new(tls_cfg))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost")?.to_owned(),
+                    initial,
+                )
+                .await?;
+            let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+            let mut framed = TokioFramed::new(tls_stream);
+
+            let offered = std::rc::Rc::new(std::cell::Cell::new(None::<u32>));
+            let seen = std::rc::Rc::clone(&offered);
+            let bind = registry.clone();
+            let result = ironrdp_tokio::connect_finalize_with_multitransport(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut NoNetwork,
+                "localhost".into(),
+                Vec::new(),
+                None,
+                async |request: ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu,
+                       _soft_sync| {
+                    seen.set(Some(request.request_id));
+                    // What the UDP listener does when the client's tunnel arrives.
+                    assert!(
+                        bind.take(&request.security_cookie).is_some(),
+                        "the offer's cookie was not registered with the listener"
+                    );
+                    Ok(ironrdp_connector::MultitransportResult::Success)
+                },
+            )
+            .await?;
+            let request_id = offered
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("the server never offered the lossy tunnel"))?;
+            let message_channel_id = result
+                .message_channel_id
+                .ok_or_else(|| anyhow::anyhow!("no MCS message channel was negotiated"))?;
+            let user_channel_id = result.user_channel_id;
+            let mut channels = result.static_channels;
+            let drdynvc_id = channels
+                .get_channel_id_by_type::<DrdynvcClient>()
+                .ok_or_else(|| anyhow::anyhow!("no DRDYNVC channel"))?;
+
+            // mstsc's order: S_OK on the message channel once the session is running.
+            let response = MultitransportResponsePdu {
+                security_header: BasicSecurityHeader {
+                    flags: BasicSecurityHeaderFlags::TRANSPORT_RSP,
+                },
+                request_id,
+                hr_response: MultitransportResponsePdu::S_OK,
+            };
+            let late_ok = ironrdp_core::encode_vec(&X224(SendDataRequest {
+                initiator_id: user_channel_id,
+                channel_id: message_channel_id,
+                user_data: ironrdp_core::encode_vec(&response)?.into(),
+            }))?;
+            framed.write_all(&late_ok).await?;
+
+            // Pump DRDYNVC until the client has processed the Soft-Sync request.
+            let pumped = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let (_action, frame) = framed.read_pdu().await?;
+                    let Ok(X224(McsMessage::SendDataIndication(data))) =
+                        ironrdp_core::decode::<X224<McsMessage<'_>>>(&frame)
+                    else {
+                        continue;
+                    };
+                    if data.channel_id != drdynvc_id {
+                        continue;
+                    }
+                    let svc = channels
+                        .get_by_channel_id_mut(drdynvc_id)
+                        .ok_or_else(|| anyhow::anyhow!("DRDYNVC disappeared"))?;
+                    let replies = svc.process(&data.user_data)?;
+                    if !replies.is_empty() {
+                        let bytes = ironrdp_svc::client_encode_svc_messages(
+                            replies,
+                            drdynvc_id,
+                            user_channel_id,
+                        )?;
+                        framed.write_all(&bytes).await?;
+                    }
+                    let client = svc
+                        .channel_processor_downcast_ref::<DrdynvcClient>()
+                        .ok_or_else(|| anyhow::anyhow!("DRDYNVC is not the client processor"))?;
+                    if client.soft_sync_complete() {
+                        let lossy = client.get_dvc::<NamedDvc<true>>().map(|c| c.channel_id());
+                        return anyhow::Ok(lossy.and_then(|id| client.tunnel_for_channel(id)));
+                    }
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("the server never sent a Soft-Sync request"))??;
+
+            assert_eq!(
+                pumped,
+                Some(SoftSyncTunnelType::LOSSY_UDP),
+                "the Soft-Sync did not move AUDIO_PLAYBACK_LOSSY_DVC onto the lossy tunnel"
+            );
+
+            egfx_ticks.abort();
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// `--network-autodetect`: with IronRDP's auto-detect enabled and macrdp's
+/// ticker running, a client that opened the MCS message channel receives RTT
+/// Measure Requests on it. Nothing else in macrdp sends auto-detect PDUs, so
+/// without the ticker (or without `enable_autodetect`) none ever arrive.
+#[tokio::test]
+async fn network_autodetect_sends_rtt_probes_on_the_message_channel() -> anyhow::Result<()> {
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest};
+    use ironrdp_pdu::x224::X224;
+
+    init_tracing();
+    let mut server =
+        build_test_server_full(3389, 1024, 768, false, None, crate::bitmap_codecs(), true);
+    server.enable_autodetect();
+    let ticker = crate::spawn_autodetect_ticker(
+        server.event_sender().clone(),
+        std::time::Duration::from_millis(100),
+    );
+
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let local = tokio::task::LocalSet::new();
+    let outcome = local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+
+            let mut connector = ClientConnector::new(
+                client_config(1024, 768),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            );
+            let mut framed = TokioFramed::new(client_io);
+            let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+            let initial = framed.into_inner_no_leftover();
+            let mut tls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+                .with_no_client_auth();
+            tls_cfg.resumption = rustls::client::Resumption::disabled();
+            let tls_stream = TlsConnector::from(Arc::new(tls_cfg))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost")?.to_owned(),
+                    initial,
+                )
+                .await?;
+            let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+            let mut framed = TokioFramed::new(tls_stream);
+            let result = ironrdp_tokio::connect_finalize(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut NoNetwork,
+                "localhost".into(),
+                Vec::new(),
+                None,
+            )
+            .await?;
+            let message_channel_id = result
+                .message_channel_id
+                .ok_or_else(|| anyhow::anyhow!("no MCS message channel was negotiated"))?;
+
+            let probe = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let (_action, frame) = framed.read_pdu().await?;
+                    let Ok(X224(McsMessage::SendDataIndication(data))) =
+                        ironrdp_core::decode::<X224<McsMessage<'_>>>(&frame)
+                    else {
+                        continue;
+                    };
+                    if data.channel_id != message_channel_id {
+                        continue;
+                    }
+                    if let Ok(pdu) =
+                        ironrdp_core::decode::<AutoDetectReqPdu>(data.user_data.as_ref())
+                    {
+                        if matches!(pdu.request, AutoDetectRequest::RttRequest { .. }) {
+                            return anyhow::Ok(());
+                        }
+                    }
+                }
+            })
+            .await;
+
+            server_task.abort();
+            anyhow::Ok(probe)
+        })
+        .await;
+    ticker.abort();
+    outcome?.map_err(|_| {
+        anyhow::anyhow!("no RTT Measure Request reached the client's message channel")
+    })?
+}
+
+/// `--network-autodetect` with the connect-time measurement (#235): the
+/// bandwidth a client reports for the connect-time burst is what the server's
+/// later Network Characteristics Results carry. This client answers RTT probes
+/// after the logon but never a continuous bandwidth measurement, so a result
+/// with a bandwidth can only come from the connect-time one; IronRDP's own
+/// auto-detect alone sends no result until a continuous measurement completes.
+#[tokio::test]
+async fn network_autodetect_reports_the_connect_time_bandwidth() -> anyhow::Result<()> {
+    use ironrdp_pdu::mcs::{McsMessage, SendDataRequest};
+    use ironrdp_pdu::rdp::autodetect::{
+        AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu,
+    };
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_tokio::FramedWrite as _;
+
+    init_tracing();
+    let mut server =
+        build_test_server_full(3389, 1024, 768, false, None, crate::bitmap_codecs(), true);
+    server.enable_autodetect();
+    let ticker = crate::spawn_autodetect_ticker(
+        server.event_sender().clone(),
+        std::time::Duration::from_millis(100),
+    );
+
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let local = tokio::task::LocalSet::new();
+    let outcome = local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+
+            let mut connector = ClientConnector::new(
+                client_config(1024, 768),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            );
+            let mut framed = TokioFramed::new(client_io);
+            let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+            let initial = framed.into_inner_no_leftover();
+            let mut tls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+                .with_no_client_auth();
+            tls_cfg.resumption = rustls::client::Resumption::disabled();
+            let tls_stream = TlsConnector::from(Arc::new(tls_cfg))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost")?.to_owned(),
+                    initial,
+                )
+                .await?;
+            let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+            let mut framed = TokioFramed::new(tls_stream);
+            let result = ironrdp_tokio::connect_finalize(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut NoNetwork,
+                "localhost".into(),
+                Vec::new(),
+                None,
+            )
+            .await?;
+            let channel = result
+                .message_channel_id
+                .ok_or_else(|| anyhow::anyhow!("no MCS message channel was negotiated"))?;
+            let user = result.user_channel_id;
+
+            let reported = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let (_action, frame) = framed.read_pdu().await?;
+                    let Ok(X224(McsMessage::SendDataIndication(data))) =
+                        ironrdp_core::decode::<X224<McsMessage<'_>>>(&frame)
+                    else {
+                        continue;
+                    };
+                    if data.channel_id != channel {
+                        continue;
+                    }
+                    let Ok(pdu) = ironrdp_core::decode::<AutoDetectReqPdu>(data.user_data.as_ref())
+                    else {
+                        continue;
+                    };
+                    match pdu.request {
+                        // Answer RTT probes, so results keep coming.
+                        AutoDetectRequest::RttRequest {
+                            sequence_number, ..
+                        } => {
+                            let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse {
+                                sequence_number,
+                            });
+                            let bytes = ironrdp_core::encode_vec(&X224(SendDataRequest {
+                                initiator_id: user,
+                                channel_id: channel,
+                                user_data: ironrdp_core::encode_vec(&response)?.into(),
+                            }))?;
+                            framed.write_all(&bytes).await?;
+                        }
+                        AutoDetectRequest::NetworkCharacteristicsResult {
+                            bandwidth_kbps, ..
+                        } => {
+                            return anyhow::Ok(bandwidth_kbps);
+                        }
+                        // A continuous bandwidth Start/Stop: deliberately never answered.
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+
+            server_task.abort();
+            anyhow::Ok(reported)
+        })
+        .await;
+    ticker.abort();
+    let bandwidth = outcome?
+        .map_err(|_| anyhow::anyhow!("no Network Characteristics Result reached the client"))??;
+    assert!(
+        bandwidth.is_some_and(|kbps| kbps > 0),
+        "the result carried no connect-time bandwidth: {bandwidth:?}"
+    );
+    Ok(())
 }

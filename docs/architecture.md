@@ -22,8 +22,9 @@ src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by
                   default; non-US via src/keyboard_layout.rs),
                   per-side modifier state with NX_DEVICE bits, Caps Lock
                   toggle, AX-driven symbolic-hotkey workarounds
-                  (Cmd+Tab app cycle, Cmd+` window cycle, Ctrl+Arrow Mission
-                  Control/Space actions, Spotlight, screencapture) since WindowServer's symbolic-hotkey
+                  (Cmd+Tab app cycle, Cmd+` window cycle, Spotlight (also
+                  Option+Space with --alt-space-spotlight),
+                  screencapture) since WindowServer's symbolic-hotkey
                   dispatcher won't fire for CGEventPost. The Cmd+Tab cycle
                   (also Option+Tab with --alt-tab-switch), and the Cmd+`
                   window cycle (also Option+` with --alt-backtick-switch),
@@ -180,9 +181,9 @@ src/multitransport.rs  macrdp-side RDP UDP multitransport provider
                   default OFF). Thin: a MacMultitransport that tells the
                   vendored server to offer reliable UDP (UdpFecR). The transport
                   itself (RDPEUDP state machine + RDPEUDP2/EMT codecs) is the
-                  sans-I/O vendor/ironrdp-rdpeudp crate; the UDP listener + rustls
+                  sans-I/O vendor/macrdp-rdpeudp crate; the UDP listener + rustls
                   TLS + MS-RDPEMT tunnel + DYNVC Soft-Sync EGFX migration live in
-                  vendored ironrdp-server (src/multitransport/, divergence (12))
+                  vendored ironrdp-server (src/mt/, divergence (12))
                   + vendored ironrdp-dvc (Soft-Sync codec). main.rs binds the
                   listener on the TCP address/port and wires the cookie registry +
                   the server↔listener tunnel handoff. EGFX-over-UDP rendering is
@@ -215,6 +216,14 @@ src/reaper.rs     Startup reaper — on launch, sweeps leftovers from a PRIOR ma
                   DEAD-pid, non-self dirs are reaped, so it's safe with another
                   instance live. Called once from async_main on a detached thread
                   (a stale umount can't block startup).
+src/auth_status.rs What a startup credential failure does (#266): headless, the
+                  server waits instead of exiting (no KeepAlive restart loop of
+                  failed logins), writes `auth-status` beside config.env for
+                  the controller, and re-reads the password every 30 s,
+                  re-checking only a changed one; interactive, it exits. Pure,
+                  unit-tested should_park / should_check + the status-file
+                  contract (no-password / wrong-password).
+                  MACRDP_PARK_ON_AUTH_FAILURE=0/1 overrides.
 src/health.rs     Health-check watchdog (Tier 2.5) — turns a hung-but-alive
                   process into a clean exit so launchd KeepAlive restarts a fresh
                   one (KeepAlive only
@@ -253,8 +262,8 @@ src/usb_redirect/ Generic USB redirection (MS-RDPEUSB / URBDRC), the SERVER /
                   the Mac. See docs/usb-redirection-feasibility.md.
 src/camera/       Camera redirection (MS-RDPECAM) — presents the CLIENT's webcam as a
   mod.rs          REAL macOS camera (--enable-camera-redirection, opt-in, default OFF,
-  decode.rs       macOS-only). SHIPPED v0.9.0; as far as is known the first OSS RDP
-  feed.rs         *server* to do this, and the path that works for mstsc (which routes
+  decode.rs       macOS-only). SHIPPED v0.9.0; as far as is known the first on macOS
+  feed.rs         (gnome-remote-desktop 50 did it on Linux first), and the path that works for mstsc (which routes
                   webcams over MS-RDPECAM and refuses the raw-USB reads the
                   usb_redirect path would need). mod.rs is the cross-platform policy:
                   the MacCamera RdCameraServerFactory + the CameraSink that receives
@@ -275,47 +284,39 @@ src/camera/       Camera redirection (MS-RDPECAM) — presents the CLIENT's webc
                   SampleResponse pull loop) lives in the vendored ironrdp-server
                   (src/rdcamera.rs, divergence 19). The virtual camera itself is a
                   separate process: gui/Sources/macrdpcamera (see the gui note above).
-gui/Sources/ControllerCore/PasswordKeychain.swift
-                  Native Security.framework credential writes with an explicit
-                  ACL trusting /usr/bin/security (the existing headless reader).
+src/audin/        Microphone redirection (MS-RDPEAI) — presents the CLIENT's mic as a
+  mod.rs          real macOS input device (--enable-microphone-redirection,
+  shm_sink.rs     EXPERIMENTAL, opt-in, default OFF). mod.rs is the MacAudin factory
+  wav_dump.rs     (cross-platform) that picks the sink behind the vendored
+                  AudinSampleSink seam: SharedMemSink on macOS, or WavDumpSink with
+                  MACRDP_MIC_DUMP=1. shm_sink.rs writes the client's PCM (16-bit, mono
+                  upmixed) into a POSIX shared-memory ring — created only once the
+                  mic is negotiated, exclusively, mode 0644, with a random session id,
+                  and wiped + unlinked at session end. Its tests parse the C header
+                  (audioplugin/macrdp_mic_ring.h), so the two layouts can't drift.
+                  The protocol state machine is the vendored ironrdp-server's
+                  src/audin.rs, to be replaced by upstream's ironrdp-rdpeai at the next
+                  IronRDP version bump.
+audioplugin/      "macrdp Microphone" — a CoreAudio AudioServerPlugIn (C, no Xcode,
+  macrdp_mic.c    no entitlement) that coreaudiod loads from /Library/Audio/Plug-Ins/
+  macrdp_mic_ring.h HAL. It opens the ring READ-ONLY (private read position),
+  micfeed_test.c  validates the header and indexes with compile-time sizes, and maps
+                  / follows / releases segments from a 1 s background timer — never
+                  from the real-time IO thread, and never unmapping one an IO cycle
+                  may hold. Float32 stereo 44.1 kHz, ~100 ms latency bound, silence
+                  when idle. Built by packaging/make-audio-plugin.sh, embedded in
+                  macrdp.app by make-app.sh, installed via install-audio-plugin.sh
+                  (the menu-bar controller runs it). micfeed_test.c is a bring-up
+                  feeder speaking the same ring protocol. Trust boundary:
+                  docs/macos-gotchas.md (5).
 build.rs          Bakes Xcode Swift-runtime rpath into the final binary
 
-vendor/ironrdp-server/    Local fork of ironrdp-server 0.13.0, pulled in via
-                          [patch.crates-io] in Cargo.toml. The live
-                          divergences (audio-lag tracker, resize-stall
-                          resync, per-batch dispatch priority, SuppressOutput
-                          handling, NSCodec encoder, opt-in QOI Rgb
-                          workaround, honor-client-desktop-size plumbing)
-                          are documented in
-                          vendor/ironrdp-server/CLAUDE.md — that nested
-                          memory loads when you work in the fork. Keep the
-                          vendor dir until all of those are upstreamed AND
-                          released.
-
-vendor/ironrdp-acceptor/  Local fork of ironrdp-acceptor 0.10.0 (added
-                          2026-06-12, same upstream rev as the git pins).
-                          Two divergences: (1) honor_client_desktop_size —
-                          adopt the client's requested desktop size from its
-                          GCC Client Core Data BEFORE Demand Active, which
-                          is what powers the default client-resolution
-                          auto-adopt (--no-client-resolution opts out); and
-                          (2) expose the client's keyboard-layout id (KLID)
-                          from the same core data on AcceptorResult, which
-                          powers default non-US keyboard auto-detect (the
-                          vendor server publishes it; input.rs auto-selects
-                          the layout). See vendor/ironrdp-acceptor/CLAUDE.md
-                          and the client-resolution / keyboard-layout quirk
-                          notes for why these can't be done from server code.
-
-vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.7.0 (added 2026-06-16,
-                          same upstream rev). Upstream is client-only
-                          (SvcClientProcessor); the fork adds the
-                          server-direction decode halves the PDUs lack
-                          (ClientName/DeviceListAnnounce/DeviceAnnounceHeader)
-                          so a server can read what the client sends. The
-                          server-side RdpdrServer processor itself lives in
-                          vendor/ironrdp-server/src/rdpdr.rs. See
-                          vendor/ironrdp-rdpdr/CLAUDE.md.
+(vendor/ironrdp-{server,acceptor,rdpdr,dvc}/
+                          DE-VENDORED 2026-11-20 (#225). The four forks are now
+                          clintcan/IronRDP, branch `macrdp`: upstream e258f6a0
+                          plus one commit per divergence. Cargo.toml takes every
+                          ironrdp-* crate from that branch at one rev. The
+                          divergence logs are in docs/ironrdp-divergences.md.
 
 (vendor/ironrdp-rdpeusb/  DE-VENDORED at the a5d1c682 pin bump (v0.9.5, 2026-08-06).
                           The lenient UsbDeviceCaps decode (USB 3.x SupportedUsbVer +
@@ -328,25 +329,17 @@ vendor/ironrdp-rdpdr/     Local fork of ironrdp-rdpdr 0.7.0 (added 2026-06-16,
                           PDU-layer fork went away. If you're seeing this in a stale
                           checkout, the dir isn't missing — it stopped existing.)
 
-vendor/ironrdp-rdpeudp/   NEW sans-I/O crate (added 2026-06-25) for RDP UDP
+vendor/macrdp-rdpeudp/   NEW sans-I/O crate (added 2026-06-25) for RDP UDP
                           multitransport (--enable-udp-multitransport, feature
                           `multitransport`, default OFF). No sockets/tokio: PDU
                           codecs for RDPEUDP v1 (pdu.rs, big-endian) + RDPEUDP2
                           (eudp2.rs) + the MS-RDPEMT tunnel PDUs (emt.rs), and the
                           reliable transport state machine (state.rs: handshake +
                           in-order dedup delivery + cumulative-ACK + RTO retransmit)
-                          driven by the listener. Candidate for upstream. See
-                          vendor/ironrdp-rdpeudp/CLAUDE.md.
-
-vendor/ironrdp-dvc/       Local fork of ironrdp-dvc 0.5.0 (added 2026-06-26, 4th
-                          fork). Adds the server-direction MS-RDPEDYC **Soft-Sync**
-                          codec (SoftSyncRequest/Response PDUs + the client
-                          Soft-Sync-Response decode arm) so the server can move a
-                          DVC (EGFX) onto the UDP tunnel and not tear down on the
-                          client's reply. Patch wiring is TWO-SIDED (it's a path dep
-                          of the git-pinned ironrdp crates) — see its CLAUDE.md.
-                          Soft-Sync rides drdynvc on the MAIN TCP connection; only
-                          channel data after the switch rides the UDP tunnel.
+                          driven by the listener. Renamed from ironrdp-rdpeudp at
+                          the e258f6a0 bump (upstream now ships its own crate of
+                          that name, unused here). See
+                          vendor/macrdp-rdpeudp/CLAUDE.md.
 
 (vendor/ironrdp-egfx/     DELETED 2026-05-25. The CapabilitySet::decode
                           tolerance fix was merged upstream as PR #1298

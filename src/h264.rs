@@ -19,17 +19,15 @@
 //!        so it keeps pace with ScreenCaptureKit instead of falling behind under
 //!        heavy frames (which would queue stale frames → growing latency).
 //!
-//!   Ship thread (`ship_loop`, or paired `avc444_ship_loop`):
+//!   Ship thread (`ship_loop`):
 //!     4. Blocks on VT's output channel; for each encoded frame, frames it (see
-//!        `WireFormat`), then hands it to the matching AVC420 or AVC444
-//!        `GraphicsPipelineServer` send method (StartFrame / WireToSurface /
-//!        EndFrame), and ships the resulting
-//!        `DvcMessage`s through DRDYNVC via a tracked ServerEvent. The event
-//!        loop bumps `shipped` AFTER transport dispatch, so queued frames and
-//!        a blocked socket write still occupy pipeline slots.
+//!        `WireFormat`), hands it to `GraphicsPipelineServer::send_avc420_frame`
+//!        (StartFrame / WireToSurface1 / EndFrame), then ships the resulting
+//!        `DvcMessage`s through DRDYNVC via `ServerEvent::Egfx(SendMessages)`,
+//!        and bumps `shipped`.
 //!
 //!   The EGFX send window is `u32::MAX` (see `GfxHandler::max_frames_in_flight`)
-//!   so the EGFX send methods NEVER drop an encoded frame — dropping one (a
+//!   so `send_avc420_frame` NEVER drops an encoded frame — dropping one (a
 //!   P-frame, or worse a keyframe) breaks the H.264 reference chain and causes
 //!   client-side artifacts. All throttling is the capture-side drop above.
 //!
@@ -50,6 +48,7 @@
 
 #![cfg(target_os = "macos")]
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -64,8 +63,8 @@ use ironrdp_egfx::pdu::{
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{
-    EgfxFrameCompletion, EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle,
-    ServerEvent, ServerEventSender,
+    EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
+    ServerEventSender,
 };
 use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
@@ -80,13 +79,6 @@ use crate::videotoolbox::{Avc444Encoder, EncodeOutput, EncodedFrame, Encoder};
 /// full 60 fps so the client's decode queue drains net. See the gate in
 /// `submit_bgra` and `ConnectionContext::last_throttle_ship`.
 const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
-const TCP_THROTTLE_INTERVAL: Duration = Duration::from_millis(40);
-
-fn tcp_decode_backlog(unacknowledged: u64, queue_ms: f64, ack_age: Duration) -> bool {
-    // Require both outstanding frames and delay above the measured RTT floor.
-    // Ignore the last delay reading once the client stops producing fresh ACKs.
-    unacknowledged > 6 && queue_ms >= 80.0 && ack_age <= Duration::from_millis(250)
-}
 
 /// P3 cold-start guard: how long after the first frame-ack the adaptive controller
 /// ignores the ack-lag congestion signal. At connect the encoder ships an initial
@@ -173,51 +165,54 @@ impl WireFormat {
     }
 }
 
-/// The negotiated encoder for one EGFX connection. AVC444 is deliberately a
-/// separate variant so an AVC420-only client keeps the proven single-stream
-/// path byte-for-byte, while a V10+ client can opt into dual-view 4:4:4.
-enum ActiveEncoder {
+/// Per-connection state, shared between the `Gfx` factory/handle (capture
+/// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
+enum VideoEncoder {
     Avc420(Encoder),
     Avc444(Box<Avc444Encoder>),
 }
 
-impl ActiveEncoder {
-    fn set_bitrate(&self, bitrate_bps: u32) -> Result<()> {
+impl VideoEncoder {
+    fn set_bitrate(&self, bps: u32) -> Result<()> {
         match self {
-            Self::Avc420(encoder) => encoder.set_bitrate(bitrate_bps),
-            Self::Avc444(encoder) => encoder.set_bitrate(bitrate_bps),
+            Self::Avc420(encoder) => encoder.set_bitrate(bps),
+            Self::Avc444(encoder) => encoder.set_bitrate(bps),
         }
     }
 
-    fn set_keyframe_interval(&self, keyframe_frames: u32) -> Result<()> {
+    fn set_keyframe_interval(&mut self, frames: u32) {
         match self {
-            Self::Avc420(encoder) => encoder.set_keyframe_interval(keyframe_frames),
-            Self::Avc444(encoder) => encoder.set_keyframe_interval(keyframe_frames),
+            Self::Avc420(encoder) => encoder.set_keyframe_interval(frames),
+            Self::Avc444(encoder) => encoder.set_keyframe_interval(frames),
         }
     }
 
-    fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
+    fn submit(&mut self, frame: FrameInput<'_>, keyframe: bool) -> Result<()> {
+        match (self, frame) {
+            (Self::Avc420(encoder), FrameInput::Bgra { bgra, stride }) => {
+                encoder.encode_bgra(bgra, stride, keyframe)
+            }
+            (Self::Avc420(encoder), FrameInput::Nv12(pb)) => {
+                encoder.encode_pixel_buffer(pb, keyframe)
+            }
+            (Self::Avc444(encoder), FrameInput::Bgra { bgra, stride }) => {
+                encoder.encode_bgra(bgra, stride, keyframe)
+            }
+            (Self::Avc444(_), FrameInput::Nv12(_)) => Err(anyhow!("AVC444 requires BGRA capture")),
+        }
+    }
+
+    fn take_receiver(&mut self) -> Option<std::sync::mpsc::Receiver<EncodeOutput>> {
         match self {
-            Self::Avc420(encoder) => encoder.encode_bgra(bgra, stride, force_keyframe),
-            Self::Avc444(encoder) => encoder.encode_bgra(bgra, stride, force_keyframe),
+            Self::Avc420(encoder) => encoder.take_receiver(),
+            Self::Avc444(encoder) => encoder.take_receiver(),
         }
     }
 }
 
-fn tracked_completion(counter: Arc<AtomicU64>, frames: u64) -> EgfxFrameCompletion {
-    let token = EgfxFrameCompletion::new(counter, frames);
-    if let Some(stats) = crate::stats::global() {
-        token.with_observer(stats.transport_retired.clone())
-    } else {
-        token
-    }
-}
-
-/// Per-connection state, shared between the `Gfx` factory/handle (capture
-/// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
 struct ConnectionContext {
     server_handle: GfxServerHandle,
-    encoder: Option<ActiveEncoder>,
+    encoder: Option<VideoEncoder>,
     surface_id: Option<u16>,
     is_ready: bool,
     epoch: Instant,
@@ -232,12 +227,11 @@ struct ConnectionContext {
     /// AVC420 to a client that can't decode it (which it rejects with
     /// ERROR_NOT_SUPPORTED and a dead graphics channel).
     client_supports_avc: bool,
-    /// Positive V10+ AVC capability signal. AVC444 is unavailable on V8.1,
-    /// even when AVC420 is enabled there.
     client_supports_avc444: bool,
-    /// Set by the dual-view ship thread if asynchronous output loses pairing.
-    /// The next capture consumes it and forces the shared stream to IDR.
-    encoder_resync: Arc<AtomicBool>,
+    /// The client advertised an EGFX capability set newer than Windows App for
+    /// macOS does, so its zero decode+render time doesn't mean "not presenting"
+    /// and blank recovery stays off for this connection ([`advertises_egfx_beyond_mac_client`]).
+    newer_egfx_client: bool,
     /// Channel-level decline, shared with this connection's `GfxDvcBridge`
     /// (`with_decline_flag`). Set true in `on_ready` when the client
     /// advertised EGFX but no AVC420 support: the bridge then discards ALL
@@ -251,9 +245,8 @@ struct ConnectionContext {
     egfx_declined: Arc<AtomicBool>,
     /// Drop-to-latest throttle counters for the push pipeline. `submitted` is
     /// bumped by `submit_bgra` (capture thread) per frame handed to VT;
-    /// `shipped` is bumped only after transport dispatch completes (or the
-    /// batch is abandoned). `submitted - shipped` includes the event queue
-    /// and pending socket write as well as frames in the VT/ship
+    /// `shipped` is bumped by the ship thread per frame pulled back out and
+    /// sent. `submitted - shipped` is how many frames are in the VT/ship
     /// pipeline; when it reaches `max_in_flight` the capture thread skips
     /// (drops to latest) — an ack-INDEPENDENT throttle, since clients commonly
     /// suspend frame acks (queue_depth=0xFFFFFFFF) which disables the EGFX
@@ -306,7 +299,6 @@ struct ConnectionContext {
     /// nanoseconds; never taken while holding another lock), read in
     /// `on_frame_ack` to time each frame's ship→ack round trip.
     ship_times: Arc<Mutex<Vec<(u64, Instant)>>>,
-    video_queued: Arc<AtomicBool>,
     /// Windowed-minimum ack RTT (two `RTT_MIN_WINDOW` buckets, so a route
     /// change re-baselines within ~2 windows). The minimum over the window is
     /// the link's base RTT including the empty-pipe server-side path;
@@ -366,6 +358,20 @@ struct ConnectionContext {
     /// usable, so the connect-time backlog never enters it). Fed to
     /// [`congested_hysteresis`]. See [`ConnectionContext::queue_delay_ms`].
     adaptive_delay_ewma: f64,
+    /// The last `2 * DELAY_TREND_WINDOW` usable queue-delay samples (oldest
+    /// first), for [`delay_trend`].
+    adaptive_delay_samples: VecDeque<f64>,
+    /// When the last bitrate decrease happened (for [`hold_trend_decrease`]).
+    adaptive_last_decrease_at: Option<Instant>,
+    /// The bitrate where the last congestion episode began (for
+    /// [`increase_step`]); set on an episode's first decrease.
+    adaptive_congestion_bps: Option<u32>,
+    /// Whether the controller is inside a decrease episode (cleared by an
+    /// increase), so `adaptive_congestion_bps` records its START.
+    adaptive_in_decrease_episode: bool,
+    /// While `Some`, the manual resync hotkey is draining the client's decoder
+    /// before its IDR (see [`resync_drain_step`]); the deadline caps the hold.
+    resync_drain_until: Option<Instant>,
     /// Hysteresis state: whether the controller is currently in a congestion episode
     /// (enters when the EWMA lag clears the high mark, exits below the low mark).
     adaptive_congested: bool,
@@ -402,6 +408,64 @@ struct ConnectionContext {
     /// `on_qoe_metrics` (which only sees the context, not the owning `Gfx`) can
     /// set the [`QoeEvidence::presented_clean`] latch. Not RTT-scaled.
     min_render_reports: u64,
+    /// Arrival times of the most recent zero-EDR QoE reports since the last
+    /// recovery attempt (newest at the back, at most
+    /// [`MAX_POST_ATTEMPT_BURST_ZEROS`]). Recorded only while
+    /// `blank_recovery_attempts > 0` and cleared when an attempt fires, so it
+    /// feeds just the post-attempt zero-burst arm of [`should_blank_recover`].
+    post_attempt_zero_at: VecDeque<Instant>,
+    /// True once EGFX went ready with AVC on this connection. A later
+    /// `on_close` clears `is_ready` but not this, so the legacy hold (see
+    /// [`hold_legacy_for_egfx`]) applies only before the first ready.
+    egfx_ever_ready: bool,
+    /// One-shot guards for the "holding back" and "legacy hold expired" log
+    /// lines.
+    legacy_hold_logged: bool,
+    legacy_hold_expired_logged: bool,
+}
+
+/// Capacity of [`ConnectionContext::post_attempt_zero_at`], and so the ceiling
+/// for `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS`.
+const MAX_POST_ATTEMPT_BURST_ZEROS: u64 = 32;
+
+/// Time from the oldest of the last `k` post-attempt zero reports until `now`,
+/// or `None` when fewer than `k` have arrived (or `k == 0`). The input to the
+/// zero-burst arm of [`should_blank_recover`]. Pure, unit-tested.
+fn post_attempt_zero_span(zeros: &VecDeque<Instant>, k: u64, now: Instant) -> Option<Duration> {
+    let k = usize::try_from(k).ok()?;
+    if k == 0 || zeros.len() < k {
+        return None;
+    }
+    zeros
+        .get(zeros.len() - k)
+        .map(|oldest| now.saturating_duration_since(*oldest))
+}
+
+impl ConnectionContext {
+    /// Starts the connection's clocks at `now`, the moment the EGFX channel goes
+    /// ready. The context is built when the server attaches channels, which is
+    /// at TCP accept, before TLS and authentication. A slow login (a
+    /// certificate prompt, a typed password, NLA over a distant link) used to
+    /// count as connected time: by the first frame the blank detector's 3 s arm
+    /// delay and the adaptive controller's 3 s no-ack grace had already run out,
+    /// so a session that had not yet had a chance to present was "recovered"
+    /// within a fraction of a second. Nothing ships or is acknowledged before
+    /// ready, so restarting every connection-start baseline here is exactly
+    /// "the connection starts now". A new connection-start clock belongs here
+    /// too.
+    fn start_clocks(&mut self, now: Instant) {
+        self.epoch = now;
+        self.last_ack_at = now;
+        self.last_ack_advance_at = now;
+        self.last_ship_at = now;
+        self.last_recovery_at = now;
+        self.rtt_bucket_started = now;
+        self.last_throttle_ship = now;
+        self.adaptive_last_control = now;
+        self.last_floor_fps_pass = now;
+        self.last_nonzero_qoe_at = now;
+        self.last_blank_recovery_at = now;
+    }
 }
 
 /// Tunables for ack-driven IDR recovery (EGFX-on-lossy). See
@@ -487,6 +551,29 @@ fn should_demigrate_to_tcp(
         && !acks_suspended
         && since_ship <= active_window
         && since_ack >= wedge_timeout
+}
+
+/// Whether capture must hold back a legacy bitmap update because this
+/// connection is still negotiating EGFX. Pure, unit-tested.
+///
+/// Windows 10 mstsc 10.0.19041.4717 (2026-10-27): when one legacy bitmap
+/// update reaches the client between capture start and EGFX ready, the
+/// session often stays frozen on that legacy picture after EGFX starts:
+/// every AVC420 frame is acknowledged, none is shown, and every QoE report
+/// has `timeDiffEDR == 0`, so the blank detector reactivates it. Fresh
+/// connects with moving content: 7 of 8 frozen with the legacy update sent,
+/// 0 of 8 with it held.
+///
+/// Hold while EGFX has not yet been ready on this connection, the client
+/// has not declined it (no AVC), and the hold has lasted less than `limit`:
+/// a client that never opens EGFX gets legacy updates after `limit`.
+fn hold_legacy_for_egfx(
+    ever_ready: bool,
+    declined: bool,
+    held_for: Duration,
+    limit: Duration,
+) -> bool {
+    !ever_ready && !declined && held_for < limit
 }
 
 /// Tunables for the blank-presentation detector + recovery (the mstsc
@@ -578,13 +665,46 @@ struct BlankRecoveryParams {
     /// ACKED frames since the attempt (the post-attempt IDR + flush frames
     /// give a live client something to ack; no acks ⇒ nothing shipped ⇒
     /// nothing to conclude) and either total QoE silence while acking (the
-    /// blank tell — this client emitted QoE fine before the attempt) or
-    /// `blank_min_reports` CUMULATIVE zeros since the attempt (immune to the
-    /// interleaved blips, which reset the streak but not the tally). A healed
-    /// static-desktop mstsc emits a few honest nonzero reports and no zeros
-    /// post-heal, so it matches neither arm. RTT-scaled like `blank_max_wait`.
-    /// `MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS`, default 8000; 0 disables.
+    /// blank tell — this client emitted QoE fine before the attempt). The
+    /// interleaved-phantom case is owned by the zero-burst arm
+    /// ([`Self::post_attempt_burst_zeros`]) since 2026-11-12: this deadline used
+    /// to also fire on `blank_min_reports` (1) cumulative zero, which dropped a
+    /// healed static-desktop mstsc on its first clock-tick zero. RTT-scaled like
+    /// `blank_max_wait`. `MACRDP_BLANK_RECOVERY_HEAL_CONFIRM_MS`, default 8000;
+    /// 0 disables.
     heal_confirm_deadline: Duration,
+    /// Post-attempt zero BURST (2026-11-12): once a recovery attempt has run,
+    /// escalate (normally to the drop) when this many zero-EDR reports arrived
+    /// within [`Self::post_attempt_burst_window`]. This replaces the
+    /// one-zero wall-clock fast path for the post-attempt phase, which dropped
+    /// sessions the reactivation had HEALED: live on mstsc (11-09, 11-10,
+    /// 11-12), a healed session showed presented runs of 0–31 and then a single
+    /// zero (a static desktop's menu-bar clock tick reports zero EDR on a
+    /// presenting mstsc), and the fast path dropped it — on a static desktop,
+    /// once a minute, in a loop. Every logged false drop had 1–2 zeros in its
+    /// window; every logged real blank had 3+. A density rule, not a running
+    /// count, because a healed static session accrues ~1 zero per minute
+    /// forever. Run length can't separate the cases: Windows App for macOS
+    /// shows phantom runs up to 18 while black (07-23), and its interleaved
+    /// zeros still form a burst. Withheld for an ESTABLISHED session (a heal
+    /// that reached `established_render_reports`): live 11-12 a 75-long heal
+    /// followed by 4 scattered zeros formed a burst and dropped a working
+    /// session; the established tier's slower paths own that case. Also
+    /// requires zeros to be at least half of the window's reports: with video
+    /// playing a healed mstsc emits scattered zeros (7-17% of the window,
+    /// live 11-12) that can still bunch into a burst.
+    /// Trade-off: a still-black, fully STATIC screen
+    /// is not escalated until something on it changes (the heal-confirmation
+    /// deadline still catches total QoE silence).
+    /// `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS`, default 3 (clamped to
+    /// 1..=[`MAX_POST_ATTEMPT_BURST_ZEROS`]).
+    post_attempt_burst_zeros: u64,
+    /// The window for [`Self::post_attempt_burst_zeros`]. Not RTT-scaled: a
+    /// longer window only makes the burst easier to meet, and a healed
+    /// session's zeros are ~a minute apart, far outside any sane value.
+    /// `MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS`, default 10000; 0
+    /// disables the burst arm.
+    post_attempt_burst_window: Duration,
     /// Total attempts per connection. All attempts but the last REMAP the
     /// output to a fresh surface (non-destructive); the LAST attempt drops the
     /// connection so the client auto-reconnects (a fresh attempt renders with
@@ -611,7 +731,10 @@ struct BlankRecoveryParams {
     /// no QoE at all), the session is conclusively blank — fire without waiting
     /// for the full count. Safe to be prompt because the reactivation heal is
     /// non-destructive: an occasional early fire costs a brief re-handshake, not
-    /// a dropped session. `MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`, default 4000.
+    /// a dropped session. **Connect phase only** (no attempt yet): after an
+    /// attempt the next lever is the DROP, which is not cheap, and a single
+    /// zero is not evidence there — see [`Self::post_attempt_burst_zeros`].
+    /// `MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`, default 4000.
     blank_max_wait: Duration,
     /// Minimum all-zero QoE reports for the wall-clock fast-path (above). Its
     /// only job is to rule out a client that sends NO QoE (e.g. FreeRDP, which
@@ -856,6 +979,10 @@ impl QoeEvidence {
 /// - `acked_since_attempt`: whether the client has acknowledged frames since
 ///   the last recovery attempt — only consulted by the post-attempt
 ///   heal-confirmation deadline (see [`BlankRecoveryParams::heal_confirm_deadline`]).
+/// - `post_attempt_zero_span`: time from the oldest of the last
+///   `post_attempt_burst_zeros` zero reports since the last attempt until now
+///   ([`post_attempt_zero_span`]); `None` when fewer have arrived. Only
+///   consulted after an attempt (see [`BlankRecoveryParams::post_attempt_burst_zeros`]).
 #[allow(clippy::too_many_arguments)]
 fn should_blank_recover(
     qoe: QoeEvidence,
@@ -866,6 +993,7 @@ fn should_blank_recover(
     since_last_attempt: Duration,
     attempts: u32,
     acked_since_attempt: bool,
+    post_attempt_zero_span: Option<Duration>,
     p: &BlankRecoveryParams,
 ) -> bool {
     // Durable clean-presentation latch (v0.9.2): a connection that produced a
@@ -929,31 +1057,60 @@ fn should_blank_recover(
     // either interleaved phantom nonzero reports (each one resetting
     // `zero_streak`) or total QoE silence — so the fallback drop, the lever
     // that actually recovers it, never fired and the user reconnected by hand.
-    // Once an attempt has run, the burden of proof flips: the session must
-    // show a sustained nonzero run within the deadline, or the escalation
-    // fires on cumulative-zero / silence evidence the blips can't reset.
+    // This arm owns the SILENT case: the client acks our post-attempt frames
+    // but sends no QoE report at all, so nothing else here can ever fire.
+    // (The interleaved case is the zero-burst arm below. This arm used to also
+    // fire on `blank_min_reports` cumulative zeros, i.e. ONE zero with the
+    // production default, which dropped a healed static-desktop mstsc whose
+    // only post-attempt report was a clock-tick zero — 11-10, window 1/1/0.)
     // `acked_since_attempt` keeps an idle session out (no frames shipped ⇒
-    // nothing to conclude), and `nonzero_max_since_reset < min_render_reports`
-    // implies `!presenting_now` below, so the arms can't fight.
-    let post_attempt_unconfirmed = attempts >= 1
+    // nothing to conclude).
+    let post_attempt_silent = attempts >= 1
         && !p.heal_confirm_deadline.is_zero()
         && since_last_attempt >= p.heal_confirm_deadline
         && acked_since_attempt
-        && qoe.nonzero_max_since_reset < p.min_render_reports
-        && (qoe.reports_since_reset == 0 || qoe.zeros_since_reset >= p.blank_min_reports);
+        && qoe.reports_since_reset == 0;
+    // Post-attempt zero BURST (2026-11-12, see the param doc): after an
+    // attempt, escalate on `post_attempt_burst_zeros` zero reports within
+    // `post_attempt_burst_window`. A density rule — immune to the interleaved
+    // phantom nonzeros (they don't remove zeros from the burst), yet a healed
+    // session's occasional clock-tick zero (~1/min) never forms one.
+    // Withheld once the session is ESTABLISHED (a 40+ run, ~5 s of picture):
+    // live 11-12, a reactivation healed mstsc into a 75-long run, then 4
+    // scattered zeros formed a burst and dropped a session the user saw
+    // working. An established session has its own, slower relapse paths
+    // (the 160-report count and the 30 s blackout above). The Windows App
+    // phantom runs (up to 18) stay well below the bar, so a real blank is
+    // still escalated here.
+    // Also needs zeros to be at least HALF of the reports since the attempt:
+    // live 11-12 (third round, YouTube playing) four reconnects healed into
+    // runs of 15-33 and then 3-4 dense zeros formed a burst — zeros were only
+    // 7-17% of their windows and the user saw the desktop each time. Every
+    // logged real blank was 73-100% zeros; the Windows App phantom pattern is
+    // mostly zeros by definition.
+    let post_attempt_zero_burst = attempts >= 1
+        && !established
+        && qoe.zeros_since_reset.saturating_mul(2) >= qoe.reports_since_reset
+        && !p.post_attempt_burst_window.is_zero()
+        && post_attempt_zero_span.is_some_and(|span| span <= p.post_attempt_burst_window);
     // Blank evidence: EITHER the full all-zero report count (fast on an active
-    // screen), OR the established wall-clock blackout above, OR the
-    // post-attempt heal-confirmation deadline above, OR — for a STATIC
-    // connect-time blank whose QoE trickles in slowly — enough wall-clock
-    // elapsed with at least `blank_min_reports` all-zero reports (which rules
-    // out a client that sends no QoE, e.g. FreeRDP, from ever firing on the
-    // wall-clock branch). That last fast path is withheld once the session is
-    // established: with `blank_min_reports` as low as 1, a single stray zero
-    // from a healthy long-running session would otherwise satisfy it.
+    // screen), OR the established wall-clock blackout above, OR one of the two
+    // post-attempt arms above, OR — for a STATIC connect-time blank whose QoE
+    // trickles in slowly — enough wall-clock elapsed with at least
+    // `blank_min_reports` all-zero reports (which rules out a client that
+    // sends no QoE, e.g. FreeRDP, from ever firing on the wall-clock branch).
+    // That last fast path is CONNECT-PHASE ONLY (`attempts == 0`): after an
+    // attempt the next lever is the drop, and a single zero after a heal is
+    // normal mstsc noise (it dropped healed sessions live, 11-09..11-12). It is
+    // also withheld once the session is established: with `blank_min_reports`
+    // as low as 1, a single stray zero from a healthy long-running session
+    // would otherwise satisfy it.
     let blank_evidence = qoe.zero_streak >= count_threshold
         || established_blackout
-        || post_attempt_unconfirmed
-        || (since_connect >= p.blank_max_wait
+        || post_attempt_silent
+        || post_attempt_zero_burst
+        || (attempts == 0
+            && since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
             && !established);
     blank_evidence
@@ -982,6 +1139,41 @@ fn blank_rtt_gate(link_rtt_ms: u32, max_rtt_ms: u32) -> Option<f64> {
         return None;
     }
     Some((f64::from(link_rtt_ms) / 25.0).clamp(1.0, 4.0))
+}
+
+/// The newest EGFX capability version Windows App for macOS advertises
+/// (undocumented, unparsed by this build). Clients that advertise anything
+/// newer are the ones [`advertises_egfx_beyond_mac_client`] picks out.
+const MAC_WINDOWS_APP_NEWEST_EGFX: u32 = 0x000B_0101;
+
+/// Whether the client advertised an EGFX capability set newer than
+/// [`MAC_WINDOWS_APP_NEWEST_EGFX`].
+///
+/// Windows App on Windows advertises 0x000B0101, 0x000B0200, 0x000B0300 and
+/// 0x000B0500, and its QoE reports carry a decode+render time only for the
+/// first frame: every later report says 0 while it presents normally (captured
+/// 2026-11-20, issue #269: 1 nonzero of 217 reports over 42 s, against 95–100%
+/// for mstsc). The blank detector reads that as the reconnect-blank and drops a
+/// working session three times. mstsc advertises nothing past V10.6, and
+/// Windows App for macOS nothing past 0x000B0101; both keep blank recovery
+/// (the macOS client has had real reconnect-blanks). The iOS Windows App
+/// advertises 0x000B0300 (#211), so it is covered too; there is no QoE data
+/// from it either way. Pure, unit-tested.
+fn advertises_egfx_beyond_mac_client(versions: impl IntoIterator<Item = u32>) -> bool {
+    versions
+        .into_iter()
+        .any(|v| v > MAC_WINDOWS_APP_NEWEST_EGFX)
+}
+
+/// The blank detector's per-connection gate: [`blank_rtt_gate`], except that a
+/// client whose zero decode+render time doesn't mean "not presenting"
+/// ([`advertises_egfx_beyond_mac_client`]) is never evaluated. `None` = disarmed
+/// for this connection. Pure, unit-tested.
+fn blank_detector_gate(newer_egfx_client: bool, link_rtt_ms: u32, max_rtt_ms: u32) -> Option<f64> {
+    if newer_egfx_client {
+        return None;
+    }
+    blank_rtt_gate(link_rtt_ms, max_rtt_ms)
 }
 
 /// Scale a [`BlankRecoveryParams`] evidence window by the RTT multiplier from
@@ -1077,6 +1269,148 @@ fn retransmit_is_lossy(retransmit_delta: u64, tolerance: u64) -> bool {
     retransmit_delta > tolerance
 }
 
+/// How many queue-delay samples (one per control interval) each half of the
+/// trend comparison averages. Two halves of 3 at the 300 ms default interval
+/// compare the last ~0.9 s against the ~0.9 s before it.
+const DELAY_TREND_WINDOW: usize = 3;
+
+/// Direction of the standing queue delay over the last ~2 trend windows, from
+/// [`delay_trend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelayTrend {
+    /// Fewer than `2 * DELAY_TREND_WINDOW` samples yet. The controller falls
+    /// back to the original level-only rule, so a link that is congested from
+    /// the first second (a thin VPN) is still backed off before a trend exists.
+    Unknown,
+    /// The queue is growing: sending faster than the bottleneck drains.
+    Rising,
+    /// The queue is shrinking: a previous back-off is draining it.
+    Falling,
+    /// Neither: a standing delay that isn't growing. At a high level this is
+    /// mstsc's decode pipeline during video, not congestion (2026-11-12).
+    Flat,
+}
+
+/// Classify the trend of the recent queue-delay samples (oldest first): the
+/// mean of the newest `DELAY_TREND_WINDOW` against the mean of the window
+/// before it, with `rise_ms` as the dead band. Pure, unit-tested.
+///
+/// Why a trend at all (2026-11-12, mstsc build 26100 on gigabit Ethernet,
+/// YouTube at 1080p60): the delay sat FLAT at ~120 ms at 3 Mbit/s (samples
+/// 123, 121, 118, 120, 122) with the TCP send queue empty, because mstsc keeps
+/// ~10 frames of video in its decode pipeline. The level-only rule read that as
+/// congestion, cut the bitrate (which didn't move the delay: it stayed
+/// 118-148 ms all the way down to 0.5 Mbit/s), hit the 10 fps floor, and the
+/// fps cap cleared the delay, so it climbed back: a stutter every 3-5 s. A real
+/// backlog keeps GROWING while the sender is over capacity, so a growing delay
+/// is the congestion evidence; a flat one isn't.
+fn delay_trend(samples: &VecDeque<f64>, rise_ms: f64) -> DelayTrend {
+    if samples.len() < 2 * DELAY_TREND_WINDOW {
+        return DelayTrend::Unknown;
+    }
+    let n = samples.len();
+    let mean = |from: usize| {
+        samples.range(from..from + DELAY_TREND_WINDOW).sum::<f64>() / DELAY_TREND_WINDOW as f64
+    };
+    let delta = mean(n - DELAY_TREND_WINDOW) - mean(n - 2 * DELAY_TREND_WINDOW);
+    if delta > rise_ms {
+        DelayTrend::Rising
+    } else if delta < -rise_ms {
+        DelayTrend::Falling
+    } else {
+        DelayTrend::Flat
+    }
+}
+
+/// Whether the smoothed delay is pressure to back off this interval: above
+/// the hard `ceiling` (a delay only a real backlog reaches) whatever the trend,
+/// or above `high` while growing (or before a trend exists). A flat or falling
+/// delay below the ceiling isn't. Pure, unit-tested.
+fn delay_pressure(ewma: f64, high: f64, ceiling: f64, trend: DelayTrend) -> bool {
+    ewma > ceiling || (ewma > high && matches!(trend, DelayTrend::Rising | DelayTrend::Unknown))
+}
+
+/// Least time between two trend-driven decreases (2026-11-12, second live
+/// round): after a cut the measured delay keeps rising for ~1.5 s while the
+/// frames already in flight drain, so cutting every 300 ms interval while it
+/// rose overshot all the way to the floor and the 10 fps cap (live: 3 → 0.5
+/// Mbit/s in 1.5 s, delay still climbing to 366 ms). One cut per second lets
+/// each one take effect. Not applied above the hard ceiling or on loss.
+const TREND_DECREASE_SPACING: Duration = Duration::from_secs(1);
+
+/// The increase step near the last congestion point is the normal step
+/// divided by this (see [`increase_step`]).
+const SLOW_APPROACH_DIVISOR: u32 = 5;
+
+/// Whether a `Decrease` from the rate rule should be held back for spacing
+/// (see [`TREND_DECREASE_SPACING`]): only a decrease driven by a RISING delay
+/// below the hard ceiling, within the spacing of the last decrease. Loss, the
+/// ceiling, and the level-only fallback (`Unknown`) are never held. Pure,
+/// unit-tested.
+fn hold_trend_decrease(
+    retransmit_lossy: bool,
+    ewma: f64,
+    ceiling: f64,
+    trend: DelayTrend,
+    since_last_decrease: Option<Duration>,
+    spacing: Duration,
+) -> bool {
+    !retransmit_lossy
+        && ewma <= ceiling
+        && trend == DelayTrend::Rising
+        && since_last_decrease.is_some_and(|d| d < spacing)
+}
+
+/// The additive-increase step: the normal `increase_bps`, slowed to
+/// `increase_bps / SLOW_APPROACH_DIVISOR` once the target is within 80% of the
+/// bitrate where the last congestion episode began (`congestion_bps`), so the
+/// climb doesn't race straight back into the backlog it just left (the
+/// second live round: +250 kbit/s per 300 ms took it from 1 to 2.5 Mbit/s in
+/// 2 s, past the ~2 Mbit/s where the reconnected mstsc's delay starts
+/// growing). Pure, unit-tested.
+fn increase_step(target_bps: u32, congestion_bps: Option<u32>, increase_bps: u32) -> u32 {
+    match congestion_bps {
+        Some(p) if u64::from(target_bps) * 5 >= u64::from(p) * 4 => {
+            (increase_bps / SLOW_APPROACH_DIVISOR).max(1)
+        }
+        _ => increase_bps,
+    }
+}
+
+/// Note a decrease for the slow approach: the FIRST decrease of an episode
+/// records the bitrate it started from (the trouble point [`increase_step`]
+/// slows down near); later cuts in the same episode leave it, or the point
+/// would sink to the floor with the cuts and slow the whole climb back. An
+/// increase ends the episode (the caller clears `in_episode`).
+fn note_decrease(in_episode: &mut bool, congestion_bps: &mut Option<u32>, target_bps: u32) {
+    if !*in_episode {
+        *in_episode = true;
+        *congestion_bps = Some(target_bps);
+    }
+}
+
+/// Seconds of frames the IDR backoff stretches the periodic-keyframe interval to
+/// (see [`stretched_keyframe_interval`]).
+const STRETCHED_KEYFRAME_SECS: u32 = 10;
+
+/// The keyframe interval (frames) the IDR backoff uses under congestion: about
+/// [`STRETCHED_KEYFRAME_SECS`] of frames at the configured rate, and always
+/// longer than the normal interval. Pure; unit-tested.
+///
+/// It was ~10 minutes, which was harmless only because the stretch never took
+/// effect (VideoToolbox ignored it; fixed 2026-11-13 by scheduling keyframes in
+/// the encoder). Once it did, a session that stayed congested sent no healing
+/// keyframe at all, because the backoff is only lifted when the bitrate climbs
+/// back to the ceiling: live on 11-13 (mstsc decoding in software inside a
+/// remote Windows session) one keyframe went out in 2.5 minutes, so a decode
+/// glitch would have stayed on screen. Ten seconds still keeps the 2 s periodic
+/// IDR off a congested link. It counts frames, so under the 10 fps floor it
+/// stretches to about a minute.
+fn stretched_keyframe_interval(fps: u32, normal_keyframe_frames: u32) -> u32 {
+    fps.saturating_mul(STRETCHED_KEYFRAME_SECS)
+        .max(normal_keyframe_frames.saturating_add(1))
+}
+
 /// Pure congestion decision with EWMA smoothing + hysteresis. `ewma_lag` is the
 /// exponentially-smoothed frame-ack lag (shipped − acked); the caller smooths the raw
 /// per-interval lag so a single spike doesn't trip a back-off (raw TCP ack-lag bursts
@@ -1089,10 +1423,20 @@ fn retransmit_is_lossy(retransmit_delta: u64, tolerance: u64) -> bool {
 /// immediately (a definite loss, no smoothing). With acks unusable (suspended / not yet
 /// seen / cold-start warmup), the lag is uninferable so only the retransmit signal
 /// counts. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
+///
+/// **Trend (2026-11-12):** `trend` and `ceiling` refine the delay rule (see
+/// [`delay_trend`]). Enter on [`delay_pressure`]. Stay while the delay is above
+/// `low` and still moving (rising, or falling as a back-off drains it), or
+/// above `ceiling`; a FLAT delay below the ceiling ends the episode, because a
+/// standing delay that isn't growing is not a backlog. With `DelayTrend::Unknown`
+/// this is exactly the original level-only rule.
+#[allow(clippy::too_many_arguments)]
 fn congested_hysteresis(
     ewma_lag: f64,
     high: f64,
     low: f64,
+    ceiling: f64,
+    trend: DelayTrend,
     retransmit_lossy: bool,
     acks_usable: bool,
     currently_congested: bool,
@@ -1104,9 +1448,12 @@ fn congested_hysteresis(
         return false;
     }
     if currently_congested {
-        ewma_lag > low // stay congested until the smoothed lag drops below the low mark
+        // stay congested until the smoothed lag drops below the low mark, or
+        // stops moving below the ceiling
+        ewma_lag > ceiling || (ewma_lag > low && trend != DelayTrend::Flat)
     } else {
-        ewma_lag > high // only enter once the smoothed lag clears the high mark
+        // only enter on real pressure (see `delay_pressure`)
+        delay_pressure(ewma_lag, high, ceiling, trend)
     }
 }
 
@@ -1132,19 +1479,60 @@ enum RateAction {
 /// increase once cleared. So a single spike = one step down then a plateau, while
 /// *sustained* congestion (lag stays above `high`) keeps decreasing toward the floor.
 /// Unit-tested. See [`Gfx::adaptive_bitrate_step`].
+///
+/// With a trend (2026-11-12) the decrease needs [`delay_pressure`]: a flat or
+/// draining delay below `ceiling` holds or increases instead of cutting.
 fn rate_action(
     ewma_lag: f64,
     high: f64,
+    ceiling: f64,
+    trend: DelayTrend,
     retransmit_lossy: bool,
     acks_usable: bool,
     congested: bool,
 ) -> RateAction {
-    if retransmit_lossy || (acks_usable && ewma_lag > high) {
+    if retransmit_lossy || (acks_usable && delay_pressure(ewma_lag, high, ceiling, trend)) {
         RateAction::Decrease
     } else if !congested {
         RateAction::Increase
     } else {
         RateAction::Hold
+    }
+}
+
+/// Longest the manual resync hotkey holds new video while the client's
+/// decoder empties (see [`resync_drain_step`]).
+const RESYNC_DRAIN_MAX: Duration = Duration::from_millis(2000);
+
+/// What the manual-resync video drain does with this capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResyncDrain {
+    /// Not draining: ship normally.
+    Off,
+    /// Still draining: drop this capture (the armed IDR waits).
+    Hold,
+    /// The drain just ended (the client acked everything shipped, or the cap
+    /// ran out): ship this capture, which carries the armed IDR.
+    Done,
+}
+
+/// Pure decision for the manual-resync video drain (2026-11-12). The hotkey
+/// used to arm only an IDR, which then queued BEHIND the video backlog in
+/// mstsc's decoder, so the drift stayed; minimize→restore fixed it because
+/// SuppressOutput stops video for over a second first. The drain does the
+/// same: hold new captures until the client has acknowledged every frame we
+/// shipped (FrameAcknowledge comes after decode, so its decoder is then
+/// empty), at most `RESYNC_DRAIN_MAX`, then ship the IDR. Unit-tested.
+fn resync_drain_step(
+    drain_until: Option<Instant>,
+    now: Instant,
+    last_shipped: u64,
+    last_acked: u64,
+) -> ResyncDrain {
+    match drain_until {
+        None => ResyncDrain::Off,
+        Some(until) if last_acked >= last_shipped || now >= until => ResyncDrain::Done,
+        Some(_) => ResyncDrain::Hold,
     }
 }
 
@@ -1202,12 +1590,26 @@ fn recovery_config_from_env() -> (bool, RecoveryParams) {
     (enabled, params)
 }
 
-/// Whether EGFX consumed a capture and actually queued it for encoding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameSubmission {
-    Inactive,
-    Deferred,
-    Submitted,
+/// The client ack-lag cap (frames shipped but not yet acknowledged) for one
+/// submit; 0 = no cap.
+///
+/// - On the reliable UDP tunnel the cap is always on (`udp_limit`, ≥ 1), for
+///   every frame, flush re-submits included — unchanged from before the TCP cap.
+/// - On TCP it applies only with `--h264-max-unacked-frames` (`tcp_limit` > 0),
+///   and never to a flush re-submit. mstsc presents an AVC420 frame (and only
+///   then acknowledges it) once about two more arrive behind it, so on a still
+///   screen the flush frames are what get the last change shown. Capped, at most
+///   one of them would pass the 100 ms trickle floor, and the last keystroke
+///   could stay unshown until the next keyframe. They are bounded
+///   (`--flush-frames` per change) and are what let the client catch up.
+fn ack_lag_limit(on_udp: bool, udp_limit: u64, tcp_limit: u64, flush: bool) -> u64 {
+    if on_udp {
+        udp_limit
+    } else if flush {
+        0
+    } else {
+        tcp_limit
+    }
 }
 
 /// Cloneable factory + frame-submit handle. One clone is boxed into
@@ -1224,9 +1626,6 @@ pub struct Gfx {
     desktop_size: crate::capture::SharedDesktopSize,
     fps: u32,
     bitrate_bps: u32,
-    /// Prefer AVC444 v1 when the client positively advertises V10+ AVC.
-    /// AVC420-only clients automatically retain the single-stream path.
-    avc444_enabled: bool,
     /// Periodic keyframe (IDR) interval in seconds (from `--keyframe-interval`).
     /// Heal-vs-smoothness knob; converted to a frame count by `Encoder::new`.
     keyframe_secs: f32,
@@ -1239,6 +1638,7 @@ pub struct Gfx {
     /// so encoded frames are never dropped, which would break the H.264 chain).
     max_in_flight: u32,
     wire_format: WireFormat,
+    avc444_enabled: bool,
     /// Ack-driven IDR recovery (EGFX-on-lossy). `recovery_enabled` is the opt-in
     /// env gate (`MACRDP_UDP_EGFX_ACK_RECOVERY`); `egfx_on_lossy` is the *runtime*
     /// gate the vendored server flips true when it migrates EGFX onto the lossy
@@ -1259,7 +1659,9 @@ pub struct Gfx {
     /// that a healthy high-RTT link never trips it; low enough to cap the decode
     /// backlog so video degrades to choppy-but-live instead of freezing.
     max_frame_lag: u64,
-    tcp_video_backpressure: bool,
+    /// The same ack-lag cap on the TCP path (`--h264-max-unacked-frames`);
+    /// 0 = off, leaving TCP paced by socket backpressure alone.
+    tcp_max_frame_lag: u64,
     /// EGFX-over-UDP → TCP watchdog. On by default (disable with
     /// `MACRDP_UDP_EGFX_WATCHDOG=0`); only ever acts while EGFX is on the RELIABLE
     /// UDP tunnel (`egfx_on_udp && !egfx_on_lossy`), so it's a no-op unless
@@ -1306,6 +1708,17 @@ pub struct Gfx {
     /// queue is unambiguous congestion at any RTT (LEDBAT's classic target);
     /// `MACRDP_ADAPTIVE_QUEUE_HIGH_MS` overrides.
     adaptive_queue_high_ms: f64,
+    /// Dead band (ms) for the queue-delay trend ([`delay_trend`]): the mean of
+    /// the last ~0.9 s must differ from the ~0.9 s before by more than this to
+    /// count as rising or falling. 20 ms ≈ a backlog growing ~22 ms/s, i.e.
+    /// sending a few percent over the bottleneck. `MACRDP_ADAPTIVE_QUEUE_RISE_MS`.
+    adaptive_queue_rise_ms: f64,
+    /// Hard ceiling (ms): a smoothed delay above this is congestion whatever its
+    /// trend, so a backlog that has stopped growing at a very high level is
+    /// still worked down. Well above mstsc's ~120 ms video decode depth.
+    /// Clamped to at least `adaptive_queue_high_ms`.
+    /// `MACRDP_ADAPTIVE_QUEUE_CEILING_MS`, default 400.
+    adaptive_queue_ceiling_ms: f64,
     /// EWMA weight on each new queue-delay sample in (0,1]: `ewma = α·sample +
     /// (1−α)·ewma`. Smooths the spiky raw signal so single bursts don't pump the
     /// bitrate; lower = more smoothing (slower reaction). Default 0.3;
@@ -1349,6 +1762,10 @@ pub struct Gfx {
     /// experimentation) — see [`BlankAction`].
     blank_recovery_enabled: bool,
     blank_params: BlankRecoveryParams,
+    /// How long capture holds back legacy bitmap updates on a new connection
+    /// while EGFX is not ready yet (see [`hold_legacy_for_egfx`]).
+    /// `MACRDP_EGFX_LEGACY_HOLD_MS`, default 3000; 0 disables the hold.
+    legacy_hold: Duration,
     /// Consecutive connections (process lifetime) that ended in a blank-recovery
     /// DROP with no connection presenting in between — the reconnect-storm guard
     /// counter (see [`blank_drop_capped`]). Incremented when a drop is armed;
@@ -1375,15 +1792,28 @@ pub struct Gfx {
     reactivate_request: Arc<AtomicU32>,
 }
 
+/// One captured frame on its way to the encoder: BGRA bytes the encoder
+/// converts to NV12 itself, or an NV12 pixel buffer ScreenCaptureKit already
+/// converted on the GPU.
+enum FrameInput<'a> {
+    Bgra { bgra: &'a [u8], stride: usize },
+    Nv12(&'a screencapturekit::cv::CVPixelBuffer),
+}
+
 impl Gfx {
+    pub fn with_avc444(mut self, enabled: bool) -> Self {
+        self.avc444_enabled = enabled;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         desktop_size: crate::capture::SharedDesktopSize,
         fps: u32,
         bitrate_bps: u32,
-        avc444_enabled: bool,
         keyframe_secs: f32,
         max_in_flight: u32,
+        tcp_max_unacked_frames: u32,
         egfx_on_lossy: Arc<AtomicBool>,
         egfx_on_udp: Arc<AtomicBool>,
         demigrate_request: Arc<AtomicBool>,
@@ -1453,6 +1883,16 @@ impl Gfx {
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|&n| n > 0.0)
             .unwrap_or(100.0);
+        let env_ms_f64 = |name: &str, default: f64| -> f64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|&n| n > 0.0)
+                .unwrap_or(default)
+        };
+        let adaptive_queue_rise_ms = env_ms_f64("MACRDP_ADAPTIVE_QUEUE_RISE_MS", 20.0);
+        let adaptive_queue_ceiling_ms =
+            env_ms_f64("MACRDP_ADAPTIVE_QUEUE_CEILING_MS", 400.0).max(adaptive_queue_high_ms);
         // EWMA smoothing weight for the queue-delay signal (clamped to (0,1]); default 0.3.
         let adaptive_ewma_alpha = std::env::var("MACRDP_ADAPTIVE_EWMA_ALPHA")
             .ok()
@@ -1473,12 +1913,10 @@ impl Gfx {
         let adaptive_floor_fps = env_u32("MACRDP_ADAPTIVE_FLOOR_FPS", 10).max(1);
         let adaptive_min_fps_interval = Duration::from_millis(1000 / u64::from(adaptive_floor_fps));
         // P2a IDR backoff: the configured periodic-keyframe interval in frames (same
-        // derivation as Encoder::new), and a stretched value (~10 min) that
-        // effectively suppresses the periodic IDR for the duration of a congestion
-        // episode without a hard "never" (VT still honors forced keyframes).
+        // derivation as Encoder::new), and the stretched value used under congestion.
         let normal_keyframe_frames =
             (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let stretched_keyframe_frames = fps.saturating_mul(600).max(normal_keyframe_frames + 1);
+        let stretched_keyframe_frames = stretched_keyframe_interval(fps, normal_keyframe_frames);
         // Blank-presentation recovery (the mstsc reconnect-blank): on by default —
         // it only ever acts on the pcap-proven blank signature (QoE acks flowing
         // with decode+render time zero on EVERY frame of a whole window), so a
@@ -1551,19 +1989,27 @@ impl Gfx {
             max_rtt_ms: env_u32_zero_ok("MACRDP_BLANK_RECOVERY_MAX_RTT_MS", 80),
             blank_max_wait: watchdog_ms("MACRDP_BLANK_RECOVERY_MAX_WAIT_MS", 4000),
             blank_min_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS", 1)),
+            post_attempt_burst_zeros: u64::from(env_u32(
+                "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_ZEROS",
+                3,
+            ))
+            .clamp(1, MAX_POST_ATTEMPT_BURST_ZEROS),
+            // Allows an explicit 0 (= disable the burst arm), so not watchdog_ms.
+            post_attempt_burst_window: Duration::from_millis(u64::from(env_u32_zero_ok(
+                "MACRDP_BLANK_RECOVERY_POST_ATTEMPT_WINDOW_MS",
+                10_000,
+            ))),
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
+        let legacy_hold = Duration::from_millis(u64::from(env_u32_zero_ok(
+            "MACRDP_EGFX_LEGACY_HOLD_MS",
+            3000,
+        )));
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
-            width,
-            height,
-            fps,
-            keyframe_secs,
-            max_in_flight,
-            avc444_enabled,
-            "EGFX/H.264 pipeline configured"
+            width, height, fps, keyframe_secs, max_in_flight, "EGFX/H.264 pipeline configured"
         );
         if recovery_enabled {
             info!(
@@ -1580,6 +2026,8 @@ impl Gfx {
                 decrease = adaptive_decrease,
                 interval_ms = adaptive_interval.as_millis() as u64,
                 queue_high_ms = adaptive_queue_high_ms,
+                queue_rise_ms = adaptive_queue_rise_ms,
+                queue_ceiling_ms = adaptive_queue_ceiling_ms,
                 ewma_alpha = adaptive_ewma_alpha,
                 normal_keyframe_frames,
                 stretched_keyframe_frames,
@@ -1594,17 +2042,16 @@ impl Gfx {
             desktop_size,
             fps,
             bitrate_bps,
-            avc444_enabled,
             keyframe_secs,
             max_in_flight,
             wire_format,
+            avc444_enabled: false,
             recovery_enabled,
             recovery_params,
             egfx_on_lossy,
             egfx_on_udp,
             max_frame_lag,
-            tcp_video_backpressure: std::env::var("MACRDP_TCP_VIDEO_BACKPRESSURE").as_deref()
-                == Ok("1"),
+            tcp_max_frame_lag: u64::from(tcp_max_unacked_frames),
             watchdog_enabled,
             watchdog_wedge_timeout,
             watchdog_active_window,
@@ -1615,6 +2062,8 @@ impl Gfx {
             adaptive_decrease,
             adaptive_interval,
             adaptive_queue_high_ms,
+            adaptive_queue_rise_ms,
+            adaptive_queue_ceiling_ms,
             adaptive_ewma_alpha,
             adaptive_retx_tolerance,
             normal_keyframe_frames,
@@ -1623,6 +2072,7 @@ impl Gfx {
             adaptive_min_fps_interval,
             blank_recovery_enabled,
             blank_params,
+            legacy_hold,
             consecutive_blank_drops: Arc::new(AtomicU32::new(0)),
             link_rtt_ms,
             adaptive_seed_rtt_ms,
@@ -1671,6 +2121,49 @@ impl Gfx {
         );
     }
 
+    /// Called by capture when [`Self::submit_bgra`] returned `Ok(false)`:
+    /// true means "do not send this frame as a legacy bitmap update" because
+    /// the connection is still negotiating EGFX (see [`hold_legacy_for_egfx`]).
+    /// Capture keeps the frame and submits it again when EGFX is ready, or
+    /// sends it as legacy when this returns false later.
+    ///
+    /// `capture_started` is when this connection's capture stream started:
+    /// the hold is measured from it, not from state on the shared ctx, which a
+    /// takeover candidate can replace while the live session still captures.
+    pub fn hold_legacy(&self, capture_started: Instant) -> bool {
+        if self.legacy_hold.is_zero() {
+            return false;
+        }
+        let mut guard = self.ctx.lock().unwrap();
+        let Some(ctx) = guard.as_mut() else {
+            return false;
+        };
+        if ctx.is_ready {
+            // EGFX became ready after `submit_bgra` returned `Ok(false)` for
+            // this frame: do not send a legacy picture now; capture submits
+            // its held frame to EGFX on the next loop.
+            return true;
+        }
+        let held_for = capture_started.elapsed();
+        let declined = ctx.egfx_declined.load(Ordering::Relaxed);
+        let hold = hold_legacy_for_egfx(ctx.egfx_ever_ready, declined, held_for, self.legacy_hold);
+        if hold && !ctx.legacy_hold_logged {
+            ctx.legacy_hold_logged = true;
+            debug!(
+                limit_ms = self.legacy_hold.as_millis() as u64,
+                "EGFX not ready yet — holding back legacy bitmap updates"
+            );
+        }
+        if !hold && !ctx.egfx_ever_ready && !ctx.legacy_hold_expired_logged {
+            ctx.legacy_hold_expired_logged = true;
+            info!(
+                held_ms = held_for.as_millis() as u64,
+                declined, "EGFX did not become ready — sending legacy bitmap updates"
+            );
+        }
+        hold
+    }
+
     /// Feed one full-frame BGRA buffer. Never blocks on the encoder.
     ///
     /// `request_keyframe` asks for the next encoded frame to be a forced IDR —
@@ -1679,15 +2172,43 @@ impl Gfx {
     /// some clients (mstsc) only resolve cleanly at the next periodic IDR (the
     /// "takes a while to come to front" lag); a forced IDR lands them at once.
     ///
-    /// `Submitted` means queued for encoding; `Deferred` means EGFX owns the
-    /// display but skipped this capture. Only `Inactive` permits legacy bitmap
-    /// fallback. Trailing-frame callers must retry a deferred submission.
+    /// `flush` marks a trailing flush re-submit (`--flush-frames`): the last
+    /// frame sent again on a static screen so mstsc presents it. Those are
+    /// exempt from the TCP ack-lag cap (see [`ack_lag_limit`]).
+    ///
+    /// Returns `Ok(true)` when EGFX is the active display path (so the caller
+    /// should suppress legacy BitmapUpdates for this frame — even if this
+    /// particular frame was skipped for backpressure or isn't encoded yet).
+    /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
+    /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
     pub fn submit_bgra(
         &self,
         bgra: &[u8],
         stride: usize,
         request_keyframe: bool,
-    ) -> Result<FrameSubmission> {
+        flush: bool,
+    ) -> Result<bool> {
+        self.submit_frame(FrameInput::Bgra { bgra, stride }, request_keyframe, flush)
+    }
+
+    /// [`Self::submit_bgra`] for a capture-owned full-range NV12 pixel buffer
+    /// (`--capture-nv12`): VideoToolbox encodes it as-is, with no CPU colour
+    /// conversion and no copy. Same return contract.
+    pub fn submit_nv12(
+        &self,
+        pixel_buffer: &screencapturekit::cv::CVPixelBuffer,
+        request_keyframe: bool,
+        flush: bool,
+    ) -> Result<bool> {
+        self.submit_frame(FrameInput::Nv12(pixel_buffer), request_keyframe, flush)
+    }
+
+    fn submit_frame(
+        &self,
+        frame: FrameInput<'_>,
+        request_keyframe: bool,
+        flush: bool,
+    ) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -1699,13 +2220,13 @@ impl Gfx {
         // `server_handle`, which is never taken while holding ctx — the ship/ack
         // lock-order invariant). The decision extracts what the action needs here.
         let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
-        {
+        let force_keyframe = {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
-                return Ok(FrameSubmission::Inactive); // no active connection
+                return Ok(false); // no active connection
             };
             if !ctx.is_ready {
-                return Ok(FrameSubmission::Inactive); // channel not negotiated yet (or non-EGFX client)
+                return Ok(false); // channel not negotiated yet (or non-EGFX client)
             }
             // Arm the keyframe BEFORE the throttle check so a large change that
             // lands on a dropped frame still forces the IDR on the next encoded
@@ -1823,9 +2344,22 @@ impl Gfx {
                 // unreliable (a rendering ZeroTier client reports zero), so the
                 // evidence window scales with RTT and past `max_rtt_ms` the
                 // drop lever is withheld entirely for this connection.
-                let gate = blank_rtt_gate(ctx.link_rtt_ms, self.blank_params.max_rtt_ms);
+                let gate = blank_detector_gate(
+                    ctx.newer_egfx_client,
+                    ctx.link_rtt_ms,
+                    self.blank_params.max_rtt_ms,
+                );
                 if !ctx.blank_gate_logged {
                     match gate {
+                        None if ctx.newer_egfx_client => {
+                            ctx.blank_gate_logged = true;
+                            info!(
+                                "blank recovery DISARMED for this connection — the client advertises EGFX \
+                                 capability sets newer than Windows App for macOS does (Windows App on \
+                                 Windows or iOS), and reports zero decode+render time while presenting, so \
+                                 the zero-render-time signal can't tell a blank from a working session (#269)"
+                            );
+                        }
                         None => {
                             ctx.blank_gate_logged = true;
                             info!(
@@ -1864,6 +2398,11 @@ impl Gfx {
                         // alive and decoding our post-attempt IDR/flush frames
                         // (feeds the post-attempt heal-confirmation deadline).
                         ctx.last_ack_advance_at > ctx.last_blank_recovery_at,
+                        post_attempt_zero_span(
+                            &ctx.post_attempt_zero_at,
+                            p.post_attempt_burst_zeros,
+                            now,
+                        ),
                         p,
                     )
                 }) {
@@ -1908,6 +2447,9 @@ impl Gfx {
                         let window_zeros = ctx.qoe.zeros_since_reset;
                         let window_best_run = ctx.qoe.nonzero_max_since_reset;
                         ctx.qoe.reset_streaks();
+                        // A new evidence window: the next attempt needs its
+                        // own burst (see `post_attempt_burst_zeros`).
+                        ctx.post_attempt_zero_at.clear();
                         let (w, h) = ctx.dims;
                         if action == BlankAction::Reactivate {
                             // The surface survives the core reactivation, so the
@@ -1956,6 +2498,28 @@ impl Gfx {
                     }
                 }
             }
+            // Manual-resync drain (the Ctrl+Alt+Shift+R hotkey): hold new
+            // captures until the client's decoder has emptied, then let the
+            // armed IDR through (see `resync_drain_step`). Dropping before
+            // encode keeps the reference chain valid, and `need_keyframe`
+            // persists across the drop. No-op unless the hotkey was pressed.
+            {
+                let now = Instant::now();
+                let shipped = ctx.last_shipped_frame_id.load(Ordering::Relaxed);
+                let acked = ctx.last_acked_frame_id.load(Ordering::Relaxed);
+                match resync_drain_step(ctx.resync_drain_until, now, shipped, acked) {
+                    ResyncDrain::Off => {}
+                    ResyncDrain::Hold => return Ok(true),
+                    ResyncDrain::Done => {
+                        ctx.resync_drain_until = None;
+                        info!(
+                            unacked_frames = shipped.saturating_sub(acked),
+                            "manual A/V resync: client decoder drained (or the cap ran out) — \
+                             shipping the IDR"
+                        );
+                    }
+                }
+            }
             // P2b frame-rate floor: once the adaptive controller has cut the bitrate to
             // its floor AND the link is still congested, lowering quality can't help —
             // so shed FRAMES. Cap the effective fps (drop captures arriving within
@@ -1981,10 +2545,7 @@ impl Gfx {
                     trace!(
                         "EGFX at bitrate floor + congested; dropping capture (frame-rate floor)"
                     );
-                    if let Some(stats) = crate::stats::global() {
-                        stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Ok(FrameSubmission::Deferred);
+                    return Ok(true);
                 }
                 if at_floor && ctx.adaptive_congested {
                     ctx.last_floor_fps_pass = now;
@@ -2003,48 +2564,81 @@ impl Gfx {
                 .load(Ordering::Relaxed)
                 .saturating_sub(ctx.shipped.load(Ordering::Relaxed));
             if outstanding >= u64::from(self.max_in_flight) {
+                if let Some(stats) = crate::stats::global() {
+                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
+                }
                 trace!(
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
                 );
-                if let Some(stats) = crate::stats::global() {
-                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(FrameSubmission::Deferred); // still the active path; just dropped this frame
+                return Ok(true); // still the active path; just dropped this frame
             }
-            // Reduce work before encode when the client is behind. Keep
-            // sending at a limited cadence so the client can drain its decoder.
-            let on_udp = self.egfx_on_udp.load(Ordering::Relaxed);
-            if (on_udp || self.tcp_video_backpressure) && ctx.egfx_acks_seen && !ctx.acks_suspended
-            {
+            // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
+            // socket backpressure to pace us to the client (unlike TCP), so without
+            // this the server floods frames and the client's DECODE queue runs away
+            // → frozen video while audio (on TCP) keeps playing. When the client's
+            // decode backlog (shipped − decoded, from FrameAcknowledge) exceeds the
+            // threshold, drop this capture so the client catches up — video degrades
+            // to choppy-but-live instead of freezing. Always on for the UDP tunnel;
+            // on TCP only with --h264-max-unacked-frames (default off, so the TCP
+            // push path stays byte-identical). TCP's socket backpressure doesn't
+            // help when the network is fine but the client's own decode/present
+            // loop runs at about the rate we send: every burst then leaves a
+            // backlog that drains at the small rate difference, which measured as
+            // 200–600 ms of lag for 10–20 s at a time (Windows App, 3456×2168).
+            // Flush re-submits are exempt on TCP (see `ack_lag_limit`).
+            // Gated to acks actually flowing (a suspended-ack client falls back to
+            // the submitted−shipped throttle above), and to having seen ≥1 ack (no
+            // cold-start false drop). Dropping before encode keeps the H.264
+            // reference chain valid.
+            let lag_limit = ack_lag_limit(
+                self.egfx_on_udp.load(Ordering::Relaxed),
+                self.max_frame_lag,
+                self.tcp_max_frame_lag,
+                flush,
+            );
+            if lag_limit > 0 && ctx.egfx_acks_seen && !ctx.acks_suspended {
                 let lag = ctx
                     .last_shipped_frame_id
                     .load(Ordering::Relaxed)
                     .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
-                let now = Instant::now();
-                let interval = if on_udp {
-                    (lag > self.max_frame_lag).then_some(UDP_THROTTLE_FLOOR)
-                } else {
-                    tcp_decode_backlog(lag, ctx.queue_delay_ms, now.duration_since(ctx.last_ack_at))
-                        .then_some(TCP_THROTTLE_INTERVAL)
-                };
-                if let Some(interval) = interval {
-                    if now.duration_since(ctx.last_throttle_ship) < interval {
-                        trace!(lag, on_udp, "EGFX ACK backlog; deferring capture");
-                        if let Some(stats) = crate::stats::global() {
-                            stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
-                            if !on_udp {
+                if lag > lag_limit {
+                    // Client is behind. Drop MOST captures so it catches up — but
+                    // keep a low-rate trickle, never zero: mstsc only presents (and
+                    // thus frame-acks) an H.264 frame once a couple more arrive
+                    // behind it, so dropping to zero means it never acks the
+                    // in-flight frames, `lag` never falls back under the threshold,
+                    // and the video freezes PERMANENTLY (recovers only on
+                    // reconnect). The trickle keeps trailing frames flowing so the
+                    // presentation buffer drains and the window reopens. Dropping
+                    // before encode keeps the H.264 reference chain valid (the
+                    // encoder never sees the dropped frames, so the next encoded
+                    // frame is a valid P-frame from the client's last reference).
+                    let now = Instant::now();
+                    if now.duration_since(ctx.last_throttle_ship) < UDP_THROTTLE_FLOOR {
+                        if !self.egfx_on_udp.load(Ordering::Relaxed) {
+                            if let Some(stats) = crate::stats::global() {
                                 stats
                                     .encode_tcp_backpressure
                                     .fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        return Ok(FrameSubmission::Deferred);
+                        trace!(
+                            lag,
+                            "EGFX client ack lag high; dropping capture (trickle floor)"
+                        );
+                        return Ok(true);
                     }
                     ctx.last_throttle_ship = now;
+                    trace!(
+                        lag,
+                        "EGFX client ack lag high; letting a trickle frame through to drain client buffer"
+                    );
+                    // fall through: ship this one to keep the client presenting/acking
                 }
             }
-        }
+            std::mem::replace(&mut ctx.need_keyframe, false)
+        };
 
         // Run the armed recovery action now that ctx is released (lock order).
         // This capture is dropped either way: a remap re-arms `need_keyframe`,
@@ -2060,10 +2654,7 @@ impl Gfx {
             if let Err(e) = result {
                 warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
             }
-            if let Some(stats) = crate::stats::global() {
-                stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
-            }
-            return Ok(FrameSubmission::Deferred);
+            return Ok(true);
         }
 
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
@@ -2071,10 +2662,7 @@ impl Gfx {
         {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
-                if let Some(stats) = crate::stats::global() {
-                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(FrameSubmission::Deferred);
+                return Ok(true);
             };
             // Congestion-responsive control (P1 bitrate + P2a IDR backoff): compute
             // the adjustments (mutates ctx adaptive state, may set need_keyframe)
@@ -2082,39 +2670,34 @@ impl Gfx {
             // adaptive is enabled AND EGFX is on a UDP tunnel.
             let adaptive = self.adaptive_bitrate_step(ctx);
             let Some(encoder) = ctx.encoder.as_mut() else {
-                if let Some(stats) = crate::stats::global() {
-                    stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(FrameSubmission::Deferred);
+                return Ok(true);
             };
-            let resync_requested = ctx.encoder_resync.swap(false, Ordering::Relaxed);
-            let force_keyframe = std::mem::take(&mut ctx.need_keyframe) || resync_requested;
             if let Some(bps) = adaptive.bitrate_bps {
                 if let Err(e) = encoder.set_bitrate(bps) {
                     trace!(error = ?e, bps, "adaptive set_bitrate failed");
                 }
             }
             if let Some(frames) = adaptive.keyframe_frames {
-                if let Err(e) = encoder.set_keyframe_interval(frames) {
-                    trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
-                }
+                encoder.set_keyframe_interval(frames);
             }
-            if let Err(error) = encoder.encode_bgra(bgra, stride, force_keyframe) {
-                // The EGFX channel still owns this surface. Let capture retry
-                // the retained image with a keyframe instead of sending a bitmap.
+            if let Err(error) = encoder.submit(frame, force_keyframe) {
                 ctx.need_keyframe = true;
                 if let Some(stats) = crate::stats::global() {
                     stats.encode_submit_errors.fetch_add(1, Ordering::Relaxed);
                 }
-                warn!(%error, "EGFX encoder submission failed; retrying with a keyframe");
-                return Ok(FrameSubmission::Deferred);
+                return Err(error);
             }
-            ctx.submitted.fetch_add(1, Ordering::Relaxed);
             if let Some(stats) = crate::stats::global() {
                 stats.encode_submitted.fetch_add(1, Ordering::Relaxed);
+                if flush {
+                    stats
+                        .encode_retained_submitted
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
+            ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(FrameSubmission::Submitted)
+        Ok(true)
     }
 
     /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
@@ -2176,6 +2759,10 @@ impl Gfx {
             }
             // Stale UDP-side smoothing state doesn't apply to the fresh TCP path.
             ctx.adaptive_delay_ewma = 0.0;
+            ctx.adaptive_delay_samples.clear();
+            ctx.adaptive_last_decrease_at = None;
+            ctx.adaptive_congestion_bps = None;
+            ctx.adaptive_in_decrease_episode = false;
             ctx.adaptive_congested = false;
         }
         ctx.adaptive_on_udp = on_udp;
@@ -2250,7 +2837,12 @@ impl Gfx {
         if signal_usable {
             ctx.adaptive_delay_ewma = self.adaptive_ewma_alpha * sample_ms
                 + (1.0 - self.adaptive_ewma_alpha) * ctx.adaptive_delay_ewma;
+            if ctx.adaptive_delay_samples.len() >= 2 * DELAY_TREND_WINDOW {
+                ctx.adaptive_delay_samples.pop_front();
+            }
+            ctx.adaptive_delay_samples.push_back(sample_ms);
         }
+        let trend = delay_trend(&ctx.adaptive_delay_samples, self.adaptive_queue_rise_ms);
         // Per-interval visibility even when the target doesn't change (the
         // adjusted-line below only logs on a change; Hold periods were opaque).
         trace!(
@@ -2259,14 +2851,18 @@ impl Gfx {
             ack_lag,
             acks_usable,
             distress,
+            ?trend,
             target_bps = ctx.adaptive_target_bps,
             "EGFX adaptive controller interval"
         );
         let high = self.adaptive_queue_high_ms;
+        let ceiling_ms = self.adaptive_queue_ceiling_ms;
         let congested = congested_hysteresis(
             ctx.adaptive_delay_ewma,
             high,
             high * 0.5, // exit threshold (hysteresis low mark)
+            ceiling_ms,
+            trend,
             retransmit_lossy,
             signal_usable,
             ctx.adaptive_congested,
@@ -2279,28 +2875,61 @@ impl Gfx {
         let action = rate_action(
             ctx.adaptive_delay_ewma,
             high,
+            ceiling_ms,
+            trend,
             retransmit_lossy,
             signal_usable,
             congested,
         );
+        // Let each trend-driven cut take effect before the next (see
+        // `TREND_DECREASE_SPACING`): hold instead.
+        let action = if action == RateAction::Decrease
+            && hold_trend_decrease(
+                retransmit_lossy,
+                ctx.adaptive_delay_ewma,
+                ceiling_ms,
+                trend,
+                ctx.adaptive_last_decrease_at
+                    .map(|t| now.saturating_duration_since(t)),
+                TREND_DECREASE_SPACING,
+            ) {
+            RateAction::Hold
+        } else {
+            action
+        };
         let new_target = match action {
             RateAction::Hold => ctx.adaptive_target_bps,
-            RateAction::Decrease => aimd_bitrate(
-                ctx.adaptive_target_bps,
-                1,
-                self.adaptive_floor_bps,
-                ceiling,
-                self.adaptive_increase_bps,
-                self.adaptive_decrease,
-            ),
-            RateAction::Increase => aimd_bitrate(
-                ctx.adaptive_target_bps,
-                0,
-                self.adaptive_floor_bps,
-                ceiling,
-                self.adaptive_increase_bps,
-                self.adaptive_decrease,
-            ),
+            RateAction::Decrease => {
+                note_decrease(
+                    &mut ctx.adaptive_in_decrease_episode,
+                    &mut ctx.adaptive_congestion_bps,
+                    ctx.adaptive_target_bps,
+                );
+                ctx.adaptive_last_decrease_at = Some(now);
+                aimd_bitrate(
+                    ctx.adaptive_target_bps,
+                    1,
+                    self.adaptive_floor_bps,
+                    ceiling,
+                    self.adaptive_increase_bps,
+                    self.adaptive_decrease,
+                )
+            }
+            RateAction::Increase => {
+                ctx.adaptive_in_decrease_episode = false;
+                aimd_bitrate(
+                    ctx.adaptive_target_bps,
+                    0,
+                    self.adaptive_floor_bps,
+                    ceiling,
+                    increase_step(
+                        ctx.adaptive_target_bps,
+                        ctx.adaptive_congestion_bps,
+                        self.adaptive_increase_bps,
+                    ),
+                    self.adaptive_decrease,
+                )
+            }
         };
         if new_target != ctx.adaptive_target_bps {
             let prev = ctx.adaptive_target_bps;
@@ -2311,6 +2940,7 @@ impl Gfx {
                 ewma_queue_ms = ctx.adaptive_delay_ewma,
                 ack_lag,
                 retransmit_delta,
+                ?trend,
                 ?action,
                 prev_bps = prev,
                 new_bps = new_target,
@@ -2357,245 +2987,80 @@ impl Gfx {
             s.rtt_ms
                 .store(self.link_rtt_ms.load(Ordering::Relaxed), Ordering::Relaxed);
             s.fps.store(self.fps, Ordering::Relaxed);
-            s.frames_sent.store(
-                ctx.last_shipped_frame_id.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
         }
         actions
     }
 
     /// Ship loop for the push pipeline: owns VideoToolbox's output receiver and
     /// ships each encoded frame the instant it arrives, fully decoupled from the
-    /// capture tick. Transfers completion tokens to the event loop so the
-    /// capture throttle includes queued and writing frames. Exits when the
+    /// capture tick. Bumps `shipped` per frame so the capture thread's
+    /// drop-to-latest throttle can bound the pipeline depth. Exits when the
     /// channel closes (encoder dropped on connection teardown).
     fn ship_loop(
         &self,
         rx: std::sync::mpsc::Receiver<EncodeOutput>,
         shipped: Arc<AtomicU64>,
-        resync: Arc<AtomicBool>,
+        avc444: bool,
     ) {
-        self.ship_loop_with_dispatch(rx, shipped, resync, |frames, completion| {
-            self.ship_frames(frames, completion)
-        });
-    }
-
-    fn ship_loop_with_dispatch(
-        &self,
-        rx: std::sync::mpsc::Receiver<EncodeOutput>,
-        shipped: Arc<AtomicU64>,
-        resync: Arc<AtomicBool>,
-        mut dispatch: impl FnMut(&mut Vec<EncodedFrame>, EgfxFrameCompletion) -> Result<()>,
-    ) {
-        // Reuse the batch allocation for the lifetime of the connection. VT
-        // normally yields one frame at a time, but can deliver a short burst
-        // after startup or a keyframe.
-        let mut frames = Vec::with_capacity(4);
-        let mut awaiting_keyframe = false;
+        let mut needs_idr = true;
+        let mut main_view = None;
         while let Ok(output) = rx.recv() {
-            for output in std::iter::once(output).chain(rx.try_iter()) {
-                match output {
-                    EncodeOutput::Picture(frame) => {
-                        if awaiting_keyframe && !frame.is_keyframe {
-                            shipped.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            awaiting_keyframe = false;
-                            frames.push(frame);
-                        }
-                    }
-                    EncodeOutput::Dropped { .. } => {
+            // AVC444 uses an even/odd PTS pair in one H.264 stream.
+            let (main, auxiliary) = if avc444 {
+                if output.pts() & 1 == 0 {
+                    if main_view.replace(output).is_some() {
                         shipped.fetch_add(1, Ordering::Relaxed);
-                        awaiting_keyframe = true;
-                        resync.store(true, Ordering::Relaxed);
+                        needs_idr = true;
                     }
+                    continue;
+                }
+                let main = main_view
+                    .take()
+                    .filter(|main| main.pts().wrapping_add(1) == output.pts());
+                (main, Some(output))
+            } else {
+                (Some(output), None)
+            };
+            let mut failed_dispatch = false;
+            match (main, auxiliary) {
+                (Some(EncodeOutput::Picture(frame)), None) if !needs_idr || frame.is_keyframe => {
+                    failed_dispatch = self
+                        .ship_frame(&frame, None, &shipped)
+                        .inspect_err(|error| warn!(?error, "EGFX AVC420 frame dispatch failed"))
+                        .is_err();
+                    needs_idr = failed_dispatch;
+                }
+                (Some(EncodeOutput::Picture(main)), Some(EncodeOutput::Picture(auxiliary)))
+                    if !needs_idr || (main.is_keyframe && auxiliary.is_keyframe) =>
+                {
+                    failed_dispatch = self
+                        .ship_frame(&main, Some(&auxiliary), &shipped)
+                        .inspect_err(|error| warn!(?error, "EGFX AVC444 frame dispatch failed"))
+                        .is_err();
+                    needs_idr = failed_dispatch;
+                }
+                _ => needs_idr = true,
+            }
+            if needs_idr {
+                if let Some(ctx) = self
+                    .ctx
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .filter(|ctx| Arc::ptr_eq(&ctx.shipped, &shipped))
+                {
+                    ctx.need_keyframe = true;
                 }
             }
-            if !frames.is_empty() {
-                let n = frames.len() as u64;
-                if let Err(e) = dispatch(&mut frames, tracked_completion(shipped.clone(), n)) {
-                    warn!(error = ?e, "EGFX ship_frames failed");
-                    if let Some(stats) = crate::stats::global() {
-                        stats.video_ship_errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                    awaiting_keyframe = true;
-                    resync.store(true, Ordering::Relaxed);
+            shipped.fetch_add(1, Ordering::Relaxed);
+            if let Some(stats) = crate::stats::global() {
+                stats.transport_retired.fetch_add(1, Ordering::Relaxed);
+                if failed_dispatch {
+                    stats.video_ship_errors.fetch_add(1, Ordering::Relaxed);
                 }
-                frames.clear();
             }
         }
         debug!("EGFX ship loop exiting (output channel closed)");
-    }
-
-    /// Pair adjacent main/auxiliary pictures from AVC444's single VideoToolbox
-    /// session and ship one AVC444 PDU per logical capture. MS-RDPEGFX requires
-    /// both pictures to form one continuous H.264 stream; even PTS values label
-    /// main pictures and the following odd PTS labels their auxiliary view.
-    /// Missing output is discarded and the next main picture is forced to IDR.
-    fn ship_loop_avc444(
-        &self,
-        rx: std::sync::mpsc::Receiver<EncodeOutput>,
-        shipped: Arc<AtomicU64>,
-        resync: Arc<AtomicBool>,
-    ) {
-        let mut pending_main: Option<EncodeOutput> = None;
-        while let Ok(output) = rx.recv() {
-            if output.pts() & 1 == 0 {
-                if pending_main.replace(output).is_some() {
-                    shipped.fetch_add(1, Ordering::Relaxed);
-                    resync.store(true, Ordering::Relaxed);
-                }
-                continue;
-            }
-            let Some(main) = pending_main.take() else {
-                shipped.fetch_add(1, Ordering::Relaxed);
-                resync.store(true, Ordering::Relaxed);
-                continue;
-            };
-            if main.pts().wrapping_add(1) != output.pts() {
-                shipped.fetch_add(2, Ordering::Relaxed);
-                resync.store(true, Ordering::Relaxed);
-                continue;
-            }
-            match (main, output) {
-                (EncodeOutput::Picture(main), EncodeOutput::Picture(auxiliary)) => {
-                    if let Err(error) = self.ship_avc444_pair(
-                        main,
-                        auxiliary,
-                        tracked_completion(shipped.clone(), 1),
-                    ) {
-                        warn!(?error, "EGFX AVC444 ship failed");
-                        resync.store(true, Ordering::Relaxed);
-                    }
-                }
-                _ => {
-                    // Retire the logical submission once, even if both views failed.
-                    shipped.fetch_add(1, Ordering::Relaxed);
-                    resync.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-        if pending_main.is_some() {
-            shipped.fetch_add(1, Ordering::Relaxed);
-        }
-        debug!("EGFX AVC444 ship loop exiting (output channel closed)");
-    }
-
-    fn ship_avc444_pair(
-        &self,
-        main: EncodedFrame,
-        auxiliary: EncodedFrame,
-        completion: EgfxFrameCompletion,
-    ) -> Result<()> {
-        let mut payload_bytes = 0;
-        let mut queued_frames = 0;
-        let (dvc_messages, egfx_channel_id, video_queued) = {
-            // Preserve the same lock order as the AVC420 ship path: copy the
-            // context data first, then release ctx before locking the server.
-            let (
-                surface_id,
-                width,
-                height,
-                epoch,
-                server_handle,
-                last_shipped,
-                ship_times,
-                video_queued,
-            ) = {
-                let mut guard = self.ctx.lock().unwrap();
-                let ctx = guard
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("EGFX AVC444: ctx vanished mid-submit"))?;
-                let surface_id = ctx
-                    .surface_id
-                    .ok_or_else(|| anyhow!("EGFX AVC444: no surface_id"))?;
-                let (width, height) = ctx.dims;
-                ctx.last_ship_at = Instant::now();
-                (
-                    surface_id,
-                    width,
-                    height,
-                    ctx.epoch,
-                    ctx.server_handle.clone(),
-                    ctx.last_shipped_frame_id.clone(),
-                    ctx.ship_times.clone(),
-                    ctx.video_queued.clone(),
-                )
-            };
-
-            let main_keyframe = main.is_keyframe;
-            let auxiliary_keyframe = auxiliary.is_keyframe;
-            // Keep AVC444 access units deliberately minimal. VideoToolbox may
-            // emit optional SEI/AUD/filler NALs; Microsoft decoders do not need
-            // them, and recovery-point SEI can reset the shared decoder between
-            // the main and auxiliary pictures. SPS/PPS and VCL NALs are enough.
-            let main_payload = self.frame_payload_avc444(main);
-            let auxiliary_payload = self.frame_payload_avc444(auxiliary);
-            let region = || Avc420Region::full_frame(width, height, 22);
-            let main_regions = [region()];
-            let auxiliary_regions = [region()];
-            let ts_ms =
-                u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
-
-            let mut server = server_handle.lock().unwrap();
-            let egfx_channel_id = server
-                .channel_id()
-                .ok_or_else(|| anyhow!("EGFX AVC444: channel_id not assigned"))?;
-            let sent = server.send_avc444_frame(
-                surface_id,
-                &main_payload,
-                &main_regions,
-                Some(&auxiliary_payload),
-                Some(&auxiliary_regions),
-                ts_ms,
-            );
-            if let Some(frame_id) = sent {
-                queued_frames += 1;
-                payload_bytes += (main_payload.len() + auxiliary_payload.len()) as u64;
-                last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
-                ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
-                    (u64::from(frame_id), Instant::now());
-                if main_keyframe || auxiliary_keyframe {
-                    debug!(
-                        frame_id,
-                        main_keyframe,
-                        auxiliary_keyframe,
-                        main_bytes = main_payload.len(),
-                        auxiliary_bytes = auxiliary_payload.len(),
-                        "EGFX shipped AVC444 frame"
-                    );
-                }
-            } else {
-                debug!("send_avc444_frame returned None");
-            }
-            (server.drain_output(), egfx_channel_id, video_queued)
-        };
-
-        if dvc_messages.is_empty() {
-            return Ok(());
-        }
-        let svc_messages =
-            encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
-                .map_err(|error| anyhow!("encode_dvc_messages failed: {error}"))?;
-        let sender = self
-            .sender
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow!("EGFX AVC444: server-event sender not set"))?;
-        sender
-            .send(ServerEvent::Egfx(EgfxServerMessage::SendTrackedMessages {
-                messages: svc_messages,
-                completion,
-            }))
-            .map_err(|_| anyhow!("EGFX AVC444: ServerEvent send failed (event loop closed)"))?;
-        if queued_frames != 0 {
-            video_queued.store(true, Ordering::Relaxed);
-        }
-        if let Some(stats) = crate::stats::global() {
-            stats.record_video_queued(queued_frames, payload_bytes);
-        }
-        Ok(())
     }
 
     /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
@@ -2652,81 +3117,59 @@ impl Gfx {
         // encoder (re)build can never disagree with an existing surface.
         let (width, height) = ctx.dims;
         if ctx.encoder.is_none() {
+            // Pass actual dims; VideoToolbox pads to 16-px macroblocks
+            // internally and encodes the crop in the SPS, so the client
+            // decodes back to actual dims.
             // Start at the connection's current adaptive target, not the raw
             // ceiling: equal to the ceiling unless the RTT seed lowered it
             // (slow link) or the controller already adjusted it (encoder
             // rebuild mid-connection).
-            // Fresh throttle counters for this connection.
-            // Old queued batches may finish after an encoder rebuild. Give the
-            // new generation separate counters so those completions cannot
-            // release its slots or hide its backlog.
-            ctx.submitted = Arc::new(AtomicU64::new(0));
-            ctx.shipped = Arc::new(AtomicU64::new(0));
-            ctx.encoder_resync.store(false, Ordering::Relaxed);
-
-            if self.avc444_enabled && ctx.client_supports_avc444 {
-                // Both streams use 16-aligned H.264 frames internally; the EGFX
-                // region remains the actual visible desktop dimensions.
-                let mut encoder = Avc444Encoder::new(
+            let use_avc444 = self.avc444_enabled && ctx.client_supports_avc444;
+            let mut encoder = if use_avc444 {
+                let encoder = Avc444Encoder::new(
                     width,
                     height,
                     self.fps,
                     ctx.adaptive_target_bps,
                     self.keyframe_secs,
                 )?;
-                let all_intra = encoder.all_intra();
-                let rx = encoder
-                    .take_receiver()
-                    .ok_or_else(|| anyhow!("EGFX: AVC444 receiver already taken"))?;
-                ctx.encoder = Some(ActiveEncoder::Avc444(Box::new(encoder)));
-                let gfx = self.clone();
-                let shipped = ctx.shipped.clone();
-                let resync = ctx.encoder_resync.clone();
-                std::thread::Builder::new()
-                    .name("egfx-avc444-ship".into())
-                    .spawn(move || {
-                        gfx.ship_loop_avc444(rx, shipped, resync);
-                    })
-                    .map_err(|e| anyhow!("EGFX: failed to spawn AVC444 ship thread: {e}"))?;
                 info!(
-                    visible_w = width,
-                    visible_h = height,
-                    all_intra,
-                    "EGFX AVC444 single continuous VideoToolbox stream initialized (4:4:4 active)"
+                    all_intra = encoder.all_intra(),
+                    "EGFX AVC444 encoder initialized"
                 );
+                VideoEncoder::Avc444(Box::new(encoder))
             } else {
-                // Pass actual dims; VideoToolbox pads macroblocks internally and
-                // writes the visible crop in SPS.
-                let mut encoder = Encoder::new(
+                VideoEncoder::Avc420(Encoder::new(
                     width,
                     height,
                     self.fps,
                     ctx.adaptive_target_bps,
                     self.keyframe_secs,
-                )?;
-                let rx = encoder
-                    .take_receiver()
-                    .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
-                ctx.encoder = Some(ActiveEncoder::Avc420(encoder));
-                let gfx = self.clone();
-                let shipped = ctx.shipped.clone();
-                let resync = ctx.encoder_resync.clone();
-                std::thread::Builder::new()
-                    .name("egfx-ship".into())
-                    .spawn(move || gfx.ship_loop(rx, shipped, resync))
-                    .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
-                if self.avc444_enabled {
-                    info!(
-                        "EGFX client has AVC420 but no positive V10+ AVC signal — using compatible AVC420 fallback"
-                    );
-                } else {
-                    info!("EGFX VideoToolbox encoder initialized + ship thread started");
-                }
-            }
+                )?)
+            };
+            // Hand VT's output channel to a dedicated ship thread (push model),
+            // so encoded frames are sent the instant they're ready, off the
+            // capture thread. The thread exits when the encoder is dropped (on
+            // connection teardown) and its sender closes.
+            let rx = encoder
+                .take_receiver()
+                .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
+            ctx.encoder = Some(encoder);
+            // Fresh throttle counters for this connection.
+            ctx.submitted.store(0, Ordering::Relaxed);
+            ctx.shipped = Arc::new(AtomicU64::new(0));
+            let gfx = self.clone();
+            let shipped = ctx.shipped.clone();
+            std::thread::Builder::new()
+                .name("egfx-ship".into())
+                .spawn(move || gfx.ship_loop(rx, shipped, use_avc444))
+                .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
+            info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
         // stats: publish the per-connection baseline (no-op unless --stats-endpoint).
         if let Some(s) = crate::stats::global() {
             let (w, h) = ctx.dims;
+            s.ack_samples.store(0, Ordering::Relaxed);
             s.video_generation.fetch_add(1, Ordering::Relaxed);
             s.connected.store(true, Ordering::Relaxed);
             s.width.store(u32::from(w), Ordering::Relaxed);
@@ -2816,6 +3259,25 @@ impl Gfx {
         Ok(())
     }
 
+    /// Whether this connection's H.264 pipeline is up.
+    pub(crate) fn pipeline_ready(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_ready)
+    }
+
+    /// Whether a client is connected whose graphics pipeline is still being
+    /// negotiated: neither ready nor declined.
+    pub(crate) fn pipeline_pending(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| !ctx.is_ready && !ctx.egfx_declined.load(Ordering::Relaxed))
+    }
+
     /// Live client-driven resize (MS-RDPEDISP monitor layout — the client
     /// resized its window) for an active EGFX/H.264 session. Called by the
     /// capture loop right before it emits the `DisplayUpdate::Resize` that
@@ -2844,10 +3306,6 @@ impl Gfx {
     /// a graphics reset — the same position it occupies on every fresh
     /// connection.
     pub(crate) fn reset_for_live_resize(&self) {
-        if let Some(stats) = crate::stats::global() {
-            stats.end_video_session();
-        }
-
         let mut guard = self.ctx.lock().unwrap();
         if let Some(ctx) = guard.as_mut() {
             // Order matters only in that both must be cleared before the
@@ -2857,21 +3315,9 @@ impl Gfx {
             // encoder and resets the throttle counters).
             ctx.encoder = None;
             ctx.surface_id = None;
-            ctx.video_queued = Arc::new(AtomicBool::new(false));
             ctx.need_keyframe = true;
-            info!(
-                "EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size"
-            );
+            info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
         }
-    }
-
-    /// Whether this surface has queued an encoded frame for the client.
-    pub(crate) fn has_queued_video(&self) -> bool {
-        self.ctx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|ctx| ctx.video_queued.load(Ordering::Relaxed))
     }
 
     /// EXPERIMENTAL blank-recovery — request a bare core
@@ -2897,7 +3343,7 @@ impl Gfx {
     }
 
     /// Manual A/V resync (the `Ctrl+Alt+Shift+R` hotkey — see `input.rs` and the
-    /// `crate::RESYNC_VIDEO` wakeup). Arms a forced IDR keyframe so the next frame
+    /// `crate::RESYNC_VIDEO` flag). Arms a forced IDR keyframe so the next frame
     /// is a clean, self-contained repaint — enough to recover a stale/idle-blanked
     /// mstsc presentation without the heavyweight core Deactivation–Reactivation,
     /// which on the `--virtual-display`/`--capture-primary` headless path cascades
@@ -2905,14 +3351,23 @@ impl Gfx {
     /// live-resize surface reset → a headless re-capture — the visible reconnect
     /// flicker). If a plain IDR turns out not to un-blank the surface-retention
     /// case on some client, [`request_reactivation`] is the heavier escalation.
-    /// `capture.rs` calls this when it receives the wakeup.
+    /// `capture.rs` calls this when it observes the flag.
+    ///
+    /// Since 2026-11-12 it first DRAINS the client: new video is held until
+    /// the client has acknowledged everything already shipped (at most
+    /// [`RESYNC_DRAIN_MAX`]), so the IDR doesn't queue behind a video backlog.
+    /// See [`resync_drain_step`].
     pub(crate) fn force_keyframe(&self) {
         if let Ok(mut guard) = self.ctx.lock() {
             if let Some(ctx) = guard.as_mut() {
                 ctx.need_keyframe = true;
+                ctx.resync_drain_until = Some(Instant::now() + RESYNC_DRAIN_MAX);
             }
         }
-        info!("manual A/V resync (Ctrl+Alt+Shift+R): forcing an IDR keyframe");
+        info!(
+            "manual A/V resync (Ctrl+Alt+Shift+R): draining the client's video queue, then \
+             forcing an IDR keyframe"
+        );
     }
 
     /// Heavier manual-resync escalation: request the same bare core
@@ -2980,15 +3435,13 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(
+    fn ship_frame(
         &self,
-        frames: &mut Vec<EncodedFrame>,
-        completion: EgfxFrameCompletion,
+        f: &EncodedFrame,
+        auxiliary: Option<&EncodedFrame>,
+        shipped: &Arc<AtomicU64>,
     ) -> Result<()> {
-        let expected_frames = frames.len() as u64;
-        let mut payload_bytes = 0;
-        let mut queued_frames = 0;
-        let (dvc_messages, egfx_channel_id, video_queued) = {
+        let (dvc_messages, egfx_channel_id, payload_len) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
             // (`GfxDvcBridge::process` → `GraphicsPipelineServer::process` →
@@ -3001,20 +3454,12 @@ impl Gfx {
             // few seconds" stall, far more likely once acks ride the UDP tunnel).
             // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
             // lock order consistent (server_handle is never nested under ctx).
-            let (
-                surface_id,
-                width,
-                height,
-                epoch,
-                server_handle,
-                last_shipped,
-                ship_times,
-                video_queued,
-            ) = {
+            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let ctx = guard
                     .as_mut()
-                    .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
+                    .filter(|ctx| Arc::ptr_eq(&ctx.shipped, shipped))
+                    .ok_or_else(|| anyhow!("EGFX: encoder belongs to an inactive connection"))?;
                 let surface_id = ctx
                     .surface_id
                     .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
@@ -3034,7 +3479,6 @@ impl Gfx {
                     ctx.server_handle.clone(),
                     ctx.last_shipped_frame_id.clone(),
                     ctx.ship_times.clone(),
-                    ctx.video_queued.clone(),
                 )
             };
 
@@ -3044,18 +3488,25 @@ impl Gfx {
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
-            // Drain instead of borrowing so frame_payload can move the encoded
-            // allocation straight onto the wire. The Vec keeps its capacity
-            // for the next batch in ship_loop.
-            for f in frames.drain(..) {
-                // Region = full actual frame, exclusive right/bottom bounds. QP 22 /
+            let payload_len = {
+                // Region = full actual frame, inclusive bounds. QP 22 /
                 // quality 100 are first-light defaults; tuned in M3. Rebuilt
                 // per frame because `Avc420Region` isn't `Copy`.
-                let region = Avc420Region::full_frame(width, height, 22);
-                let is_keyframe = f.is_keyframe;
-                let ps_count = f.parameter_sets.len();
-                let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                let payload = self.frame_payload(f);
+                let region = Avc420Region {
+                    left: 0,
+                    top: 0,
+                    right: width.saturating_sub(1),
+                    bottom: height.saturating_sub(1),
+                    quantization_parameter: 22,
+                    quality: 100,
+                };
+                let (payload, chroma) = match auxiliary {
+                    Some(aux) => (
+                        self.frame_payload_avc444(f),
+                        Some(self.frame_payload_avc444(aux)),
+                    ),
+                    None => (self.frame_payload(f), None),
+                };
                 let ts_ms =
                     u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
                 // Diagnostic for the reconnect-blank investigation: keyframes
@@ -3065,20 +3516,35 @@ impl Gfx {
                 // after "EGFX surface created" is a P-frame (keyframe=false /
                 // param_sets=0), the new client has no reference to paint and
                 // the surface stays blank.
-                let sent = server.send_avc420_frame(surface_id, &payload, &[region], ts_ms);
+                let ps_count = f.parameter_sets.len();
+                let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
+                let regions = [region];
+                let sent = match chroma.as_deref() {
+                    Some(chroma) => server.send_avc444_frame(
+                        surface_id,
+                        &payload,
+                        &regions,
+                        Some(chroma),
+                        Some(&regions),
+                        ts_ms,
+                    ),
+                    None => server.send_avc420_frame(surface_id, &payload, &regions, ts_ms),
+                };
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
                 // round trip for the queue-delay congestion signal.
                 if let Some(frame_id) = sent {
-                    queued_frames += 1;
-                    payload_bytes += payload.len() as u64;
                     last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
+                    // stats: no-op unless --stats-endpoint.
+                    if let Some(s) = crate::stats::global() {
+                        s.frames_sent.store(u64::from(frame_id), Ordering::Relaxed);
+                    }
                     ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
                         (u64::from(frame_id), Instant::now());
                 }
                 match sent {
-                    Some(frame_id) if is_keyframe => debug!(
+                    Some(frame_id) if f.is_keyframe => debug!(
                         frame_id,
                         ?self.wire_format,
                         param_sets = ps_count,
@@ -3092,14 +3558,15 @@ impl Gfx {
                         payload_bytes = payload.len(),
                         "EGFX shipped frame"
                     ),
-                    None => break,
+                    None => return Err(anyhow!("EGFX rejected encoded frame")),
                 }
-            }
-            (server.drain_output(), egfx_channel_id, video_queued)
+                (payload.len() + chroma.as_ref().map_or(0, Vec::len)) as u64
+            };
+            (server.drain_output(), egfx_channel_id, payload_len)
         };
 
         if dvc_messages.is_empty() {
-            anyhow::bail!("EGFX rejected AVC420 frame before transport dispatch");
+            return Err(anyhow!("EGFX encoded frame produced no channel messages"));
         }
         // DRDYNVC framing, addressed to the EGFX dynamic channel. SHOW_PROTOCOL
         // matches what upstream's Echo handler uses for DRDYNVC-wrapped data.
@@ -3113,59 +3580,68 @@ impl Gfx {
             .clone()
             .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
         sender
-            .send(ServerEvent::Egfx(EgfxServerMessage::SendTrackedMessages {
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
                 messages: svc_messages,
-                completion,
             }))
             .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
-        if queued_frames != 0 {
-            video_queued.store(true, Ordering::Relaxed);
-        }
         if let Some(stats) = crate::stats::global() {
-            stats.record_video_queued(queued_frames, payload_bytes);
+            stats.record_video_queued(1, payload_len);
         }
-        anyhow::ensure!(
-            queued_frames == expected_frames,
-            "EGFX rejected part of an AVC420 batch"
-        );
         Ok(())
     }
 
+    fn frame_payload_avc444(&self, frame: &EncodedFrame) -> Vec<u8> {
+        let mut filtered = frame.clone();
+        filtered.data = retain_avc444_nals(filtered.data);
+        self.frame_payload(&filtered)
+    }
+
     /// Frame the encoded NALs for the wire per the selected `WireFormat`,
-    /// prepending SPS/PPS (from VT's format description) on keyframes. Consumes
-    /// the frame so the common P-frame path can reuse VideoToolbox's allocation
-    /// instead of copying the complete encoded payload once per frame.
-    fn frame_payload(&self, f: EncodedFrame) -> Vec<u8> {
-        let EncodedFrame {
-            data,
-            is_keyframe,
-            parameter_sets,
-            ..
-        } = f;
+    /// prepending SPS/PPS (from VT's format description) on keyframes.
+    fn frame_payload(&self, f: &EncodedFrame) -> Vec<u8> {
         match self.wire_format {
             // VT data is already AVCC (length-prefixed); just prepend the
             // parameter sets as length-prefixed NALs on keyframes.
             WireFormat::LengthPrefixed => {
-                if !is_keyframe || parameter_sets.is_empty() {
-                    return data;
+                if !f.is_keyframe || f.parameter_sets.is_empty() {
+                    return f.data.clone();
                 }
-                let prefix_bytes: usize = parameter_sets.iter().map(|ps| 4 + ps.len()).sum();
-                let mut out = Vec::with_capacity(prefix_bytes + data.len());
-                for ps in &parameter_sets {
+                let mut out = Vec::with_capacity(f.data.len() + 64);
+                for ps in &f.parameter_sets {
                     out.extend_from_slice(&(ps.len() as u32).to_be_bytes());
                     out.extend_from_slice(ps);
                 }
-                out.extend_from_slice(&data);
+                out.extend_from_slice(&f.data);
                 out
             }
-            WireFormat::AnnexB => avcc_to_annex_b_in_place(data, &parameter_sets, is_keyframe),
+            WireFormat::AnnexB => avcc_to_annex_b(&f.data, &f.parameter_sets, f.is_keyframe),
         }
     }
+}
 
-    fn frame_payload_avc444(&self, mut frame: EncodedFrame) -> Vec<u8> {
-        frame.data = retain_avc444_nals(frame.data);
-        self.frame_payload(frame)
+fn retain_avc444_nals(mut avcc: Vec<u8>) -> Vec<u8> {
+    let mut read = 0usize;
+    let mut write = 0usize;
+    while read + 4 <= avcc.len() {
+        let nal_len =
+            u32::from_be_bytes([avcc[read], avcc[read + 1], avcc[read + 2], avcc[read + 3]])
+                as usize;
+        let nal_start = read + 4;
+        let Some(nal_end) = nal_start.checked_add(nal_len) else {
+            break;
+        };
+        if nal_len == 0 || nal_end > avcc.len() {
+            break;
+        }
+        let nal_type = avcc[nal_start] & 0x1f;
+        if matches!(nal_type, 1 | 5 | 7 | 8) {
+            avcc.copy_within(read..nal_end, write);
+            write += nal_end - read;
+        }
+        read = nal_end;
     }
+    avcc.truncate(write);
+    avcc
 }
 
 impl core::fmt::Debug for Gfx {
@@ -3188,6 +3664,20 @@ impl ServerEventSender for Gfx {
     }
 }
 
+impl Gfx {
+    /// Identity of the connection whose context is active (the address of its
+    /// `GraphicsPipelineServer`), so a test can tell one connection's context
+    /// from another's.
+    #[cfg(test)]
+    pub(crate) fn active_connection(&self) -> Option<usize> {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| Arc::as_ptr(&c.server_handle) as usize)
+    }
+}
+
 impl GfxServerFactory for Gfx {
     fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
         // We override build_server_with_handle, so this is only a safety stub.
@@ -3204,9 +3694,7 @@ impl GfxServerFactory for Gfx {
         // still-running macrdp, the id-0 `CreateSurface` no-ops against the
         // surface mstsc retained from the prior session → the reconnect-blank.
         // See the H.264 reconnect quirk note + `on_close` instrumentation below.
-        debug!(
-            "EGFX: building fresh GraphicsPipelineServer for new connection (surface-id counter resets to 0)"
-        );
+        debug!("EGFX: building fresh GraphicsPipelineServer for new connection (surface-id counter resets to 0)");
         let server = GraphicsPipelineServer::new(handler);
         let handle: GfxServerHandle = Arc::new(Mutex::new(server));
         // Channel-level decline flag, shared between this connection's ctx
@@ -3247,7 +3735,7 @@ impl GfxServerFactory for Gfx {
             need_keyframe: true,
             client_supports_avc: false,
             client_supports_avc444: false,
-            encoder_resync: Arc::new(AtomicBool::new(false)),
+            newer_egfx_client: false,
             egfx_declined: egfx_declined.clone(),
             submitted: Arc::new(AtomicU64::new(0)),
             shipped: Arc::new(AtomicU64::new(0)),
@@ -3261,7 +3749,6 @@ impl GfxServerFactory for Gfx {
             last_acked_frame_id: Arc::new(AtomicU64::new(0)),
             egfx_acks_seen: false,
             ship_times: Arc::new(Mutex::new(vec![(u64::MAX, Instant::now()); RTT_RING])),
-            video_queued: Arc::new(AtomicBool::new(false)),
             rtt_min_cur_ms: f64::INFINITY,
             rtt_min_prev_ms: f64::INFINITY,
             rtt_bucket_started: Instant::now(),
@@ -3275,6 +3762,11 @@ impl GfxServerFactory for Gfx {
             adaptive_on_udp: self.egfx_on_udp.load(Ordering::Relaxed),
             adaptive_warmup_until: None,
             adaptive_delay_ewma: 0.0,
+            adaptive_delay_samples: VecDeque::with_capacity(2 * DELAY_TREND_WINDOW),
+            adaptive_last_decrease_at: None,
+            adaptive_congestion_bps: None,
+            adaptive_in_decrease_episode: false,
+            resync_drain_until: None,
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
             qoe: QoeEvidence::default(),
@@ -3284,6 +3776,10 @@ impl GfxServerFactory for Gfx {
             link_rtt_ms,
             blank_gate_logged: false,
             min_render_reports: self.blank_params.min_render_reports,
+            post_attempt_zero_at: VecDeque::new(),
+            egfx_ever_ready: false,
+            legacy_hold_logged: false,
+            legacy_hold_expired_logged: false,
         });
         Some((
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
@@ -3317,6 +3813,21 @@ fn caps_indicate_avc(caps: &[CapabilitySet]) -> bool {
         // Bare V8 / V10_1 carry no AVC flag — no positive AVC signal.
         CapabilitySet::V8 { .. } | CapabilitySet::V10_1 => false,
     })
+}
+
+/// One log entry for a capability set that didn't parse: its version, the first
+/// four data bytes read as the flags word (every EGFX capset starts with one), and
+/// why it didn't parse. Never prints more than the flags word, so a long or
+/// garbage body can't flood the log.
+fn describe_unparsed_capset(version: u32, data: &[u8], reason: &str) -> String {
+    let flags = match data.first_chunk::<4>() {
+        Some(word) => format!("{:#010x}", u32::from_le_bytes(*word)),
+        None => "none".to_owned(),
+    };
+    format!(
+        "version={version:#010x} flags={flags} len={} ({reason})",
+        data.len()
+    )
 }
 
 /// AVC444 v1 requires an RDPGFX V10+ AVC capability. As with AVC420, require
@@ -3367,18 +3878,35 @@ impl GraphicsPipelineHandler for GfxHandler {
             .filter_map(|raw| raw.parsed().ok().flatten())
             .collect();
         let supports_avc = caps_indicate_avc(&typed);
-        let supports_avc444 = caps_indicate_avc444(&typed);
+        // The sets that didn't parse, with their raw version and flags, so a
+        // client whose AVC support hides in a set this build can't read shows
+        // up in the log (#211).
+        let unparsed: Vec<String> = pdu
+            .0
+            .iter()
+            .filter_map(|raw| {
+                let reason = match raw.parsed() {
+                    Ok(Some(_)) => return None,
+                    Ok(None) => "unknown version".to_owned(),
+                    Err(e) => format!("decode error: {e}"),
+                };
+                Some(describe_unparsed_capset(raw.version.0, &raw.data, &reason))
+            })
+            .collect();
         info!(
             count = pdu.0.len(),
             parsed_count = typed.len(),
             supports_avc,
-            supports_avc444,
             caps = ?typed,
+            unparsed = ?unparsed,
             "EGFX: client advertised capabilities"
         );
+        let newer_egfx_client =
+            advertises_egfx_beyond_mac_client(pdu.0.iter().map(|raw| raw.version.0));
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.client_supports_avc = supports_avc;
-            ctx.client_supports_avc444 = supports_avc444;
+            ctx.client_supports_avc444 = caps_indicate_avc444(&typed);
+            ctx.newer_egfx_client = newer_egfx_client;
         }
     }
 
@@ -3390,7 +3918,13 @@ impl GraphicsPipelineHandler for GfxHandler {
             // to a non-AVC client gets it rejected (ERROR_NOT_SUPPORTED) and
             // kills the graphics channel.
             if ctx.client_supports_avc {
+                // Only on the first ready: a mid-session capabilities
+                // re-advertise must not push detection back by an arm delay.
+                if !ctx.is_ready {
+                    ctx.start_clocks(Instant::now());
+                }
                 ctx.is_ready = true;
+                ctx.egfx_ever_ready = true;
                 ctx.need_keyframe = true;
                 info!(?negotiated, "EGFX channel ready (H.264 active)");
             } else {
@@ -3525,6 +4059,13 @@ impl GraphicsPipelineHandler for GfxHandler {
             ctx.qoe.record(metrics.time_diff_dr);
             if metrics.time_diff_dr > 0 {
                 ctx.last_nonzero_qoe_at = Instant::now();
+            } else if ctx.blank_recovery_attempts > 0 {
+                // Feeds the post-attempt zero-burst arm of
+                // `should_blank_recover`; bounded (oldest dropped).
+                if ctx.post_attempt_zero_at.len() as u64 >= MAX_POST_ATTEMPT_BURST_ZEROS {
+                    ctx.post_attempt_zero_at.pop_front();
+                }
+                ctx.post_attempt_zero_at.push_back(Instant::now());
             }
             // INFO (not debug) deliberately, and rare (once per recovery
             // attempt): the deployed agent runs at RUST_LOG=info, and the
@@ -3569,13 +4110,9 @@ impl GraphicsPipelineHandler for GfxHandler {
                      lapses back to zero)"
                 );
             }
-            // stats: keep frames/RTT live for mstsc sessions even without
+            // stats: keep RTT live for mstsc sessions even without
             // --adaptive-bitrate (no-op unless --stats-endpoint). ~8/s.
             if let Some(s) = crate::stats::global() {
-                s.frames_sent.store(
-                    ctx.last_shipped_frame_id.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
                 s.rtt_ms.store(ctx.link_rtt_ms, Ordering::Relaxed);
             }
         }
@@ -3622,251 +4159,96 @@ impl GraphicsPipelineHandler for StubHandler {
 /// Rewrite AVCC (4-byte length-prefixed NALs) to Annex-B (`00 00 00 01` start
 /// codes), prepending SPS/PPS on keyframes. Only used when `MACRDP_H264_ANNEXB`
 /// selects Annex-B framing.
-fn avcc_to_annex_b_in_place(
-    mut avcc: Vec<u8>,
-    parameter_sets: &[Vec<u8>],
-    is_keyframe: bool,
-) -> Vec<u8> {
+fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -> Vec<u8> {
     const START_CODE: [u8; 4] = [0, 0, 0, 1];
-    let mut i = 0;
-    let mut valid_end = 0;
-    while i + 4 <= avcc.len() {
-        let prefix = i;
-        let nal_len = u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
-        i += 4;
-        let Some(nal_end) = i.checked_add(nal_len) else {
-            warn!(
-                avcc_len = avcc.len(),
-                offset = i,
-                nal_len,
-                "AVCC NAL length overflows buffer; truncating"
-            );
-            break;
-        };
-        if nal_end > avcc.len() {
-            warn!(
-                avcc_len = avcc.len(),
-                offset = i,
-                nal_len,
-                "AVCC NAL length overflows buffer; truncating"
-            );
-            break;
-        }
-        // AVCC's length prefix and Annex-B's start code are both four bytes,
-        // so every non-keyframe can be converted without allocating or moving
-        // the encoded NAL bytes.
-        avcc[prefix..i].copy_from_slice(&START_CODE);
-        i = nal_end;
-        valid_end = nal_end;
-    }
-    // Match the old converter's fail-closed behavior: discard a malformed NAL
-    // and any incomplete trailing prefix rather than forwarding invalid bytes.
-    avcc.truncate(valid_end);
+    let mut out = Vec::with_capacity(avcc.len() + 64);
 
-    if is_keyframe && !parameter_sets.is_empty() {
-        let prefix_bytes: usize = parameter_sets
-            .iter()
-            .map(|ps| START_CODE.len() + ps.len())
-            .sum();
-        let mut out = Vec::with_capacity(prefix_bytes + avcc.len());
+    if is_keyframe {
         for ps in parameter_sets {
             out.extend_from_slice(&START_CODE);
             out.extend_from_slice(ps);
         }
-        out.extend_from_slice(&avcc);
-        out
-    } else {
-        avcc
     }
-}
 
-/// Remove optional H.264 NAL units from a VideoToolbox AVCC access unit before
-/// it enters AVC444's shared decoder timeline. Keep slices plus any in-band
-/// SPS/PPS; the normal payload builder still prepends format-description
-/// parameter sets to keyframes.
-fn retain_avc444_nals(mut avcc: Vec<u8>) -> Vec<u8> {
-    let mut read = 0usize;
-    let mut write = 0usize;
-    while read + 4 <= avcc.len() {
-        let nal_len =
-            u32::from_be_bytes([avcc[read], avcc[read + 1], avcc[read + 2], avcc[read + 3]])
-                as usize;
-        let nal_start = read + 4;
-        let Some(nal_end) = nal_start.checked_add(nal_len) else {
-            break;
-        };
-        if nal_len == 0 || nal_end > avcc.len() {
+    let mut i = 0;
+    while i + 4 <= avcc.len() {
+        let nal_len = u32::from_be_bytes([avcc[i], avcc[i + 1], avcc[i + 2], avcc[i + 3]]) as usize;
+        i += 4;
+        if i + nal_len > avcc.len() {
+            warn!(
+                avcc_len = avcc.len(),
+                offset = i,
+                nal_len,
+                "AVCC NAL length overflows buffer; truncating"
+            );
             break;
         }
-        let nal_type = avcc[nal_start] & 0x1f;
-        if matches!(nal_type, 1 | 5 | 7 | 8) {
-            avcc.copy_within(read..nal_end, write);
-            write += nal_end - read;
-        }
-        read = nal_end;
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(&avcc[i..i + nal_len]);
+        i += nal_len;
     }
-    avcc.truncate(write);
-    avcc
+    out
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ack_lag_limit_tcp_is_off_unless_configured() {
+        // TCP with N = 0 never drops, flush or not.
+        assert_eq!(super::ack_lag_limit(false, 30, 0, false), 0);
+        assert_eq!(super::ack_lag_limit(false, 30, 0, true), 0);
+        // TCP with N > 0 caps captures at N.
+        assert_eq!(super::ack_lag_limit(false, 30, 4, false), 4);
+    }
+
+    #[test]
+    fn ack_lag_limit_exempts_tcp_flush_frames() {
+        assert_eq!(super::ack_lag_limit(false, 30, 4, true), 0);
+    }
+
+    #[test]
+    fn ack_lag_limit_udp_always_caps() {
+        // The UDP tunnel keeps its own limit whatever the TCP setting, and
+        // flush re-submits stay capped there as they always were.
+        for tcp in [0, 4] {
+            for flush in [false, true] {
+                assert_eq!(super::ack_lag_limit(true, 30, tcp, flush), 30);
+            }
+        }
+    }
+
     use super::*;
 
+    /// #211: the iOS client sends two capsets this build can't parse. The log
+    /// line must say which versions they are, and the flags, without dumping
+    /// the body.
     #[test]
-    fn tcp_backpressure_requires_recent_ack_delay_and_outstanding_frames() {
-        let recent = Duration::from_millis(200);
-        assert!(tcp_decode_backlog(7, 80.0, recent));
-        assert!(!tcp_decode_backlog(6, 120.0, recent));
-        assert!(!tcp_decode_backlog(30, 10.0, recent));
-        assert!(!tcp_decode_backlog(30, 120.0, Duration::from_millis(251)));
-    }
+    fn unparsed_capsets_log_version_and_flags_only() {
+        use ironrdp_egfx::pdu::{CapabilityVersion, RawCapabilitySet};
 
-    fn completion_test_gfx() -> Gfx {
-        Gfx::new(
-            crate::capture::SharedDesktopSize::new(64, 64),
-            30,
-            1_000_000,
-            false,
-            2.0,
-            2,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            false,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU32::new(0)),
-        )
-    }
-
-    #[test]
-    fn resized_surface_waits_for_its_own_first_queued_frame() {
-        let gfx = completion_test_gfx();
-        let _server = gfx.build_server_with_handle().unwrap();
-        assert!(!gfx.has_queued_video());
-        let old_surface = gfx
-            .ctx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .video_queued
-            .clone();
-        old_surface.store(true, Ordering::Relaxed);
-        assert!(gfx.has_queued_video());
-
-        gfx.reset_for_live_resize();
-        old_surface.store(true, Ordering::Relaxed);
-        assert!(!gfx.has_queued_video());
-    }
-
-    #[test]
-    fn encoder_failures_release_avc420_slots_and_arm_resync() {
-        let gfx = completion_test_gfx();
-        let shipped = Arc::new(AtomicU64::new(0));
-        let resync = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel();
-        // More failures than the configured window must all retire, so later
-        // captures can still enter the encoder instead of being deferred forever.
-        for pts in 0..20 {
-            tx.send(EncodeOutput::Dropped { pts }).unwrap();
-        }
-        drop(tx);
-        gfx.ship_loop(rx, shipped.clone(), resync.clone());
-        assert_eq!(shipped.load(Ordering::Relaxed), 20);
-        assert!(resync.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn avc420_send_failure_skips_dependent_pictures_until_keyframe() {
-        let gfx = completion_test_gfx();
-        let shipped = Arc::new(AtomicU64::new(0));
-        let resync = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let picture = |pts, is_keyframe| {
-            EncodeOutput::Picture(EncodedFrame {
-                pts,
-                is_keyframe,
-                data: vec![],
-                parameter_sets: vec![],
-            })
-        };
-        tx.send(picture(0, true)).unwrap();
-        let mut pending = Some(tx);
-        let mut batches = Vec::new();
-        gfx.ship_loop_with_dispatch(
-            rx,
-            shipped.clone(),
-            resync.clone(),
-            |frames, _completion| {
-                batches.push(frames.iter().map(|frame| frame.pts).collect::<Vec<_>>());
-                if let Some(sender) = pending.take() {
-                    for (pts, keyframe) in [(1, false), (2, false), (3, true), (4, false)] {
-                        sender.send(picture(pts, keyframe)).unwrap();
-                    }
-                    anyhow::bail!("simulated send failure");
-                }
-                Ok(())
-            },
+        // An undocumented "Azure" version FreeRDP knows about: unknown here.
+        let azure =
+            RawCapabilitySet::new(CapabilityVersion(0x000B_0101), vec![0x20, 0x00, 0x00, 0x00]);
+        assert!(matches!(azure.parsed(), Ok(None)));
+        assert_eq!(
+            describe_unparsed_capset(azure.version.0, &azure.data, "unknown version"),
+            "version=0x000b0101 flags=0x00000020 len=4 (unknown version)"
         );
-        assert_eq!(batches, [vec![0], vec![3, 4]]);
-        assert_eq!(shipped.load(Ordering::Relaxed), 5);
-        assert!(resync.load(Ordering::Relaxed));
-    }
 
-    #[test]
-    fn avc444_failed_views_retire_one_logical_submission_per_pair() {
-        let gfx = completion_test_gfx();
-        let shipped = Arc::new(AtomicU64::new(0));
-        let resync = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel();
-        fn picture(pts: i64) -> EncodeOutput {
-            EncodeOutput::Picture(EncodedFrame {
-                data: vec![],
-                is_keyframe: false,
-                pts,
-                parameter_sets: vec![],
-            })
-        }
-        for output in [
-            EncodeOutput::Dropped { pts: 0 },
-            picture(1),
-            picture(2),
-            EncodeOutput::Dropped { pts: 3 },
-            EncodeOutput::Dropped { pts: 4 },
-            EncodeOutput::Dropped { pts: 5 },
-        ] {
-            tx.send(output).unwrap();
-        }
-        drop(tx);
-        gfx.ship_loop_avc444(rx, shipped.clone(), resync.clone());
-        assert_eq!(shipped.load(Ordering::Relaxed), 3);
-        assert!(resync.load(Ordering::Relaxed));
-    }
+        // A known version with a body too short to hold its flags word.
+        let short = RawCapabilitySet::new(CapabilityVersion::V10_7, vec![0x01]);
+        let e = short.parsed().unwrap_err();
+        assert_eq!(
+            describe_unparsed_capset(short.version.0, &short.data, &format!("decode error: {e}")),
+            format!("version=0x000a0701 flags=none len=1 (decode error: {e})")
+        );
 
-    #[test]
-    fn avc444_requires_positive_v10_avc_capability() {
-        let v81 = [CapabilitySet::V8_1 {
-            flags: CapabilitiesV81Flags::AVC420_ENABLED,
-        }];
-        assert!(caps_indicate_avc(&v81));
-        assert!(!caps_indicate_avc444(&v81));
-
-        let v10 = [CapabilitySet::V10 {
-            flags: CapabilitiesV10Flags::SMALL_CACHE,
-        }];
-        assert!(caps_indicate_avc(&v10));
-        assert!(caps_indicate_avc444(&v10));
-
-        let disabled = [CapabilitySet::V10 {
-            flags: CapabilitiesV10Flags::AVC_DISABLED,
-        }];
-        assert!(!caps_indicate_avc(&disabled));
-        assert!(!caps_indicate_avc444(&disabled));
-
-        // Bare V10_1 is intentionally treated as no positive signal because
-        // decoder-less clients may advertise it beside disabled flagged sets.
-        assert!(!caps_indicate_avc444(&[CapabilitySet::V10_1]));
+        // A long body still logs only the flags word.
+        let long = describe_unparsed_capset(0x000B_0300, &[0xAA; 4096], "unknown version");
+        assert_eq!(
+            long,
+            "version=0x000b0300 flags=0xaaaaaaaa len=4096 (unknown version)"
+        );
     }
 
     fn recovery_params() -> RecoveryParams {
@@ -4233,29 +4615,111 @@ mod tests {
         assert!(retransmit_is_lossy(1, 0));
     }
 
-    // congested_hysteresis(ewma_lag, high, low, retransmit_lossy, acks_usable, currently)
+    // congested_hysteresis(ewma_lag, high, low, ceiling, trend, retransmit_lossy, acks_usable, currently)
+    // These tests pass an infinite ceiling + DelayTrend::Unknown = the original level-only rule.
     #[test]
     fn hysteresis_enters_only_above_high() {
         // Not yet congested: enter only once the smoothed lag clears the HIGH mark.
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // below high
-        assert!(!congested_hysteresis(12.0, 12.0, 6.0, false, true, false)); // exactly at
-        assert!(congested_hysteresis(13.0, 12.0, 6.0, false, true, false)); // above high
+        assert!(!congested_hysteresis(
+            10.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // below high
+        assert!(!congested_hysteresis(
+            12.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // exactly at
+        assert!(congested_hysteresis(
+            13.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // above high
     }
 
     #[test]
     fn hysteresis_stays_until_below_low() {
         // Already congested: stay through the (low, high] band, exit at or below low.
-        assert!(congested_hysteresis(9.0, 12.0, 6.0, false, true, true)); // in the band → stay
-        assert!(congested_hysteresis(7.0, 12.0, 6.0, false, true, true)); // just above low → stay
-        assert!(!congested_hysteresis(6.0, 12.0, 6.0, false, true, true)); // at low → exit
-        assert!(!congested_hysteresis(5.0, 12.0, 6.0, false, true, true)); // below low → exit
+        assert!(congested_hysteresis(
+            9.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // in the band → stay
+        assert!(congested_hysteresis(
+            7.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // just above low → stay
+        assert!(!congested_hysteresis(
+            6.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // at low → exit
+        assert!(!congested_hysteresis(
+            5.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            true
+        )); // below low → exit
     }
 
     #[test]
     fn hysteresis_retransmit_forces_congested() {
         // Loss above the tolerance is a definite loss → congested regardless of lag/acks.
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, true, false));
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, false, false)); // even acks-unusable
+        assert!(congested_hysteresis(
+            0.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            true,
+            true,
+            false
+        ));
+        assert!(congested_hysteresis(
+            0.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            true,
+            false,
+            false
+        )); // even acks-unusable
     }
 
     #[test]
@@ -4263,10 +4727,24 @@ mod tests {
         // Acks suspended / cold-start: lag uninferable → not congested (no retransmit),
         // and a stale-high EWMA can't keep an episode latched.
         assert!(!congested_hysteresis(
-            10_000.0, 12.0, 6.0, false, false, false
+            10_000.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            false,
+            false
         ));
         assert!(!congested_hysteresis(
-            10_000.0, 12.0, 6.0, false, false, true
+            10_000.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            false,
+            true
         ));
     }
 
@@ -4274,23 +4752,564 @@ mod tests {
     fn hysteresis_transport_specific_high() {
         // Same smoothed lag enters congestion at the UDP high (8) but not the TCP high
         // (12) — TCP's send buffer adds baseline depth, so it needs a higher mark.
-        assert!(congested_hysteresis(10.0, 8.0, 4.0, false, true, false)); // UDP
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // TCP
+        assert!(congested_hysteresis(
+            10.0,
+            8.0,
+            4.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // UDP
+        assert!(!congested_hysteresis(
+            10.0,
+            12.0,
+            6.0,
+            f64::INFINITY,
+            DelayTrend::Unknown,
+            false,
+            true,
+            false
+        )); // TCP
     }
 
-    // rate_action(ewma_lag, high, retransmit_lossy, acks_usable, congested)
+    #[test]
+    fn resync_drain_holds_until_the_client_catches_up_or_the_cap() {
+        let t0 = Instant::now();
+        let until = Some(t0 + RESYNC_DRAIN_MAX);
+        // Not pressed → ship normally.
+        assert_eq!(resync_drain_step(None, t0, 100, 90), ResyncDrain::Off);
+        // Pressed, 10 frames still in the client's decoder → hold.
+        assert_eq!(resync_drain_step(until, t0, 100, 90), ResyncDrain::Hold);
+        assert_eq!(
+            resync_drain_step(until, t0 + ms(1_999), 100, 99),
+            ResyncDrain::Hold
+        );
+        // Everything shipped is acked → done (ship the IDR now).
+        assert_eq!(
+            resync_drain_step(until, t0 + ms(300), 100, 100),
+            ResyncDrain::Done
+        );
+        // Acks never catch up (suspended, or a stuck client) → the cap ends it.
+        assert_eq!(
+            resync_drain_step(until, t0 + RESYNC_DRAIN_MAX, 100, 40),
+            ResyncDrain::Done
+        );
+    }
+
+    fn delay_samples(v: &[f64]) -> VecDeque<f64> {
+        v.iter().copied().collect()
+    }
+
+    #[test]
+    fn delay_trend_classifies_rising_falling_flat_and_unknown() {
+        // Fewer than two windows → Unknown (level-only fallback).
+        assert_eq!(
+            delay_trend(&delay_samples(&[10.0, 50.0, 90.0, 130.0, 170.0]), 20.0),
+            DelayTrend::Unknown
+        );
+        // The measured mstsc plateau at 3 Mbit/s (11-12): flat.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[123.0, 121.0, 118.0, 120.0, 122.0, 121.0]),
+                20.0
+            ),
+            DelayTrend::Flat
+        );
+        // The measured ramp into it (72, 72, 80 → 99, 103, 150): rising.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[72.0, 72.0, 80.0, 99.0, 103.0, 150.0]),
+                20.0
+            ),
+            DelayTrend::Rising
+        );
+        // A back-off draining a queue: falling.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[300.0, 280.0, 260.0, 200.0, 170.0, 140.0]),
+                20.0
+            ),
+            DelayTrend::Falling
+        );
+        // One jittery sample at the window edge doesn't flip it: the halves
+        // are averaged (110 vs 120 = +10, Flat), though the endpoints alone
+        // differ by 60.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[100.0, 130.0, 100.0, 100.0, 100.0, 160.0]),
+                20.0
+            ),
+            DelayTrend::Flat
+        );
+        // Exactly the dead band either way is still Flat.
+        assert_eq!(
+            delay_trend(
+                &delay_samples(&[100.0, 100.0, 100.0, 120.0, 120.0, 120.0]),
+                20.0
+            ),
+            DelayTrend::Flat
+        );
+    }
+
+    #[test]
+    fn delay_pressure_needs_growth_below_the_ceiling() {
+        // Above high: only Rising (or Unknown, the old rule) is pressure.
+        assert!(delay_pressure(150.0, 100.0, 400.0, DelayTrend::Rising));
+        assert!(delay_pressure(150.0, 100.0, 400.0, DelayTrend::Unknown));
+        assert!(!delay_pressure(150.0, 100.0, 400.0, DelayTrend::Flat));
+        assert!(!delay_pressure(150.0, 100.0, 400.0, DelayTrend::Falling));
+        // Above the ceiling: always pressure.
+        for t in [
+            DelayTrend::Flat,
+            DelayTrend::Falling,
+            DelayTrend::Rising,
+            DelayTrend::Unknown,
+        ] {
+            assert!(delay_pressure(450.0, 100.0, 400.0, t));
+        }
+        // Below high: never.
+        assert!(!delay_pressure(90.0, 100.0, 400.0, DelayTrend::Rising));
+        // A flat episode ends below the ceiling; a moving one holds until `low`.
+        assert!(!congested_hysteresis(
+            150.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Flat,
+            false,
+            true,
+            true
+        ));
+        assert!(congested_hysteresis(
+            150.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Falling,
+            false,
+            true,
+            true
+        ));
+        assert!(congested_hysteresis(
+            450.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Flat,
+            false,
+            true,
+            true
+        ));
+        // Loss still forces it regardless.
+        assert!(congested_hysteresis(
+            0.0,
+            100.0,
+            50.0,
+            400.0,
+            DelayTrend::Flat,
+            true,
+            true,
+            false
+        ));
+    }
+
+    /// Result of [`simulate_adaptive`]: bitrate per interval and how many
+    /// intervals sat at the floor (where the fps floor engages).
+    struct AdaptiveSim {
+        bps: Vec<u32>,
+        at_floor_intervals: usize,
+        decreases: usize,
+        max_ewma: f64,
+    }
+
+    /// Which controller [`simulate_adaptive`] runs.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SimMode {
+        /// The pre-2026-11-12 level-only controller.
+        Old,
+        /// The trend gate alone (the first live round of this fix).
+        TrendOnly,
+        /// The trend gate plus decrease spacing and the slow approach.
+        Full,
+    }
+
+    /// Closed-loop run of the controller's pure decision chain (EWMA → trend →
+    /// hysteresis → rate action → decrease spacing → AIMD with the slow
+    /// approach) at the production defaults and the 300 ms interval, against a
+    /// `link` model mapping (interval, current bitrate) to the delay sample.
+    fn simulate_adaptive(
+        intervals: usize,
+        mode: SimMode,
+        mut link: impl FnMut(usize, u32) -> f64,
+    ) -> AdaptiveSim {
+        let (floor, ceiling_bps, inc, dec) = (500_000u32, 3_000_000u32, 250_000u32, 0.7f32);
+        let (high, low, ceiling_ms, rise, alpha) = (100.0, 50.0, 400.0, 20.0, 0.3);
+        let interval = ms(300);
+        let mut target = ceiling_bps;
+        let mut ewma = 0.0;
+        let mut samples = VecDeque::new();
+        let mut congested = false;
+        let mut last_decrease: Option<Duration> = None;
+        let mut congestion_bps: Option<u32> = None;
+        let mut in_episode = false;
+        let mut sim = AdaptiveSim {
+            bps: Vec::new(),
+            at_floor_intervals: 0,
+            decreases: 0,
+            max_ewma: 0.0,
+        };
+        for i in 0..intervals {
+            let now = interval * i as u32;
+            let sample = link(i, target);
+            ewma = alpha * sample + (1.0 - alpha) * ewma;
+            sim.max_ewma = sim.max_ewma.max(ewma);
+            if samples.len() >= 2 * DELAY_TREND_WINDOW {
+                samples.pop_front();
+            }
+            samples.push_back(sample);
+            let (trend, ceil) = if mode == SimMode::Old {
+                (DelayTrend::Unknown, f64::INFINITY)
+            } else {
+                (delay_trend(&samples, rise), ceiling_ms)
+            };
+            congested = congested_hysteresis(ewma, high, low, ceil, trend, false, true, congested);
+            let mut action = rate_action(ewma, high, ceil, trend, false, true, congested);
+            if mode == SimMode::Full
+                && action == RateAction::Decrease
+                && hold_trend_decrease(
+                    false,
+                    ewma,
+                    ceil,
+                    trend,
+                    last_decrease.map(|t| now - t),
+                    TREND_DECREASE_SPACING,
+                )
+            {
+                action = RateAction::Hold;
+            }
+            target = match action {
+                RateAction::Hold => target,
+                RateAction::Decrease => {
+                    sim.decreases += 1;
+                    note_decrease(&mut in_episode, &mut congestion_bps, target);
+                    last_decrease = Some(now);
+                    aimd_bitrate(target, 1, floor, ceiling_bps, inc, dec)
+                }
+                RateAction::Increase => {
+                    in_episode = false;
+                    let step = if mode == SimMode::Full {
+                        increase_step(target, congestion_bps, inc)
+                    } else {
+                        inc
+                    };
+                    aimd_bitrate(target, 0, floor, ceiling_bps, step, dec)
+                }
+            };
+            if target <= floor && congested {
+                sim.at_floor_intervals += 1;
+            }
+            sim.bps.push(target);
+        }
+        sim
+    }
+
+    #[test]
+    fn adaptive_controller_does_not_oscillate_on_mstsc_decode_depth() {
+        // THE 11-12 LAN STUTTER: mstsc keeps ~10 frames of 1080p60 video in
+        // its decoder, so the measured delay ramps to ~120 ms and sits there
+        // regardless of bitrate (it stayed 118-148 ms from 3 down to
+        // 0.5 Mbit/s). Model: a ramp then a flat 120 ms with the measured ±5 ms
+        // jitter, independent of the bitrate. 60 intervals = 18 s of video.
+        let jitter = [3.0, -2.0, -5.0, 0.0, 2.0, 1.0, -3.0, 4.0];
+        let mstsc = |i: usize, _bps: u32| {
+            if i < 6 {
+                20.0 + 20.0 * i as f64
+            } else {
+                120.0 + jitter[i % jitter.len()]
+            }
+        };
+        let fixed = simulate_adaptive(60, SimMode::Full, mstsc);
+        // Never reaches the floor (so the 10 fps cap never engages) and
+        // spends the second half at or near the 3 Mbit/s ceiling.
+        assert_eq!(
+            fixed.at_floor_intervals, 0,
+            "fixed controller hit the floor: {:?}",
+            fixed.bps
+        );
+        assert!(
+            fixed.bps[30..].iter().all(|&b| b >= 2_500_000),
+            "{:?}",
+            fixed.bps
+        );
+        assert!(
+            fixed.decreases <= 3,
+            "{} decreases: {:?}",
+            fixed.decreases,
+            fixed.bps
+        );
+        // The old level-only rule on the same input is what stuttered: it
+        // keeps cutting and reaches the floor.
+        let old = simulate_adaptive(60, SimMode::Old, mstsc);
+        assert!(
+            old.at_floor_intervals > 0,
+            "old controller never hit the floor: {:?}",
+            old.bps
+        );
+    }
+
+    /// A bottleneck of `capacity_bps` with an infinite buffer: each interval
+    /// the queue grows (or drains) by the over/under-send, in ms of link time.
+    fn thin_link(capacity_bps: u32) -> impl FnMut(usize, u32) -> f64 {
+        let mut queue_ms = 0.0f64;
+        move |_i, bps| {
+            let interval_ms = 300.0;
+            queue_ms +=
+                interval_ms * (f64::from(bps) - f64::from(capacity_bps)) / f64::from(capacity_bps);
+            queue_ms = queue_ms.max(0.0);
+            queue_ms
+        }
+    }
+
+    #[test]
+    fn adaptive_controller_still_tracks_a_thin_link() {
+        // A 1.5 Mbit/s VPN-class bottleneck, starting at the 3 Mbit/s
+        // ceiling: the queue grows while over capacity, so the trend sees it.
+        let sim = simulate_adaptive(200, SimMode::Full, thin_link(1_500_000));
+        assert!(sim.decreases > 0);
+        // Settles around the capacity: over the last 30 s (100 intervals) the
+        // average stays within 60-120% of it, and the delay stays bounded
+        // well below the hard ceiling's order of magnitude.
+        let tail = &sim.bps[100..];
+        let avg = tail.iter().map(|&b| f64::from(b)).sum::<f64>() / tail.len() as f64;
+        assert!(
+            (900_000.0..=1_800_000.0).contains(&avg),
+            "avg {avg} bps: {:?}",
+            tail
+        );
+        assert!(
+            sim.max_ewma < 1_000.0,
+            "queue ran away: max ewma {}",
+            sim.max_ewma
+        );
+    }
+
+    #[test]
+    fn adaptive_controller_still_backs_off_a_saturated_link() {
+        // The 2026-07-04 lab case: a 500 Kbit/s pipe at a 3 Mbit/s start. The
+        // queue climbs fast; the controller must cut to the floor quickly.
+        let sim = simulate_adaptive(60, SimMode::Full, thin_link(500_000));
+        let first_floor = sim.bps.iter().position(|&b| b <= 500_000);
+        assert!(matches!(first_floor, Some(i) if i <= 15), "{:?}", sim.bps);
+        // And it backs off exactly as the old level-only controller did: on
+        // a growing queue the trend is Rising, so nothing here changed. (The
+        // model's 6x overshoot builds a multi-second queue before any
+        // controller can react; that part is the link, not the rule.)
+        let old = simulate_adaptive(60, SimMode::Old, thin_link(500_000));
+        assert_eq!(sim.bps, old.bps);
+    }
+
+    #[test]
+    fn the_idr_backoff_stretch_is_bounded() {
+        // 60 fps with the default 2 s interval (120 frames): ten seconds.
+        assert_eq!(stretched_keyframe_interval(60, 120), 600);
+        // Always longer than the normal interval, even when that is long.
+        assert_eq!(stretched_keyframe_interval(60, 900), 901);
+        // Never the old ~10 minutes.
+        assert!(stretched_keyframe_interval(60, 120) < 60 * 600);
+    }
+
+    #[test]
+    fn trend_decreases_are_spaced_and_the_climb_slows_near_the_last_congestion() {
+        let s = TREND_DECREASE_SPACING;
+        // A rising-delay cut within the spacing of the last one is held…
+        assert!(hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(ms(300)),
+            s
+        ));
+        // …but not once the spacing has passed, nor for the first cut.
+        assert!(!hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(s),
+            s
+        ));
+        assert!(!hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            None,
+            s
+        ));
+        // Never held: loss, above the ceiling, or the level-only fallback.
+        assert!(!hold_trend_decrease(
+            true,
+            150.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(ms(300)),
+            s
+        ));
+        assert!(!hold_trend_decrease(
+            false,
+            450.0,
+            400.0,
+            DelayTrend::Rising,
+            Some(ms(300)),
+            s
+        ));
+        assert!(!hold_trend_decrease(
+            false,
+            150.0,
+            400.0,
+            DelayTrend::Unknown,
+            Some(ms(300)),
+            s
+        ));
+
+        // Full step until 80% of where the last episode began, then a fifth.
+        assert_eq!(increase_step(1_000_000, None, 250_000), 250_000);
+        assert_eq!(increase_step(1_500_000, Some(2_500_000), 250_000), 250_000);
+        assert_eq!(increase_step(2_000_000, Some(2_500_000), 250_000), 50_000);
+        assert_eq!(increase_step(2_900_000, Some(2_500_000), 250_000), 50_000);
+    }
+
+    /// A client whose decoder falls behind above `capacity_bps`, seen with a
+    /// lag of `lag` intervals (frames already in flight still have to be
+    /// decoded after a cut — the 11-12 second live round, a reconnected mstsc).
+    fn lagged_decoder(capacity_bps: u32, lag: usize) -> impl FnMut(usize, u32) -> f64 {
+        let mut queue_ms = 0.0f64;
+        let mut line: VecDeque<f64> = VecDeque::new();
+        move |_i, bps| {
+            queue_ms +=
+                300.0 * (f64::from(bps) - f64::from(capacity_bps)) / f64::from(capacity_bps);
+            queue_ms = queue_ms.max(0.0);
+            line.push_back(queue_ms);
+            20.0 + if line.len() > lag {
+                line.pop_front().unwrap_or(0.0)
+            } else {
+                0.0
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_controller_settles_instead_of_sawing_on_a_lagged_decoder() {
+        // THE 11-12 SECOND LIVE ROUND: on a reconnected mstsc the delay really
+        // grows above ~2 Mbit/s and keeps rising after each cut, so cutting
+        // every interval plunged to the floor and the 10 fps cap.
+        let tail_avg = |sim: &AdaptiveSim| {
+            let t = &sim.bps[60..];
+            t.iter().map(|&b| f64::from(b)).sum::<f64>() / t.len() as f64
+        };
+        let full = simulate_adaptive(200, SimMode::Full, lagged_decoder(2_000_000, 3));
+        let trend_only = simulate_adaptive(200, SimMode::TrendOnly, lagged_decoder(2_000_000, 3));
+        assert!(
+            full.at_floor_intervals * 2 < trend_only.at_floor_intervals,
+            "floor intervals: full {} vs trend-only {}",
+            full.at_floor_intervals,
+            trend_only.at_floor_intervals
+        );
+        assert!(
+            tail_avg(&full) > tail_avg(&trend_only) + 300_000.0,
+            "avg {} vs {}",
+            tail_avg(&full),
+            tail_avg(&trend_only)
+        );
+        // On the thin links the follow-up never costs throughput or delay
+        // against the old controller.
+        for cap in [1_000_000u32, 1_500_000, 2_500_000] {
+            let f = simulate_adaptive(200, SimMode::Full, thin_link(cap));
+            let o = simulate_adaptive(200, SimMode::Old, thin_link(cap));
+            let avg =
+                |s: &AdaptiveSim| s.bps[100..].iter().map(|&b| f64::from(b)).sum::<f64>() / 100.0;
+            assert!(avg(&f) >= avg(&o), "thin {cap}: {} < {}", avg(&f), avg(&o));
+            assert!(
+                f.max_ewma <= o.max_ewma + 1.0,
+                "thin {cap}: {} > {}",
+                f.max_ewma,
+                o.max_ewma
+            );
+            assert!(f.at_floor_intervals <= o.at_floor_intervals, "thin {cap}");
+        }
+    }
+
+    #[test]
+    fn the_climb_back_is_fast_until_near_where_the_episode_began() {
+        // One congestion episode cut 3 Mbit/s down through several spaced
+        // cuts; then the link clears. The trouble point is where the episode
+        // BEGAN (3 Mbit/s), so the climb runs at the full step up to 2.4
+        // Mbit/s. (Recording each cut instead would put it near the bottom
+        // and slow the whole climb to a fifth.)
+        let mut in_episode = false;
+        let mut point = None;
+        for bps in [3_000_000, 2_100_000, 1_470_000, 1_029_000] {
+            note_decrease(&mut in_episode, &mut point, bps);
+        }
+        assert_eq!(point, Some(3_000_000));
+        assert_eq!(increase_step(1_029_000, point, 250_000), 250_000);
+        assert_eq!(increase_step(2_300_000, point, 250_000), 250_000);
+        assert_eq!(increase_step(2_400_000, point, 250_000), 50_000);
+        // A new episode after an increase records its own start.
+        in_episode = false;
+        note_decrease(&mut in_episode, &mut point, 2_600_000);
+        assert_eq!(point, Some(2_600_000));
+    }
+
+    #[test]
+    fn adaptive_controller_backs_off_a_flat_delay_above_the_ceiling() {
+        // A backlog that stopped growing at a very high level is still worked
+        // down: flat 500 ms is over the 400 ms ceiling.
+        let sim = simulate_adaptive(30, SimMode::Full, |_i, _bps| 500.0);
+        assert!(sim.decreases >= 5, "{:?}", sim.bps);
+    }
+
+    // rate_action(ewma_lag, high, ceiling, trend, retransmit_lossy, acks_usable, congested) — again
+    // with an infinite ceiling + DelayTrend::Unknown, i.e. the original level-only rule.
     #[test]
     fn rate_action_decreases_above_high_or_on_retransmit() {
         assert_eq!(
-            rate_action(13.0, 12.0, false, true, true),
+            rate_action(
+                13.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                true,
+                true
+            ),
             RateAction::Decrease
         ); // lag>high
         assert_eq!(
-            rate_action(0.0, 12.0, true, true, true),
+            rate_action(
+                0.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                true,
+                true,
+                true
+            ),
             RateAction::Decrease
         ); // loss>tolerance
         assert_eq!(
-            rate_action(0.0, 12.0, true, false, false),
+            rate_action(
+                0.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                true,
+                false,
+                false
+            ),
             RateAction::Decrease
         ); // loss>tolerance, acks unusable
     }
@@ -4299,20 +5318,47 @@ mod tests {
     fn rate_action_holds_in_band_while_congested() {
         // Latched congested but the smoothed lag has decayed below high (decaying through
         // the band) → hold, don't keep cratering. This is the "single spike" fix.
-        assert_eq!(rate_action(9.0, 12.0, false, true, true), RateAction::Hold);
+        assert_eq!(
+            rate_action(
+                9.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                true,
+                true
+            ),
+            RateAction::Hold
+        );
     }
 
     #[test]
     fn rate_action_increases_when_cleared() {
         // Not congested (cleared below low) → climb back toward the ceiling.
         assert_eq!(
-            rate_action(2.0, 12.0, false, true, false),
+            rate_action(
+                2.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                true,
+                false
+            ),
             RateAction::Increase
         );
         // Acks unusable (warmup/suspend) with no retransmit → not congested → increase
         // (target is already at ceiling at connect, so this is a clamp-no-op there).
         assert_eq!(
-            rate_action(99.0, 12.0, false, false, false),
+            rate_action(
+                99.0,
+                12.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                false,
+                false,
+                false
+            ),
             RateAction::Increase
         );
     }
@@ -4325,14 +5371,30 @@ mod tests {
         let lossy = retransmit_is_lossy(1, 2);
         assert!(!lossy);
         assert_eq!(
-            rate_action(1.0, 8.0, lossy, true, false),
+            rate_action(
+                1.0,
+                8.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                lossy,
+                true,
+                false
+            ),
             RateAction::Increase
         );
         // But sustained loss (delta=5) crosses the tolerance → back off.
         let lossy = retransmit_is_lossy(5, 2);
         assert!(lossy);
         assert_eq!(
-            rate_action(1.0, 8.0, lossy, true, true),
+            rate_action(
+                1.0,
+                8.0,
+                f64::INFINITY,
+                DelayTrend::Unknown,
+                lossy,
+                true,
+                true
+            ),
             RateAction::Decrease
         );
     }
@@ -4392,7 +5454,78 @@ mod tests {
             // 3 for the tests (the production default is a more aggressive 1);
             // the wall-clock test asserts against this value.
             blank_min_reports: 3,
+            // The production defaults (3 zeros within 10 s); the post-attempt
+            // tests assert against these values.
+            post_attempt_burst_zeros: 3,
+            post_attempt_burst_window: ms(10_000),
             reactivate: false,
+        }
+    }
+
+    /// #269: blank recovery stays off for the client family whose QoE reports
+    /// zero decode+render time while presenting, and only for it. The lists are
+    /// the capability versions each client advertised in the 2026-11-20 capture
+    /// (iOS from #211).
+    #[test]
+    fn blank_recovery_skips_clients_beyond_the_mac_windows_app() {
+        use ironrdp_egfx::pdu::CapabilityVersion as V;
+        let windows_app_windows = [
+            V::V8.0,
+            V::V8_1.0,
+            V::V10.0,
+            V::V10_2.0,
+            V::V10_3.0,
+            V::V10_4.0,
+            V::V10_5.0,
+            V::V10_6.0,
+            V::V10_7.0,
+            0x000B_0101,
+            0x000B_0200,
+            0x000B_0300,
+            0x000B_0500,
+        ];
+        let mstsc = [
+            V::V8.0,
+            V::V8_1.0,
+            V::V10.0,
+            V::V10_2.0,
+            V::V10_3.0,
+            V::V10_4.0,
+            V::V10_5.0,
+            V::V10_6.0,
+        ];
+        let windows_app_macos = [
+            V::V8.0,
+            V::V8_1.0,
+            V::V10.0,
+            V::V10_2.0,
+            V::V10_3.0,
+            V::V10_4.0,
+            V::V10_7.0,
+            0x000B_0101,
+        ];
+        let windows_app_ios_unparsed = [0x000B_0101, 0x000B_0300];
+        assert!(advertises_egfx_beyond_mac_client(windows_app_windows));
+        assert!(advertises_egfx_beyond_mac_client(windows_app_ios_unparsed));
+        // The macOS client and mstsc have had real reconnect-blanks: recovery stays on.
+        assert!(!advertises_egfx_beyond_mac_client(mstsc));
+        assert!(!advertises_egfx_beyond_mac_client(windows_app_macos));
+        assert!(!advertises_egfx_beyond_mac_client([]));
+    }
+
+    #[test]
+    fn blank_detector_gate_disarms_newer_clients_whatever_the_link() {
+        // A newer client is never evaluated, on a LAN, an unknown link, or with
+        // RTT gating turned off.
+        assert_eq!(blank_detector_gate(true, 2, 80), None);
+        assert_eq!(blank_detector_gate(true, 0, 80), None);
+        assert_eq!(blank_detector_gate(true, 2, 0), None);
+        // Every other client gets exactly the RTT gate.
+        for (rtt, max) in [(0, 80), (2, 80), (50, 80), (80, 80), (200, 80), (200, 0)] {
+            assert_eq!(
+                blank_detector_gate(false, rtt, max),
+                blank_rtt_gate(rtt, max)
+            );
         }
     }
 
@@ -4448,6 +5581,7 @@ mod tests {
             ms(7000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         assert!(!should_blank_recover(
@@ -4459,6 +5593,7 @@ mod tests {
             ms(7000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &s
         ));
     }
@@ -4555,6 +5690,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4574,6 +5710,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // A long healthy run is likewise never touched.
@@ -4586,6 +5723,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4610,6 +5748,7 @@ mod tests {
             ms(10_000),
             1,     // i.e. the reactivation already ran; this is the fallback drop
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Mid-blip (the blip itself is the most recent report) it still holds
@@ -4623,6 +5762,7 @@ mod tests {
             ms(10_000),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4639,8 +5779,9 @@ mod tests {
         let p = blank_params();
 
         // (a) The interleaved phantom pattern: the most recent report was a
-        // nonzero blip (zero_streak reset to 0!), runs never reached
-        // min_render_reports, but zeros kept accruing cumulatively.
+        // nonzero blip (zero_streak reset to 0!), but zeros kept arriving
+        // densely between the blips. Since 2026-11-12 this is the zero-burst
+        // arm's case (3 zeros within 10 s), not the deadline's.
         let interleaved = QoeEvidence {
             zero_streak: 0,
             nonzero_streak: 2,
@@ -4656,22 +5797,75 @@ mod tests {
             false,
             ms(30_000),
             ms(0),
-            ms(8000), // = heal_confirm_deadline
-            1,        // the reactivation already ran
-            true,     // client is acking our post-attempt frames
+            ms(8000),       // since the attempt (past retry_interval)
+            1,              // the reactivation already ran
+            true,           // client is acking our post-attempt frames
+            Some(ms(6000)), // the last 3 zeros span 6 s: a burst
             &p
         ));
-        // Same evidence BEFORE the deadline → hold (give the heal time).
+        // A phantom RUN as long as 18 (07-23) earlier in the window doesn't
+        // shield it: the burst is what decides, not run length.
+        assert!(should_blank_recover(
+            QoeEvidence {
+                nonzero_max_since_reset: 18,
+                max_nonzero_streak: 18,
+                ..interleaved
+            },
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(8000),
+            1,
+            true,
+            Some(ms(6000)),
+            &p
+        ));
+        // Inside retry_interval (5 s) → hold (give the heal time).
         assert!(!should_blank_recover(
             interleaved,
             true,
             false,
             ms(30_000),
             ms(0),
-            ms(6000),
+            ms(4000),
             1,
             true,
+            Some(ms(3000)),
             &p
+        ));
+        // Same tallies but the zeros were NOT dense (span past the window, or
+        // fewer than 3 recorded) → hold; the cumulative tally alone no longer
+        // escalates (that is what dropped healed sessions).
+        for span in [Some(ms(10_001)), None] {
+            assert!(!should_blank_recover(
+                interleaved,
+                true,
+                false,
+                ms(30_000),
+                ms(0),
+                ms(8000),
+                1,
+                true,
+                span,
+                &p
+            ));
+        }
+        // A zero-length window disables the burst arm.
+        assert!(!should_blank_recover(
+            interleaved,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(8000),
+            1,
+            true,
+            Some(ms(1)),
+            &BlankRecoveryParams {
+                post_attempt_burst_window: ms(0),
+                ..p
+            }
         ));
 
         // (b) Total QoE silence after the attempt, while frame acks flow: the
@@ -4690,6 +5884,7 @@ mod tests {
             ms(8000),
             1,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
         // …but silence WITHOUT acks proves nothing (nothing shipped — an idle
@@ -4703,6 +5898,7 @@ mod tests {
             ms(8000),
             1,
             false,
+            None, // post_attempt_zero_span
             &p
         ));
         // …and the branch is strictly post-attempt (attempts == 0 → inert;
@@ -4716,8 +5912,227 @@ mod tests {
             ms(8000),
             0,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
+    }
+
+    /// The production defaults that matter for the post-attempt arms (the test
+    /// `blank_params` deliberately blunts the connect-phase fast path, which
+    /// would hide the 11-09..11-12 false drop).
+    fn production_like_blank_params() -> BlankRecoveryParams {
+        BlankRecoveryParams {
+            min_qoe_reports: 24,
+            established_render_reports: 40,
+            established_min_qoe: 160,
+            retry_interval: ms(4000),
+            blank_max_wait: ms(4000),
+            blank_min_reports: 1,
+            ..blank_params()
+        }
+    }
+
+    /// A post-attempt window as the recovery warning logs it, with the last
+    /// report a zero (the moment the old fast path fired).
+    fn window_ending_in_a_zero(reports: u64, zeros: u64, best_run: u64) -> QoeEvidence {
+        QoeEvidence {
+            zero_streak: 1,
+            nonzero_streak: 0,
+            max_nonzero_streak: best_run,
+            reports_since_reset: reports,
+            zeros_since_reset: zeros,
+            nonzero_max_since_reset: best_run,
+            presented_clean: false,
+        }
+    }
+
+    #[test]
+    fn blank_recovery_post_attempt_lone_zero_after_a_heal_does_not_drop() {
+        // THE 11-09 / 11-10 / 11-12 FALSE DROPS (mstsc build 26100, LAN and
+        // ZeroTier): the reactivation healed the session (the user saw the
+        // desktop), then ONE zero-EDR report — on a static desktop, the
+        // menu-bar clock tick — made the one-zero wall-clock fast path drop
+        // it; on 11-10 once a minute in a loop. Each tuple is a logged window:
+        // (window_reports, window_zeros, window_best_render_run).
+        let p = production_like_blank_params();
+        for (reports, zeros, best) in [
+            (22, 2, 20),
+            (1, 1, 0),
+            (9, 2, 7),
+            (4, 1, 3),
+            (33, 2, 31),
+            (2, 1, 1),
+        ] {
+            let w = window_ending_in_a_zero(reports, zeros, best);
+            // 5.6 s (11-12) and a minute (the 11-10 clock-tick loop) after
+            // the attempt; fewer than 3 post-attempt zeros ⇒ no span.
+            for since_attempt in [ms(5_600), ms(60_000)] {
+                assert!(
+                    !should_blank_recover(
+                        w,
+                        true,
+                        false,
+                        ms(120_000),
+                        ms(1_000),
+                        since_attempt,
+                        1,
+                        true,
+                        None,
+                        &p
+                    ),
+                    "dropped a healed window {reports}/{zeros}/{best} at {since_attempt:?}"
+                );
+            }
+        }
+        // THE THIRD LIVE ROUND (11-12, YouTube playing): heals into runs of
+        // 15-33, then 3-4 zeros that DID form a burst, at 7-17% of the
+        // window. The majority rule holds them.
+        for (reports, zeros, best) in [(44, 4, 33), (38, 4, 20), (18, 3, 15), (50, 3, 25)] {
+            let w = window_ending_in_a_zero(reports, zeros, best);
+            assert!(
+                !should_blank_recover(
+                    w,
+                    true,
+                    false,
+                    ms(12_000),
+                    ms(500),
+                    ms(8_000),
+                    1,
+                    true,
+                    Some(ms(2_000)),
+                    &p
+                ),
+                "dropped a healed window {reports}/{zeros}/{best} during video"
+            );
+        }
+        // A healed STATIC session keeps collecting a clock-tick zero about
+        // once a minute, forever: three of them never form a burst.
+        let w = window_ending_in_a_zero(40, 3, 20);
+        assert!(!should_blank_recover(
+            w,
+            true,
+            false,
+            ms(300_000),
+            ms(60_000),
+            ms(180_000),
+            1,
+            true,
+            Some(ms(120_000)),
+            &p
+        ));
+        // THE 11-12 LIVE FALSE DROP on the first cut of this fix: the heal
+        // reached a 75-long run (ESTABLISHED), then 4 scattered zeros, the
+        // last 3 within 10 s, formed a burst. The user saw a working desktop.
+        // An established session is judged by the slower established tier
+        // instead, so the burst must not fire.
+        assert!(!should_blank_recover(
+            QoeEvidence {
+                zero_streak: 2,
+                ..window_ending_in_a_zero(85, 4, 75)
+            },
+            true,
+            false,
+            ms(19_000),
+            ms(1_000),
+            ms(14_000),
+            1,
+            true,
+            Some(ms(8_000)),
+            &p
+        ));
+        // The connect-phase fast path is unchanged: before any attempt one
+        // zero past blank_max_wait still fires (the reactivation is cheap).
+        assert!(should_blank_recover(
+            qoe(1, 0, 0),
+            true,
+            false,
+            ms(4_000),
+            ms(4_000),
+            ms(4_000),
+            0,
+            false,
+            None,
+            &p
+        ));
+    }
+
+    #[test]
+    fn blank_recovery_post_attempt_zero_burst_escalates_a_real_blank() {
+        // Logged windows of drops that were real blanks (Windows App for
+        // macOS, Aug 2026): mostly zeros, short runs. With the zeros arriving
+        // densely (the last 3 within 3 s) every one still escalates.
+        let p = production_like_blank_params();
+        for (reports, zeros, best) in [
+            (15, 11, 2),
+            (23, 18, 2),
+            (18, 17, 1),
+            (5, 5, 0),
+            (17, 15, 1),
+            (10, 9, 1),
+            (4, 3, 1),
+            (3, 3, 0),
+        ] {
+            let w = window_ending_in_a_zero(reports, zeros, best);
+            assert!(
+                should_blank_recover(
+                    w,
+                    true,
+                    false,
+                    ms(30_000),
+                    ms(5_000),
+                    ms(5_000),
+                    1,
+                    true,
+                    Some(ms(3_000)),
+                    &p
+                ),
+                "missed a real blank {reports}/{zeros}/{best}"
+            );
+        }
+        // The burst arm is post-attempt only: a span handed in at attempts 0
+        // (which the caller never does) can't fire on its own. Inside
+        // blank_max_wait, so the connect fast path is out of the way too.
+        assert!(!should_blank_recover(
+            window_ending_in_a_zero(5, 5, 0),
+            true,
+            false,
+            ms(3_500),
+            ms(3_500),
+            ms(3_500),
+            0,
+            true,
+            Some(ms(1_000)),
+            &p
+        ));
+        // Total silence after the attempt (acks flowing, no QoE at all) still
+        // escalates on the heal-confirmation deadline.
+        assert!(should_blank_recover(
+            QoeEvidence::default(),
+            true,
+            false,
+            ms(30_000),
+            ms(30_000),
+            ms(8_000),
+            1,
+            true,
+            None,
+            &p
+        ));
+    }
+
+    #[test]
+    fn post_attempt_zero_span_measures_the_kth_newest_zero() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let zeros: VecDeque<Instant> = [at(0), at(50), at(55), at(58)].into_iter().collect();
+        // k = 3 → the third-newest zero (t = 50 s) to now (t = 60 s).
+        assert_eq!(post_attempt_zero_span(&zeros, 3, at(60)), Some(ms(10_000)));
+        assert_eq!(post_attempt_zero_span(&zeros, 1, at(60)), Some(ms(2_000)));
+        assert_eq!(post_attempt_zero_span(&zeros, 4, at(60)), Some(ms(60_000)));
+        // Fewer zeros than k, or k = 0 → None.
+        assert_eq!(post_attempt_zero_span(&zeros, 5, at(60)), None);
+        assert_eq!(post_attempt_zero_span(&zeros, 0, at(60)), None);
+        assert_eq!(post_attempt_zero_span(&VecDeque::new(), 3, at(60)), None);
     }
 
     #[test]
@@ -4746,6 +6161,7 @@ mod tests {
             ms(9000),
             1,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
         // A healed-but-static mstsc: a couple of honest nonzero reports and NO
@@ -4769,6 +6185,7 @@ mod tests {
             ms(9000),
             1,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
         // A zero-length deadline disables the branch outright.
@@ -4786,6 +6203,7 @@ mod tests {
             ms(60_000),
             1,
             true,
+            None, // post_attempt_zero_span
             &disabled
         ));
     }
@@ -4812,6 +6230,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // A stray/short zero run likewise holds off.
@@ -4824,6 +6243,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // But the disarm is still REVOCABLE: a genuinely sustained blackout
@@ -4838,6 +6258,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4860,6 +6281,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Same zeros but the last nonzero was recent → the transient window.
@@ -4872,6 +6294,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Long silence but too few zero reports: an IDLE session (frames stop,
@@ -4885,6 +6308,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Not established → this branch never applies. (since_connect kept
@@ -4900,6 +6324,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4921,6 +6346,7 @@ mod tests {
             ms(10_000),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Just over the established bar → the long window is required instead.
@@ -4933,6 +6359,7 @@ mod tests {
             ms(10_000),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -4971,6 +6398,7 @@ mod tests {
             ms(60_000),
             0,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
         // And it survives even the established wall-clock blackout inputs.
@@ -4983,6 +6411,7 @@ mod tests {
             ms(60_000),
             1,
             true,
+            None, // post_attempt_zero_span
             &p
         ));
     }
@@ -5006,6 +6435,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -5024,6 +6454,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         assert!(!should_blank_recover(
@@ -5035,6 +6466,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -5052,6 +6484,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Acks suspended (queueDepth sentinel) → congestion territory, not blank.
@@ -5064,6 +6497,7 @@ mod tests {
             ms(10_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -5081,6 +6515,7 @@ mod tests {
             ms(2999),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Too soon after the previous dance → hold.
@@ -5093,6 +6528,7 @@ mod tests {
             ms(4999),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Attempts exhausted → give up (client-side floor).
@@ -5105,6 +6541,7 @@ mod tests {
             ms(60_000),
             2,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Second attempt inside the cap, past the spacing → fires.
@@ -5117,6 +6554,7 @@ mod tests {
             ms(5000),
             1,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
     }
@@ -5140,6 +6578,7 @@ mod tests {
             ms(60_000), // long since last attempt
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // …but NOT once the client is ESTABLISHED (presented for a meaningful
@@ -5157,6 +6596,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Same but only 2 reports → the >=3 floor blocks it (guards a client
@@ -5170,6 +6610,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Zero reports (QoE-less client) never fires on the wall-clock path.
@@ -5182,6 +6623,7 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
         // Before blank_max_wait, with a low count → still holds (neither path
@@ -5195,8 +6637,23 @@ mod tests {
             ms(60_000),
             0,
             false, // acked_since_attempt — irrelevant unless the post-attempt deadline is under test
+            None,  // post_attempt_zero_span
             &p
         ));
+    }
+
+    #[test]
+    fn legacy_hold_lasts_until_egfx_is_ready_or_the_limit() {
+        let limit = ms(3000);
+        // Negotiating, within the limit: hold.
+        assert!(hold_legacy_for_egfx(false, false, ms(0), limit));
+        assert!(hold_legacy_for_egfx(false, false, ms(2999), limit));
+        // Limit reached without EGFX: send legacy.
+        assert!(!hold_legacy_for_egfx(false, false, ms(3000), limit));
+        // EGFX was ready once (a later on_close does not restart the hold).
+        assert!(!hold_legacy_for_egfx(true, false, ms(0), limit));
+        // The client declined EGFX (no AVC): legacy at once.
+        assert!(!hold_legacy_for_egfx(false, true, ms(0), limit));
     }
 
     #[test]
@@ -5359,46 +6816,12 @@ mod tests {
         avcc.extend_from_slice(&[0xAA, 0xAA, 0xAA]);
         avcc.extend_from_slice(&5u32.to_be_bytes());
         avcc.extend_from_slice(&[0xBB, 0xBB, 0xBB, 0xBB, 0xBB]);
-        let allocation = avcc.as_ptr();
-        let out = avcc_to_annex_b_in_place(avcc, &[], false);
+        let out = avcc_to_annex_b(&avcc, &[], false);
         let expected: Vec<u8> = [
             0, 0, 0, 1, 0xAA, 0xAA, 0xAA, 0, 0, 0, 1, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
         ]
         .into();
         assert_eq!(out, expected);
-        assert_eq!(
-            out.as_ptr(),
-            allocation,
-            "P-frame conversion must be zero-copy"
-        );
-    }
-
-    #[test]
-    fn avc444_nal_filter_keeps_only_parameter_sets_and_slices() {
-        let mut avcc = Vec::new();
-        for nal in [
-            &[0x06, 0x11][..],       // SEI: drop
-            &[0x67, 0x42][..],       // SPS: keep
-            &[0x68, 0xCE][..],       // PPS: keep
-            &[0x09, 0xF0][..],       // AUD: drop
-            &[0x65, 0xAA, 0xBB][..], // IDR: keep
-            &[0x0C, 0x80][..],       // filler: drop
-        ] {
-            avcc.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-            avcc.extend_from_slice(nal);
-        }
-
-        let filtered = retain_avc444_nals(avcc);
-        let mut expected = Vec::new();
-        for nal in [
-            &[0x67, 0x42][..],
-            &[0x68, 0xCE][..],
-            &[0x65, 0xAA, 0xBB][..],
-        ] {
-            expected.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-            expected.extend_from_slice(nal);
-        }
-        assert_eq!(filtered, expected);
     }
 
     #[test]
@@ -5411,12 +6834,165 @@ mod tests {
             v.extend_from_slice(&[0x65, 0x88]);
             v
         };
-        let out = avcc_to_annex_b_in_place(avcc, &[sps.clone(), pps.clone()], true);
+        let out = avcc_to_annex_b(&avcc, &[sps.clone(), pps.clone()], true);
         assert_eq!(&out[0..4], &[0, 0, 0, 1]);
         assert_eq!(&out[4..7], sps.as_slice());
         assert_eq!(&out[7..11], &[0, 0, 0, 1]);
         assert_eq!(&out[11..14], pps.as_slice());
         assert_eq!(&out[14..18], &[0, 0, 0, 1]);
         assert_eq!(&out[18..20], &[0x65, 0x88]);
+    }
+
+    /// A real per-connection context, built the way the server builds one: at
+    /// TCP accept, through `build_server_with_handle`.
+    fn gfx_with_context() -> Gfx {
+        let gfx = Gfx::new(
+            crate::capture::SharedDesktopSize::new(1920, 1080),
+            30,
+            5_000_000,
+            2.0,
+            2,
+            0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            true,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        );
+        assert!(gfx.build_server_with_handle().is_some());
+        gfx
+    }
+
+    /// Every connection-start clock, so a test can't pass by checking only the
+    /// one it happened to remember.
+    fn clocks(ctx: &ConnectionContext) -> [Instant; 11] {
+        [
+            ctx.epoch,
+            ctx.last_ack_at,
+            ctx.last_ack_advance_at,
+            ctx.last_ship_at,
+            ctx.last_recovery_at,
+            ctx.rtt_bucket_started,
+            ctx.last_throttle_ship,
+            ctx.adaptive_last_control,
+            ctx.last_floor_fps_pass,
+            ctx.last_nonzero_qoe_at,
+            ctx.last_blank_recovery_at,
+        ]
+    }
+
+    fn avc_ready() -> CapabilitySet {
+        CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED,
+        }
+    }
+
+    /// The bug (live, 2026-10-01): a Windows App login took 7-11 s between
+    /// accept and authentication, all counted as connected time, so blank
+    /// recovery ran a reactivation ~0.3 s after the first frame. A slow login
+    /// must not use up the detector's arm delay.
+    #[test]
+    fn a_slow_login_does_not_count_toward_the_connection_clocks() {
+        let gfx = gfx_with_context();
+        let login = Duration::from_secs(8);
+        {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.start_clocks(Instant::now() - login); // built 8 s before ready
+            ctx.client_supports_avc = true;
+        }
+        let ready_at = Instant::now();
+        GfxHandler {
+            ctx: gfx.ctx.clone(),
+        }
+        .on_ready(&avc_ready());
+
+        let guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_ref().unwrap();
+        assert!(ctx.is_ready);
+        for (i, clock) in clocks(ctx).iter().enumerate() {
+            assert!(*clock >= ready_at, "clock {i} still counts the login");
+        }
+        assert!(ctx.epoch.elapsed() < gfx.blank_params.arm_delay);
+    }
+
+    /// A capabilities re-advertise on a live connection is not a new start:
+    /// restarting the clocks then would push detection back by an arm delay.
+    #[test]
+    fn a_mid_session_ready_keeps_the_connection_clocks() {
+        let gfx = gfx_with_context();
+        let started = Instant::now() - Duration::from_secs(10);
+        {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.start_clocks(started);
+            ctx.client_supports_avc = true;
+            ctx.is_ready = true;
+        }
+        GfxHandler {
+            ctx: gfx.ctx.clone(),
+        }
+        .on_ready(&avc_ready());
+
+        let guard = gfx.ctx.lock().unwrap();
+        assert_eq!(clocks(guard.as_ref().unwrap()), [started; 11]);
+    }
+
+    /// A declined (no-AVC) client never goes ready, so its clocks are left alone.
+    #[test]
+    fn a_declined_client_does_not_start_the_clocks() {
+        let gfx = gfx_with_context();
+        let built = Instant::now() - Duration::from_secs(8);
+        gfx.ctx
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .start_clocks(built);
+        GfxHandler {
+            ctx: gfx.ctx.clone(),
+        }
+        .on_ready(&avc_ready()); // client_supports_avc is false: declined
+
+        let guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_ref().unwrap();
+        assert!(!ctx.is_ready);
+        assert_eq!(clocks(ctx), [built; 11]);
+    }
+
+    /// The capture loop holds a pre-EGFX frame only while the pipeline is
+    /// still coming: pending until the client's graphics channel is confirmed
+    /// (ready) or declined, and never without a connection.
+    #[test]
+    fn pipeline_state_tracks_the_graphics_channel() {
+        let gfx = gfx_with_context();
+        assert!(gfx.pipeline_pending());
+        assert!(!gfx.pipeline_ready());
+
+        gfx.ctx
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .client_supports_avc = true;
+        GfxHandler {
+            ctx: gfx.ctx.clone(),
+        }
+        .on_ready(&avc_ready());
+        assert!(gfx.pipeline_ready());
+        assert!(!gfx.pipeline_pending());
+
+        let declined = gfx_with_context();
+        GfxHandler {
+            ctx: declined.ctx.clone(),
+        }
+        .on_ready(&avc_ready()); // no AVC
+        assert!(!declined.pipeline_ready());
+        assert!(!declined.pipeline_pending());
+
+        *gfx.ctx.lock().unwrap() = None;
+        assert!(!gfx.pipeline_ready());
+        assert!(!gfx.pipeline_pending());
     }
 }

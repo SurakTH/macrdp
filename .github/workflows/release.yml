@@ -2,6 +2,8 @@ name: release
 
 on:
   push:
+    branches:
+      - 'codex/sync-upstream-*'
     tags:
       - 'v*'
   workflow_dispatch:
@@ -99,6 +101,20 @@ jobs:
           set -euo pipefail
           test -f Cargo.lock || { echo "Cargo.lock missing — commit it for reproducible release builds"; exit 1; }
 
+      # Before building anything that ships: every IronRDP pin must be one commit
+      # on a protected macrdp* branch of clintcan/IronRDP (see the script). Uses
+      # the script from the tag being built. Tags from before the script (v0.10.7
+      # and older) built IronRDP from in-repo copies, so there is nothing to check.
+      - name: Check the IronRDP pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f scripts/check-ironrdp-pin.sh ]; then
+            scripts/check-ironrdp-pin.sh
+          else
+            echo "this tag predates scripts/check-ironrdp-pin.sh; nothing to check"
+          fi
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
@@ -149,7 +165,7 @@ jobs:
         # VERSION comes from a tag name / dispatch input; pass it via env (never
         # inline in the script) so a maliciously-named tag can't inject shell.
         env:
-          VERSION: ${{ inputs.tag || github.ref_name }}
+          VERSION: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || format('preview-{0}', github.run_id) }}
         run: |
           set -euo pipefail
           NAME="macrdp-${VERSION}-${{ matrix.target }}"
@@ -229,7 +245,7 @@ jobs:
         shell: bash
         # VERSION via env (not inline) — same shell-injection hardening as above.
         env:
-          VERSION: ${{ inputs.tag || github.ref_name }}
+          VERSION: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || format('preview-{0}', github.run_id) }}
         run: |
           set -euo pipefail
           NAME="macrdp-${VERSION}-${{ matrix.target }}-app"
@@ -247,7 +263,7 @@ jobs:
         id: stagedmg
         shell: bash
         env:
-          VERSION: ${{ inputs.tag || github.ref_name }}
+          VERSION: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || format('preview-{0}', github.run_id) }}
         run: |
           set -euo pipefail
           NAME="macrdp-${VERSION}-${{ matrix.target }}"
@@ -283,6 +299,7 @@ jobs:
   release:
     name: publish release
     needs: build
+    if: ${{ github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.tag != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

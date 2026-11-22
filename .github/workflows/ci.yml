@@ -73,28 +73,33 @@ jobs:
           RUSTFLAGS: ''
         run: cargo test --locked
 
-      - name: Test bitmap and RemoteFX server logic
-        env:
-          RUSTFLAGS: ''
-        run: cargo test --locked -p ironrdp-server --lib
-
-      # ironrdp-egfx is a vendored path dependency, not a workspace member.
-      # Root `cargo test` compiles it but does not run its own PDU/region tests.
-      - name: Test ironrdp-egfx (vendored AVC region logic)
-        env:
-          RUSTFLAGS: ''
-        run: cargo test --locked -p ironrdp-egfx
-
-      # vendor/ironrdp-rdpeudp is a STANDALONE crate (not a workspace member, so
+      # vendor/macrdp-rdpeudp is a STANDALONE crate (not a workspace member, so
       # the root cargo test/fmt don't reach it). It's platform-independent
       # (sans-I/O wire codecs + reliability state machine), so test + fmt-check
       # it here. It resolves ironrdp-core via its own [patch.crates-io].
-      - name: Test ironrdp-rdpeudp (standalone vendored crate)
+      - name: Test macrdp-rdpeudp (standalone crate)
         env:
           RUSTFLAGS: ''
         run: |
-          cargo fmt --manifest-path vendor/ironrdp-rdpeudp/Cargo.toml -- --check
-          cargo test --manifest-path vendor/ironrdp-rdpeudp/Cargo.toml
+          cargo fmt --manifest-path vendor/macrdp-rdpeudp/Cargo.toml -- --check
+          cargo test --manifest-path vendor/macrdp-rdpeudp/Cargo.toml
+
+      # ironrdp-server comes from clintcan/IronRDP (branch `macrdp`) and its
+      # manifest sets `[lib] test = false`, so the root `cargo test` never runs
+      # its unit tests (the divergence tests, e.g. the surface command per codec
+      # of divergence (34)). scripts/check-ironrdp-pin.sh first checks that
+      # every IronRDP pin is one commit on a protected macrdp* branch of
+      # clintcan/IronRDP, then leaves that commit checked out; `--lib` runs the
+      # tests there. Platform-independent, so Linux is enough. `egfx` as macrdp
+      # builds it; `multitransport` (BoringSSL from source) is left out to keep
+      # the job fast. `--locked` uses the fork's committed Cargo.lock.
+      - name: Test ironrdp-server (clintcan/IronRDP at the pinned rev, unit tests)
+        env:
+          RUSTFLAGS: ''
+        run: |
+          dir="$RUNNER_TEMP/ironrdp"
+          scripts/check-ironrdp-pin.sh --checkout "$dir"
+          cargo test --locked --manifest-path "$dir/crates/ironrdp-server/Cargo.toml" --lib --features egfx
 
   test-macos:
     name: test (macos)
