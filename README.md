@@ -1,4 +1,4 @@
-# macrdp Surak
+# S' MacRDP
 
 [![Fork release](https://img.shields.io/github/v/release/SurakTH/macrdp?include_prereleases&label=fork%20release)](https://github.com/SurakTH/macrdp/releases)
 [![Upstream release](https://img.shields.io/github/v/release/clintcan/macrdp?sort=semver&label=upstream%20release)](https://github.com/clintcan/macrdp/releases/latest)
@@ -25,11 +25,36 @@ This is the macOS equivalent of `xrdp`. Not a client, not a VNC bridge.
 
 v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-latency and mobile links included). Scope and limits: [Production readiness](#production-readiness).
 
-**Fork download: [v0.9.6.2](https://github.com/SurakTH/macrdp/releases/tag/v0.9.6.2)**. The installer includes the server and the menu-bar Controller. The app reports the internal version `0.96.2`.
+## Fork releases
 
-**Upstream integration preview:** this branch brings in [clintcan/macrdp v0.10.9](https://github.com/clintcan/macrdp/releases/tag/v0.10.9), including changes to Windows App startup, connection-quality reporting and the IronRDP dependency. Use the Stable Controller profile when comparing with the previous fork release. Fast flush and AVC444 are experimental, and 4K/60 still needs client validation.
+### v0.10.9.2
 
-**Recent upstream releases**
+- **Experimental H.265 (HEVC)** adds 1080p/60, 1440p/60 and 4K/60 profiles for compatible Windows App clients. macrdp falls back to H.264 when supported by the client. The Controller's Performance tab shows the codec in use.
+- **Video tuning** adds TCP pacing to the 4K/60 HEVC profile and increases the number of frames the Stable 1080p/60 H.264 profile can have in flight from one to two. HEVC at 4K/60 remains a preview.
+- **Lower-latency PCM audio** adds an optional Core Audio Tap on macOS 14.2 and later. PCM sends audio in 10 ms packets, and the Tap path can queue up to 120 ms of audio during a brief TCP write stall. ScreenCaptureKit remains the default capture path, and AAC remains available as an option.
+
+<details>
+<summary>View screenshot from the H.265 (HEVC) 4K/60 test</summary>
+
+Windows App's Connection Information shows HEVC as the active codec and lists GPU support for HEVC. The session used the experimental **4K HEVC profile** with a **60 FPS target**. Select the image to open the full-size screenshot.
+
+[![Windows App Connection Information showing HEVC as the active codec during a 4K test](docs/images/hevc-4k60-windows-app.png)](docs/images/hevc-4k60-windows-app.png)
+
+</details>
+
+[Download v0.10.9.2](https://github.com/SurakTH/macrdp/releases/tag/v0.10.9.2) or read the [full release notes](docs/releases/v0.10.9.2.md). See the [video guide](docs/video.md) and [audio guide](docs/audio.md) for setup and testing details.
+
+### v0.10.9.1
+
+[Download v0.10.9.1](https://github.com/SurakTH/macrdp/releases/tag/v0.10.9.1) for the server and menu-bar Controller. This fork release builds on upstream v0.10.9.
+
+- **Stable 1080p/60** uses H.264 AVC420 over TCP with a 60 Mbps adaptive bitrate target. Fast typing, document scrolling, restoring a minimized session and video playback with audio were tested over a wired connection.
+- **Experimental 4K profiles** add a 4K/60 Preview with direct NV12 capture and a Sharp Text (LAN) preset with a higher bitrate target.
+- **Controller and shortcuts** add a compact profile menu, a preview of settings changes before Apply, separate capture and TCP write timings, and improvements to Space switching, language switching and screenshot shortcuts.
+
+See the [full v0.10.9.1 release notes](docs/releases/v0.10.9.1.md).
+
+## Recent upstream releases
 
 - **v0.10.7** (2026-11-20) — no frozen start on Windows 10 mstsc, an ack-lag cap, UDP out of experimental
 - **v0.10.6** (2026-11-16) — no restart loop on a wrong password, a HiDPI virtual display, Windows 10 mstsc pictures
@@ -56,13 +81,11 @@ Full per-release notes (what shipped, what was verified live, and the war storie
 
 ## Production readiness
 
-Short version: **production-ready for single-user use on a LAN or VPN** — soak-tested past 48 h twice with no leaks or panics, hardened, and abuse-tested. **Not an enterprise RDP server:** one session at a time, a solo project with no SLA, and features marked *experimental* (for example USB, microphone, lock-on-disconnect/auto-unlock) haven't been soak-tested. **Never expose it — or any RDP server — on a public IP;** reach it over a VPN or RD Gateway.
+**For daily use**, start with the Controller's **Stable** profile, which uses H.264 at 1080p/60. Try the HEVC previews with a compatible Windows App client and check the active codec in the Controller's **Performance** tab.
 
-**Solid (verified on real mstsc / Microsoft Remote Desktop / FreeRDP):** TLS + NLA/CredSSP auth against your Mac account (Keychain-backed, real CA certs supported, per-IP rate-limiting + lockout + audit log); the full daily workflow (display, input incl. non-US layouts, clipboard/files both ways, audio, drive + smart-card redirection, headless virtual displays); H.264 with congestion-responsive rate control that degrades gracefully instead of freezing; signed/notarized packaging with a LaunchAgent, menu-bar controller, and a health-check watchdog; soak-tested past 48 h twice (v0.9.3, v0.9.6; no leaks, 0 panics) and abuse-tested; 250+ tests in CI.
+S' MacRDP supports one active desktop session at a time. The Mac user must be logged in, and some protected windows and DRM video may appear black. Connect over a trusted LAN, VPN or RD Gateway. Keep the RDP port off the public internet.
 
-**Know before relying on it:** single session/single user; no multi-monitor or printer redirection; DRM video and password-manager windows capture black (macOS policy, not fixable); synthetic input can't reach the login window/secure fields (same); reconnecting *mstsc* can briefly show a blank screen (client quirk — the server now auto-heals it in ~4 s by reactivating the RDP core in place, no user action); the UDP paths are opt-in and newer than the TCP core; it's a solo v0 on vendored [IronRDP] forks, no SLA. **Never expose any RDP server on a raw public IP — reach it over a VPN or RD Gateway.**
-
-Details and the path to closing the gaps: [docs/production-readiness-roadmap.md](docs/production-readiness-roadmap.md).
+See the [upstream readiness record](docs/production-readiness-roadmap.md) for historical soak tests and client coverage.
 
 Rust is pinned to **1.95.0**, matching CI, in `rust-toolchain.toml`. When using
 Homebrew Rust without rustup, select that version explicitly for reproducible
@@ -71,19 +94,24 @@ handler together with the server; see [smart-card setup](docs/smart-card-redirec
 
 ## Quick start
 
-**With Homebrew** (Apple Silicon, macOS 14+), installing the same notarized build as the releases:
+### Install S' MacRDP from GitHub
 
-```bash
-brew tap clintcan/tap
-brew trust clintcan/tap    # current Homebrew asks you to trust third-party taps
-brew install --cask macrdp
-```
+1. On an Apple Silicon Mac running macOS 14 or later, download the DMG for a published release from [SurakTH/macrdp Releases](https://github.com/SurakTH/macrdp/releases). Drag both `macrdp.app` and `macrdp Controller.app` to Applications.
+2. Open **macrdp Controller** from Applications. Select its display icon in the menu bar and choose **Start (first run sets up)**. Enter your Mac account password when prompted.
+3. In **System Settings → Privacy & Security**, grant **Screen & System Audio Recording** and **Accessibility** to the installed `macrdp.app`. Restart the server from the Controller after granting permissions.
+4. To connect from another computer on a trusted network, enable **Allow connections from the network** in the Controller and click **Apply**. In your RDP client, connect to `<your-mac-ip>:3390` using your Mac account.
 
-Then open **macrdpController** from /Applications. It's a menu-bar app, so nothing appears in the Dock; the first time, a short welcome points you to it. Look for a small display icon in the menu bar (dimmed while the server isn't running), click it and choose **Start (first run sets up)**. That asks for your Mac password, stores it in the Keychain, and sets the server to start at login; then turn on Screen Recording and Accessibility for macrdp in System Settings › Privacy & Security (the controller offers to open it). If you can't see the icon, it may be hidden behind the notch or by the Menu Bar settings in System Settings. After `brew upgrade`, restart the server with `launchctl kickstart -k gui/$UID/com.clintcan.macrdp`. It's a cask rather than a formula on purpose: only the signed app carries the entitlement USB redirection needs, and it keeps your permission grants across upgrades.
+If the server stops starting after an update or move, open the Controller's **Status** tab and choose **Repair Installation**.
+
+### Homebrew for upstream macrdp
+
+The [`clintcan/tap` Homebrew tap](https://github.com/clintcan/homebrew-tap) distributes the original macrdp. For S' MacRDP builds and fork-specific features, use the GitHub releases above.
+
+### Connecting after a reboot
 
 **After a reboot, someone has to log in before you can connect.** macrdp runs in your user session, which only starts once you log in, so it can't show the login screen ([#237](https://github.com/clintcan/macrdp/issues/237)). With FileVault on, no remote-desktop server can, since the disk unlocks before macOS starts any network service. To get in after a reboot, log in once with macOS Screen Sharing (VNC) and then connect over RDP. For a planned reboot with FileVault on, `sudo fdesetup authrestart` unlocks the disk for that one restart. Automatic login (System Settings › Users & Groups, FileVault off only) also works, at the cost of the Mac booting straight to an unlocked desktop.
 
-**From source:**
+### Run from source
 
 ```bash
 ./start.sh doctor   # read-only preflight; does not build or start the server
@@ -97,7 +125,7 @@ verified by macrdp itself at launch because macOS does not expose a reliable
 read-only shell query for another binary's TCC grants.
 
 Other presets: `./start.sh lan` for maximum practical quality on a clean LAN
-(HiDPI AVC420, 60 FPS, 50 Mbps, stable TCP and latency-free PCM audio), `./start.sh native`
+(HiDPI AVC420, 60 FPS, 50 Mbps, stable TCP and uncompressed PCM audio), `./start.sh native`
 for the sharpest HiDPI bitmap text/UI at a stable 12 FPS, or `./start.sh fast`
 for the lowest-latency H.264 LAN setup. For a manual build,
 run `cargo build --release && codesign -s - --force target/release/macrdp`.
@@ -145,6 +173,14 @@ Optional flags: `--alt-tab-switch` / `--alt-backtick-switch` / `--alt-space-spot
 
 ## Auto-start at login (launchd)
 
+The bundled Controller manages the fork's LaunchAgent, `io.github.surakth.macrdp`. To restart that service from Terminal, run:
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/io.github.surakth.macrdp"
+```
+
+For a command-line installation, use the standalone installer below. Run just one installation on port 3390.
+
 ```bash
 dist/install.sh
 ```
@@ -154,12 +190,12 @@ Builds + signs + installs to `~/.local/bin/macrdp`, stores your Mac password in 
 ```bash
 launchctl print gui/$UID/com.user.macrdp | head    # status
 launchctl kickstart -k gui/$UID/com.user.macrdp    # restart
-launchctl bootout gui/$UID/com.user.macrdp         # stop / uninstall
+launchctl bootout gui/$UID/com.user.macrdp         # unload the agent
 ```
 
 ## Building the full app
 
-`dist/install.sh` installs a bare binary. For a proper **signed `macrdp.app`** — stable bundle identity (TCC grants survive rebuilds), background-agent behavior, the embedded smart-card IFD handler, optional notarization, the menu-bar controller app, and a distributable DMG:
+`dist/install.sh` installs a bare binary. For a proper **signed `macrdp.app`** — bundle identity, background-agent behavior, the embedded smart-card IFD handler, optional notarization, the menu-bar controller app, and a distributable DMG:
 
 ```bash
 packaging/make-app.sh                                 # build + sign + install to /Applications
@@ -167,9 +203,10 @@ gui/make-tray-app.sh                                  # build + install macrdp C
 open "/Applications/macrdp Controller.app"            # click Start; onboarding is in the app
 ```
 
-The controller exposes Ultimate, LAN Max, Native, and Fast profiles plus LAN
-access and an exact-address Allowed IP field. Feature toggles, bind address, and
-extra flags live in `~/Library/Application Support/macrdp/config.env` — outside
+The Controller includes the Stable profile and presets for LAN, bitmap and
+experimental video modes. Network settings can restrict access to specific
+client IP addresses. Feature toggles, bind address, and extra flags live in
+`~/Library/Application Support/macrdp/config.env` — outside
 the bundle, so edits never disturb the signature or TCC grants. The full
 Controller self-installs the LaunchAgent and repairs an obsolete executable path
 after either app is moved or replaced; **Repair Installation** on Status reruns
@@ -181,18 +218,16 @@ app, icons, TCC notes): **[packaging/README.md](packaging/README.md)**.
 
 ## Release artifacts
 
-Pushing a `v*` tag runs the [release workflow](.github/workflows/release.yml), which builds on an Apple-Silicon runner and attaches these to a draft GitHub Release (Apple Silicon / `aarch64-apple-darwin` only). Tags containing a suffix such as `-controller.1` are marked as pre-releases automatically:
+The fork's [release workflow](.github/workflows/release.yml) builds these downloads for Apple Silicon (`aarch64-apple-darwin`) when a version tag is pushed.
 
-| File | What it is |
-|------|------------|
-| `macrdp-<ver>-aarch64-apple-darwin.dmg` | easiest install: **`macrdp.app` + `macrdp Controller.app`** and an Applications drop-link |
-| `macrdp-<ver>-aarch64-apple-darwin.tar.gz` | the **bare CLI binary** + `LICENSE`/`README` |
-| `macrdp-<ver>-aarch64-apple-darwin-app.zip` | the full **`macrdp.app`**, with the embedded smart-card IFD handler + installer — the only standalone artifact that carries everything `--enable-smartcard-redirection` needs |
-| `SHA256SUMS` | checksums for every downloadable archive |
+| File | What's included |
+|------|-----------------|
+| `macrdp-<ver>-aarch64-apple-darwin.dmg` | `macrdp.app` and `macrdp Controller.app`, with an Applications shortcut |
+| `macrdp-<ver>-aarch64-apple-darwin.tar.gz` | Standalone CLI binary and project documentation |
+| `macrdp-<ver>-aarch64-apple-darwin-app.zip` | Server app bundle, including the smart-card IFD handler and installer |
+| `SHA256SUMS` | SHA-256 checksums for the downloadable files |
 
-Both are **ad-hoc signed, not notarized** — open the app once via **right-click → Open** (or `xattr -dr com.apple.quarantine macrdp.app`).
-
-Each release also carries **`macrdp-<ver>-usb.dmg`**, built and attached by hand rather than in CI: the **Developer-ID-signed, notarized, entitled** build with both the server and the menu-bar controller app. It's the only build in which `--enable-usb-redirection` works, and it's what the [Homebrew cask](#quick-start) installs. To make your own signed build, use [packaging/make-app.sh](packaging/README.md).
+The fork's CI builds are ad-hoc signed and ship without Apple notarization. If macOS blocks a trusted download, follow [Apple's app-opening instructions](https://support.apple.com/en-us/102445). For Developer ID signing, notarization or an entitled USB build, see the [packaging guide](packaging/README.md).
 
 ## Documentation
 
