@@ -1112,12 +1112,40 @@ mod macos {
     /// never opens the graphics channel.
     const EGFX_PENDING_FRAME_WINDOW: Duration = Duration::from_secs(5);
 
-    /// Samples kept for a consumer that falls behind; the oldest is dropped.
+    /// Maximum samples retained while the consumer is busy.
     const SAMPLE_BUFFER: usize = 4;
+
+    // At capacity, keep the newest renderable desktop even when only idle
+    // notifications follow. Index SAMPLE_BUFFER means discard the incoming sample.
+    fn eviction_index(
+        mut queued_content: impl Iterator<Item = bool>,
+        incoming_content: bool,
+    ) -> usize {
+        queued_content
+            .position(|content| !content)
+            .unwrap_or(if incoming_content { 0 } else { SAMPLE_BUFFER })
+    }
+
+    #[test]
+    fn idle_burst_cannot_displace_the_last_visible_update() {
+        let mut queue = std::collections::VecDeque::from([Some(1), Some(2), Some(3), Some(4)]);
+        for incoming in std::iter::repeat_n(None, 12).chain([Some(5)]) {
+            let i = eviction_index(queue.iter().map(Option::is_some), incoming.is_some());
+            if queue.remove(i).is_some() {
+                queue.push_back(incoming);
+            }
+        }
+        assert_eq!(queue, [Some(2), Some(3), Some(4), Some(5)]);
+        assert_eq!(
+            eviction_index([true, false, true, true].into_iter(), true),
+            1
+        );
+    }
 
     struct CaptureSample {
         buffer: CMSampleBuffer,
         status: Option<SCFrameStatus>,
+        received_at: Option<Instant>,
     }
 
     impl CaptureSample {
@@ -1182,22 +1210,30 @@ mod macos {
             let on_sample = Arc::clone(&samples);
             stream.add_output_handler(
                 move |sample: CMSampleBuffer, _| {
+                    let stats = crate::stats::global();
                     let status = sample.frame_status();
                     let sample = CaptureSample {
                         buffer: sample,
                         status,
+                        received_at: stats.map(|_| Instant::now()),
                     };
                     let mut q = on_sample.queue.lock().unwrap();
-                    if let Some(stats) = crate::stats::global() {
+                    if let Some(stats) = stats {
                         stats.capture_samples.fetch_add(1, Ordering::Relaxed);
                         if !sample.has_content() {
                             stats.capture_idle.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     if q.samples.len() >= SAMPLE_BUFFER {
-                        q.samples.pop_front();
-                        if let Some(stats) = crate::stats::global() {
+                        let index = eviction_index(
+                            q.samples.iter().map(CaptureSample::has_content),
+                            sample.has_content(),
+                        );
+                        if let Some(stats) = stats {
                             stats.capture_superseded.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if q.samples.remove(index).is_none() {
+                            return;
                         }
                     }
                     q.samples.push_back(sample);
@@ -2051,6 +2087,7 @@ mod macos {
         /// The capture loop. Kept on anyhow; the trait impl below converts at the boundary.
         async fn capture_next_update(&mut self) -> Result<Option<DisplayUpdate>> {
             loop {
+                crate::capture_fairness::yield_capture_turn().await;
                 // EXPERIMENTAL blank-recovery: if the H.264 blank detector armed
                 // a bare core reactivation (BlankAction::Reactivate), emit a
                 // no-op DisplayUpdate::Resize to the same size. The vendored
@@ -2263,6 +2300,7 @@ mod macos {
                     }
                     continue;
                 }
+                let received_at = sample.received_at;
                 let sample = sample.buffer;
 
                 if let Some(stats) = crate::stats::global() {
@@ -2387,6 +2425,13 @@ mod macos {
                         false,
                     ) {
                         Ok(outcome @ (Submitted | Deferred)) => {
+                            if matches!(outcome, Submitted) {
+                                if let (Some(received_at), Some(stats)) =
+                                    (received_at, crate::stats::global())
+                                {
+                                    stats.capture_to_submit.record(received_at.elapsed());
+                                }
+                            }
                             self.held_frame = false;
                             // Keep the newest pixels, even if the encoder was
                             // busy. The flush timer retries them if capture goes idle.

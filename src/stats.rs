@@ -24,6 +24,24 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+#[derive(Default)]
+pub struct StageTiming {
+    samples: AtomicU64,
+    total_us: AtomicU64,
+}
+
+impl StageTiming {
+    pub fn record(&self, elapsed: std::time::Duration) {
+        self.total_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn sample_count(&self) -> u64 {
+        self.samples.load(Ordering::Relaxed)
+    }
+}
+
 /// The live snapshot. Every field is an atomic so the encode path can update it
 /// lock-free; the listener reads it under no lock either. Values are best-effort
 /// and eventually-consistent. Video activity tracks the encoder session, not
@@ -74,6 +92,8 @@ pub struct SessionStats {
     /// Source buffer allocation, copy or conversion before AVC420 submission.
     pub encode_prepared: AtomicU64,
     pub encode_prepare_total_us: AtomicU64,
+    pub capture_to_submit: StageTiming,
+    pub tcp_dispatch: StageTiming,
     pub ack_samples: AtomicU64,
     pub ack_sample_uptime_ms: AtomicU64,
     pub ack_rtt_ms: AtomicU32,
@@ -225,6 +245,18 @@ impl SessionStats {
             self.ack_samples.load(Ordering::Relaxed), self.ack_sample_uptime_ms.load(Ordering::Relaxed),
             self.ack_rtt_ms.load(Ordering::Relaxed), self.ack_queue_ms.load(Ordering::Relaxed),
         ));
+        for (name, stage) in [
+            ("capture_to_submit", &self.capture_to_submit),
+            ("tcp_dispatch", &self.tcp_dispatch),
+        ] {
+            use std::fmt::Write as _;
+            let samples = stage.sample_count();
+            let total_us = stage.total_us.load(Ordering::Relaxed);
+            let _ = write!(
+                json,
+                ",\"{name}_samples\":{samples},\"{name}_total_us\":{total_us}"
+            );
+        }
         json.push('}');
         json
     }

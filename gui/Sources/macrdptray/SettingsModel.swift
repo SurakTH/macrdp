@@ -8,7 +8,7 @@ import SwiftUI
 /// Network exposure is deliberately not part of a performance profile; the
 /// user enables LAN access separately and sees the existing security warning.
 enum PerformanceProfile: String, CaseIterable, Identifiable {
-    case stable, ultimate, lan, native, fast, fourK
+    case stable, ultimate, lan, native, fast, fourK, fourKText
 
     var id: String { rawValue }
 
@@ -20,13 +20,14 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
         case .native: return "Native"
         case .fast: return "Fast"
         case .fourK: return "4K/60 Preview"
+        case .fourKText: return "4K/60 Sharp Text (LAN)"
         }
     }
 
     var detail: String {
         switch self {
         case .stable:
-            return "Recommended for typing: 1080p AVC420, 60 FPS, 25 Mbps adaptive, TCP and stable flush cadence."
+            return "1080p AVC420 at 60 FPS with a 60 Mbps adaptive bitrate target over TCP. Tested on wired LAN."
         case .ultimate:
             return "Best overall balance: AVC420 at 60 FPS, 25 Mbps adaptive, UDP offered, AAC."
         case .lan:
@@ -35,6 +36,8 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             return "Sharpest text and UI: HiDPI bitmap/RemoteFX at a stable 12 FPS."
         case .fast:
             return "Lowest latency: AVC420 at 60 FPS, 50 Mbps and a minimal one-frame pipeline."
+        case .fourKText:
+            return "Sharper text while scrolling on a fast wired LAN. Uses the 4K/60 Preview settings with a 100 Mbps adaptive ceiling."
         case .fourK:
             return "4K at up to 60 FPS with NV12 capture, 60 Mbps adaptive, and TCP. Virtual displays use their own resolution or the client's request."
         }
@@ -44,8 +47,6 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
         var values = [
             "AVC444": "0",
             "CAPTURE_SIZE": "",
-            "MAP_CTRL_TO_CMD": "1",
-            "ALT_TAB_SWITCH": "1",
             "UDP_MIGRATE_EGFX": "0",
             "KEYFRAME_INTERVAL": "2.0",
             "KEYFRAME_CHANGE_PCT": "20",
@@ -64,7 +65,7 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             values.merge([
                 "ENABLE_H264": "1", "HIDPI": "0", "CAPTURE_SIZE": "1920x1080",
                 "ENABLE_AAC": "0", "ADAPTIVE_BITRATE": "1", "ENABLE_UDP_MULTITRANSPORT": "0",
-                "BITRATE": "25", "FPS": "60", "KEYFRAME_ON_CHANGE": "1",
+                "BITRATE": "60", "FPS": "60", "KEYFRAME_ON_CHANGE": "1",
                 "KEYFRAME_CHANGE_PCT": "15", "KEYFRAME_CLICK_PCT": "3",
                 "H264_FRAMES_IN_FLIGHT": "1", "FLUSH_FRAMES": "2",
                 "UNMINIMIZE": "0", "BLANK_RECOVERY": "0",
@@ -102,11 +103,11 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
                 "H264_FRAMES_IN_FLIGHT": "1", "UNMINIMIZE": "0",
                 "BLANK_RECOVERY": "0",
             ]) { _, new in new }
-        case .fourK:
+        case .fourK, .fourKText:
             values.merge([
                 "ENABLE_H264": "1", "HIDPI": "0", "CAPTURE_SIZE": "3840x2160",
                 "ENABLE_AAC": "0", "ADAPTIVE_BITRATE": "1", "ENABLE_UDP_MULTITRANSPORT": "0",
-                "BITRATE": "60", "FPS": "60", "KEYFRAME_ON_CHANGE": "0",
+                "BITRATE": self == .fourKText ? "100" : "60", "FPS": "60", "KEYFRAME_ON_CHANGE": "0",
                 "H264_FRAMES_IN_FLIGHT": "2", "FLUSH_FRAMES": "2",
                 "RESPONSIVE_CAPTURE": "1", "CAPTURE_NV12": "1",
                 "UNMINIMIZE": "0", "BLANK_RECOVERY": "0",
@@ -231,6 +232,73 @@ final class SettingsModel: ObservableObject {
 
     var appliedProfile: PerformanceProfile? {
         PerformanceProfile.allCases.first { $0.matches(saved) }
+    }
+
+    struct ProfileChange: Equatable {
+        let label: String
+        let saved: String
+        let pending: String
+    }
+
+    var pendingProfileChanges: [ProfileChange] {
+        zip(Self.profileSummary(saved), Self.profileSummary(draft)).compactMap { before, after in
+            guard before.value != after.value else { return nil }
+            return ProfileChange(label: before.label, saved: before.value, pending: after.value)
+        }
+    }
+
+    private static func profileSummary(_ config: [String: String]) -> [(label: String, value: String)] {
+        let extra = config["EXTRA_FLAGS"] ?? ""
+        func number(_ key: String, flag: String, fallback: String) -> String {
+            if let value = config[key], !value.isEmpty { return value }
+            return extraFlagValue(flag, in: extra) ?? fallback
+        }
+        func toggle(_ key: String, when available: Bool = true) -> String {
+            available && settingEnabled(key, in: config) ? "On" : "Off"
+        }
+        let physicalSize = config["CAPTURE_SIZE"] ?? ""
+        let video = settingEnabled("ENABLE_H264", in: config)
+        let avc444 = settingEnabled("AVC444", in: config)
+        let size = config["VIRTUAL_DISPLAY"] == "1"
+            ? "Virtual display · " + formattedSize(virtualResolution(config))
+            : physicalSize.isEmpty
+                ? (config["HIDPI"] == "1" ? "Native Retina" : "Automatic")
+                : formattedSize(physicalSize)
+        let fps = number("FPS", flag: "--fps", fallback: video ? "60" : "15")
+        let bitrate = number("BITRATE", flag: "--bitrate", fallback: "6")
+        let pacing = UInt32(pacingLimit(in: config)) ?? 0
+        let flush = flushSummary(config)
+        let trailing = number("FLUSH_FRAMES", flag: "--flush-frames", fallback: "4")
+        return [
+            ("Capture size", size),
+            ("Frame rate limit", "\(fps) fps"),
+            ("Bitrate ceiling", video ? "\(bitrate) Mbps" : "Unavailable"),
+            ("Video codec", video ? (avc444 ? "H.264 AVC444" : "H.264 AVC420") : "Bitmap / RemoteFX"),
+            ("Adaptive bitrate", toggle("ADAPTIVE_BITRATE", when: video)),
+            ("Capture mode", video && !avc444 && settingEnabled("CAPTURE_NV12", in: config) ? "NV12" : "Standard"),
+            ("Responsive capture", toggle("RESPONSIVE_CAPTURE", when: video)),
+            ("Encoder queue", video ? number("H264_FRAMES_IN_FLIGHT", flag: "--h264-frames-in-flight", fallback: "2") : "Unavailable"),
+            ("Trailing frames", video ? "\(trailing) · \(flush)" : "Unavailable"),
+            ("Keyframe interval", video ? number("KEYFRAME_INTERVAL", flag: "--keyframe-interval", fallback: "2.0") + " s" : "Unavailable"),
+            ("Keyframes on screen changes", toggle("KEYFRAME_ON_CHANGE", when: video)),
+            ("TCP video pacing", video && pacing > 0 ? "\(pacing) frames" : "Off"),
+            ("UDP network offer", toggle("ENABLE_UDP_MULTITRANSPORT")),
+            ("Video over UDP", toggle("UDP_MIGRATE_EGFX", when: video)),
+            ("Audio format", settingEnabled("ENABLE_AAC", in: config) ? "AAC when supported" : "PCM"),
+            ("Loss-resilient UDP audio", toggle("ENABLE_LOSSY_AUDIO")),
+            ("Restore minimized windows", toggle("UNMINIMIZE")),
+            ("Blank screen recovery", toggle("BLANK_RECOVERY")),
+            ("Live performance statistics", toggle("STATS_ENDPOINT")),
+        ]
+    }
+
+    private static func formattedSize(_ size: String) -> String {
+        size.replacingOccurrences(of: "x", with: " × ")
+    }
+
+    var profileVirtualDisplaySize: String? {
+        guard bool("VIRTUAL_DISPLAY"), !string("CAPTURE_SIZE").isEmpty else { return nil }
+        return Self.formattedSize(resolution)
     }
 
     var validationError: String? {
@@ -691,9 +759,11 @@ final class SettingsModel: ObservableObject {
         let size = saved["CAPTURE_SIZE"] ?? ""
         return !size.isEmpty ? size : saved["HIDPI"] == "1" ? "Native Retina" : "Automatic / client size"
     }
-    var savedFlushSummary: String {
-        let value = saved["FLUSH_INTERVAL_MS"]
-            ?? Self.extraFlagValue("--flush-interval-ms", in: saved["EXTRA_FLAGS"] ?? "") ?? ""
+    var savedFlushSummary: String { Self.flushSummary(saved) }
+
+    private static func flushSummary(_ config: [String: String]) -> String {
+        let value = config["FLUSH_INTERVAL_MS"]
+            ?? extraFlagValue("--flush-interval-ms", in: config["EXTRA_FLAGS"] ?? "") ?? ""
         return value.isEmpty ? "Stable (capture cadence)" : "Fast flush · \(value) ms"
     }
 
@@ -734,8 +804,10 @@ final class SettingsModel: ObservableObject {
         cleanExtraFlags(["--virtual-display-hidpi"])
     }
 
-    var resolution: String {
-        "\(string("VD_WIDTH", default: "1920"))x\(string("VD_HEIGHT", default: "1080"))"
+    var resolution: String { Self.virtualResolution(draft) }
+
+    private static func virtualResolution(_ config: [String: String]) -> String {
+        "\(config["VD_WIDTH"] ?? "1920")x\(config["VD_HEIGHT"] ?? "1080")"
     }
     func setResolution(_ wxh: String) {
         let parts = wxh.split(separator: "x")

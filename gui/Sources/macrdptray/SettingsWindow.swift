@@ -254,6 +254,8 @@ struct SettingsView: View {
 
 private struct ConnectionTab: View {
     @ObservedObject var model: SettingsModel
+    private let commonProfiles: [PerformanceProfile] = [.stable, .fourK, .fourKText]
+
     var body: some View {
         Form {
             Section("Performance profile") {
@@ -264,19 +266,42 @@ private struct ConnectionTab: View {
                             model.applyProfile(profile)
                         }
                     })) {
-                    ForEach(PerformanceProfile.allCases) { profile in
+                    ForEach(commonProfiles) { profile in
+                        Text(profile.title).tag(profile.rawValue)
+                    }
+                    Divider()
+                    ForEach(PerformanceProfile.allCases.filter { !commonProfiles.contains($0) }) { profile in
                         Text(profile.title).tag(profile.rawValue)
                     }
                     if model.selectedProfile == nil {
+                        Divider()
                         Text("Custom").tag("custom")
                     }
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 Text(model.selectedProfile?.detail
-                    ?? "Custom settings. Choose a profile to stage its values, then Apply.")
+                    ?? "Current settings differ from the built-in profiles.")
                     .font(.caption).foregroundColor(.secondary)
-                Text("Profiles change video, audio and shortcut settings only. Network access stays a separate choice below.")
-                    .font(.caption).foregroundColor(.secondary)
+                if let size = model.profileVirtualDisplaySize {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Virtual display is configured for \(size). The profile’s capture size applies to the physical screen.")
+                            .font(.caption).foregroundColor(.secondary)
+                        Button("Display Settings") { model.section = .display }
+                            .controlSize(.small)
+                    }
+                }
+                let changes = model.pendingProfileChanges
+                if !changes.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Changes before Apply").font(.subheadline.weight(.semibold))
+                        ForEach(changes.prefix(3), id: \.label, content: profileChangeRow)
+                        if changes.count > 3 {
+                            DisclosureGroup("More changes") {
+                                ForEach(changes.dropFirst(3), id: \.label, content: profileChangeRow)
+                            }
+                        }
+                    }
+                }
             }
             Section("Personal presets") {
                 Picker("Saved preset", selection: Binding(
@@ -376,6 +401,15 @@ private struct ConnectionTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func profileChangeRow(_ change: SettingsModel.ProfileChange) -> some View {
+        LabeledContent(change.label) {
+            Text("\(change.saved) → \(change.pending)")
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.trailing)
+        }
+        .font(.caption)
     }
 }
 

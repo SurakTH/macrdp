@@ -2651,8 +2651,6 @@ impl Gfx {
                     // fall through: ship this one to keep the client presenting/acking
                 }
             }
-            let force_keyframe = std::mem::replace(&mut ctx.need_keyframe, false);
-
             // Submit to VideoToolbox while this context is still current.
             // A resize must not feed the old capture into the new encoder.
             // Congestion-responsive control (P1 bitrate + P2a IDR backoff): compute
@@ -2671,6 +2669,9 @@ impl Gfx {
             if let Some(frames) = adaptive.keyframe_frames {
                 encoder.set_keyframe_interval(frames);
             }
+            // Recovery can arm an IDR in adaptive_bitrate_step above. Consume
+            // it only when submitting, including on the final capture before idle.
+            let force_keyframe = std::mem::take(&mut ctx.need_keyframe);
             if let Err(error) = encoder.submit(frame, force_keyframe) {
                 ctx.need_keyframe = true;
                 if let Some(stats) = crate::stats::global() {
@@ -2996,6 +2997,7 @@ impl Gfx {
         rx: std::sync::mpsc::Receiver<EncodeOutput>,
         shipped: Arc<AtomicU64>,
         avc444: bool,
+        mut tcp_probe: Option<TcpDispatchProbe>,
     ) {
         let mut needs_idr = true;
         let mut main_view = None;
@@ -3020,7 +3022,7 @@ impl Gfx {
             match (main, auxiliary) {
                 (Some(EncodeOutput::Picture(frame)), None) if !needs_idr || frame.is_keyframe => {
                     failed_dispatch = self
-                        .ship_frame(&frame, None, &shipped)
+                        .ship_frame(&frame, None, &shipped, tcp_probe.as_mut())
                         .inspect_err(|error| warn!(?error, "EGFX AVC420 frame dispatch failed"))
                         .is_err();
                     needs_idr = failed_dispatch;
@@ -3029,7 +3031,7 @@ impl Gfx {
                     if !needs_idr || (main.is_keyframe && auxiliary.is_keyframe) =>
                 {
                     failed_dispatch = self
-                        .ship_frame(&main, Some(&auxiliary), &shipped)
+                        .ship_frame(&main, Some(&auxiliary), &shipped, tcp_probe.as_mut())
                         .inspect_err(|error| warn!(?error, "EGFX AVC444 frame dispatch failed"))
                         .is_err();
                     needs_idr = failed_dispatch;
@@ -3155,9 +3157,13 @@ impl Gfx {
             ctx.shipped = Arc::new(AtomicU64::new(0));
             let gfx = self.clone();
             let shipped = ctx.shipped.clone();
+            let tcp_probe = crate::stats::global().and_then(|stats| {
+                let runtime = tokio::runtime::Handle::try_current().ok()?;
+                Some(TcpDispatchProbe::new(runtime, stats.clone()))
+            });
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped, use_avc444))
+                .spawn(move || gfx.ship_loop(rx, shipped, use_avc444, tcp_probe))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
@@ -3435,6 +3441,7 @@ impl Gfx {
         f: &EncodedFrame,
         auxiliary: Option<&EncodedFrame>,
         shipped: &Arc<AtomicU64>,
+        tcp_probe: Option<&mut TcpDispatchProbe>,
     ) -> Result<()> {
         let (dvc_messages, egfx_channel_id, payload_len) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
@@ -3576,11 +3583,17 @@ impl Gfx {
             .unwrap()
             .clone()
             .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
+        let sample_at = tcp_probe
+            .as_ref()
+            .and_then(|probe| probe.sample_start(&self.egfx_on_udp));
         sender
             .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
                 messages: svc_messages,
             }))
             .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+        if let (Some(probe), Some(start)) = (tcp_probe, sample_at) {
+            probe.enqueue(&sender, self.clone(), shipped.clone(), start);
+        }
         if let Some(stats) = crate::stats::global() {
             stats.record_video_queued(1, payload_len);
         }
@@ -3612,6 +3625,78 @@ impl Gfx {
                 out
             }
             WireFormat::AnnexB => avcc_to_annex_b(&f.data, &f.parameter_sets, f.is_keyframe),
+        }
+    }
+}
+
+/// Sample the RDP event queue and TCP writer using a local-only FIFO marker.
+/// In the pinned server, EGFX and GetLocalAddr share the same priority tier;
+/// the event dispatcher awaits EGFX writes before answering the next marker.
+struct TcpDispatchProbe {
+    runtime: tokio::runtime::Handle,
+    stats: Arc<crate::stats::SessionStats>,
+    next_sample: Option<Instant>,
+    pending: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TcpDispatchProbe {
+    fn new(runtime: tokio::runtime::Handle, stats: Arc<crate::stats::SessionStats>) -> Self {
+        Self {
+            runtime,
+            stats,
+            next_sample: None,
+            pending: None,
+        }
+    }
+
+    fn sample_start(&self, on_udp: &AtomicBool) -> Option<Instant> {
+        if on_udp.load(Ordering::Relaxed)
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        {
+            return None;
+        }
+        let now = Instant::now();
+        self.next_sample
+            .is_none_or(|deadline| now >= deadline)
+            .then_some(now)
+    }
+
+    fn enqueue(
+        &mut self,
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        gfx: Gfx,
+        shipped: Arc<AtomicU64>,
+        start: Instant,
+    ) {
+        self.next_sample = Some(start + Duration::from_millis(100));
+        let (reply, response) = tokio::sync::oneshot::channel();
+        if sender.send(ServerEvent::GetLocalAddr(reply)).is_err() {
+            return;
+        }
+        let stats = self.stats.clone();
+        self.pending = Some(self.runtime.spawn(async move {
+            if response.await.is_err() {
+                return;
+            }
+            let elapsed = start.elapsed();
+            let guard = gfx.ctx.lock().unwrap();
+            let current = guard
+                .as_ref()
+                .is_some_and(|ctx| ctx.is_ready && Arc::ptr_eq(&ctx.shipped, &shipped));
+            if current && !gfx.egfx_on_udp.load(Ordering::Relaxed) {
+                stats.tcp_dispatch.record(elapsed);
+            }
+        }));
+    }
+}
+
+impl Drop for TcpDispatchProbe {
+    fn drop(&mut self) {
+        if let Some(pending) = &self.pending {
+            pending.abort();
         }
     }
 }
@@ -6862,6 +6947,36 @@ mod tests {
         gfx
     }
 
+    #[tokio::test]
+    async fn tcp_dispatch_probe_waits_for_reply_and_ignores_retired_surface() {
+        use super::TcpDispatchProbe;
+        let gfx = gfx_with_context();
+        let shipped = {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.is_ready = true;
+            ctx.shipped.clone()
+        };
+        let stats = Arc::new(crate::stats::SessionStats::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for retire_surface in [false, true] {
+            let mut probe = TcpDispatchProbe::new(tokio::runtime::Handle::current(), stats.clone());
+            let start = probe.sample_start(&gfx.egfx_on_udp).unwrap();
+            probe.enqueue(&tx, gfx.clone(), shipped.clone(), start);
+            let Some(ironrdp_server::ServerEvent::GetLocalAddr(reply)) = rx.recv().await else {
+                panic!("expected local dispatch marker");
+            };
+            assert_eq!(stats.tcp_dispatch.sample_count(), u64::from(retire_surface));
+            assert!(probe.sample_start(&gfx.egfx_on_udp).is_none());
+            if retire_surface {
+                gfx.reset_for_live_resize();
+            }
+            reply.send(None).unwrap();
+            probe.pending.take().unwrap().await.unwrap();
+            assert_eq!(stats.tcp_dispatch.sample_count(), 1);
+        }
+    }
+
     #[test]
     fn resize_discards_output_from_the_retired_encoder() {
         let gfx = gfx_with_context();
@@ -6874,7 +6989,7 @@ mod tests {
             pts: 0,
             parameter_sets: Vec::new(),
         };
-        assert!(gfx.ship_frame(&frame, None, &retired).is_ok());
+        assert!(gfx.ship_frame(&frame, None, &retired, None).is_ok());
         let active = gfx.ctx.lock().unwrap().as_ref().unwrap().shipped.clone();
         assert!(!Arc::ptr_eq(&retired, &active));
     }

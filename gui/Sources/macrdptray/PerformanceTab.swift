@@ -78,7 +78,8 @@ struct PerformanceTab: View {
                         VStack(spacing: 8) {
                             row("Encoder target", String(format: "%.1f Mbps%@", Double(live.bitrateBps) / 1_000_000,
                                 live.adaptive ? " · adaptive" : ""))
-                            row("Frame ACK round trip", value(history.latest?.ackRttMs, unit: "ms"))
+                            row("Frame queued to client ACK", value(history.latest?.ackRttMs, unit: "ms"))
+                                .help("Includes server dispatch time. A frame acknowledgement does not measure display time.")
                             if live.retainedEncodeSubmissions != nil {
                                 row("Reused captures", value(history.latest?.retainedEncodeRate, unit: "frames/s"))
                                     .help("Encoder submissions that reused a captured image for flush, repaint, or retry.")
@@ -93,6 +94,14 @@ struct PerformanceTab: View {
                     if live.hasVideoDiagnostics {
                         DisclosureGroup("Video diagnostics") {
                             VStack(spacing: 8) {
+                                if live.captureToSubmit != nil {
+                                    row("Capture callback to encoder submit", value(history.latest?.captureToSubmitMs, unit: "ms"))
+                                        .help("Average for fresh frames accepted by the encoder.")
+                                }
+                                if live.tcpDispatch != nil {
+                                    row("Queue to TCP write completion", value(history.latest?.tcpDispatchMs, unit: "ms"))
+                                        .help("Sampled average for TCP graphics, including dispatch queue and local write. No value when there is no fresh sample.")
+                                }
                                 if live.encodePrepared != nil {
                                     row("AVC420 buffer preparation", value(history.latest?.prepareMs, unit: "ms"))
                                 }

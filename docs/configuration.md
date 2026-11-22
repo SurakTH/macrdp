@@ -534,10 +534,12 @@ Both restore the original layout when the last client disconnects, and both auto
 
 ## Controller video controls
 
-The Stable profile uses the Windows-tested 1920×1080 AVC420 settings: 60 FPS,
-25 Mbps adaptive bitrate, TCP, one frame in flight, two trailing pictures, and
-fast flush off. Selecting a profile stages changes; Apply saves and restarts a
-running managed server once. Existing config is preserved until Apply.
+Stable uses the 1920×1080 AVC420 settings tested in Windows Remote Desktop
+over wired LAN. It uses 60 FPS, a 60 Mbps adaptive encoder target, TCP, one
+frame in flight, and two trailing pictures. Responsive capture, fast flush, and
+NV12 are off. For a slower connection, adjust the target in Video → Bitrate.
+Select the profile to review the changes, then choose Apply to save and restart
+a running managed server.
 
 Video → Capture resolution controls the physical-screen capture via
 `CAPTURE_SIZE=WIDTHxHEIGHT`. Presets cover 720p through 4K, with a custom field.
@@ -575,6 +577,10 @@ keeps its own resolution and may follow the client request. Choose Stable to
 restore the profile for 1080p typing. Use **Performance** to compare queued
 FPS, acknowledgement latency, and encoder or pacing skips during the same
 motion sequence.
+
+**Connection → 4K/60 Sharp Text (LAN)** raises the adaptive ceiling to 100 Mbps
+for finer lettering during scrolling. It uses the same capture, encoder queue and
+flush settings as 4K/60 Preview. The higher ceiling suits a fast wired link.
 
 **Display → Virtual display → Scaling** offers Standard (1×), Retina (2×)
 and Automatic (`VD_HIDPI=auto`). Automatic follows the client scale

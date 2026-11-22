@@ -46,9 +46,18 @@ values sampled at slightly different times.
   failures. Logs include the associated status, without image contents.
   Failed encoder pictures now produce a completion outcome, release their
   logical pipeline slot (once per AVC444 pair), and request a recovery IDR.
-- `transport_retired`: logical frames whose transport event completed OR was
-  abandoned on error/disconnect. Consult logs for failures. It is neither a
-  count of bytes received by Windows nor proof of decoding/presentation.
+- `transport_retired`: logical frames retired by the encoder dispatch loop,
+  including failed or discarded outputs. A queued frame may still await a
+  socket write.
+- `capture_to_submit_*`: time from the ScreenCaptureKit callback to the
+  return of a successful submit for a fresh picture.
+- `tcp_dispatch_*`: sampled time from EGFX enqueue through completion of
+  the local TCP write, estimated using an ordered server event after the
+  frame. Includes server dispatch and scheduling. Samples exclude video
+  over UDP. Local write completion does not prove delivery to Windows.
+- The existing encoder time runs from VideoToolbox submission to callback.
+  Frame queue-to-ACK time includes server dispatch, link time and client
+  acknowledgement. These intervals can overlap and should not be summed.
 
 Increasing key counts with no content capture suggests checking capture first.
 Submissions without output, especially with callback errors, suggest checking

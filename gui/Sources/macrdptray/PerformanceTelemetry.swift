@@ -29,14 +29,27 @@ struct LiveStats {
     let tcpBackpressure: Double?
     let encoderSubmissionErrors: Double?
     let videoShippingErrors: Double?
+    let captureToSubmit: TimingTotals?
+    let tcpDispatch: TimingTotals?
     var hasVideoDiagnostics: Bool {
         encodePrepared != nil || captureSuperseded != nil || tcpBackpressure != nil
             || encoderSubmissionErrors != nil || videoShippingErrors != nil
+            || captureToSubmit != nil || tcpDispatch != nil
     }
     let ackSamples: Int?
     let ackSampleMs: Double?
     let ackRttMs: Double?
     let ackQueueMs: Double?
+
+    struct TimingTotals {
+        let samples: Double
+        let micros: Double
+
+        func averageMilliseconds(since previous: Self?) -> Double? {
+            guard let previous, samples > previous.samples, micros >= previous.micros else { return nil }
+            return (micros - previous.micros) / (samples - previous.samples) / 1000
+        }
+    }
 
     static func decode(_ data: Data) -> LiveStats? {
         guard let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -47,6 +60,11 @@ struct LiveStats {
             return value.isFinite && value >= 0 ? value : nil
         }
         func int(_ key: String) -> Int { (o[key] as? NSNumber)?.intValue ?? 0 }
+        func timing(_ prefix: String) -> TimingTotals? {
+            guard let samples = number(prefix + "_samples"),
+                  let micros = number(prefix + "_total_us") else { return nil }
+            return TimingTotals(samples: samples, micros: micros)
+        }
         return LiveStats(videoActive: o["video_active"] as? Bool, processId: int("process_id"), width: int("width"), height: int("height"),
             bitrateBps: int("bitrate_bps"), ceilingBps: int("ceiling_bps"),
             rttMs: int("rtt_ms"), queueMs: int("queue_delay_ms"), fps: int("fps"),
@@ -59,6 +77,7 @@ struct LiveStats {
             encodePrepared: number("encode_prepared"), encodePrepareTotalUs: number("encode_prepare_total_us"),
             captureSuperseded: number("capture_superseded"), tcpBackpressure: number("encode_tcp_backpressure"),
             encoderSubmissionErrors: number("encode_submit_errors"), videoShippingErrors: number("video_ship_errors"),
+            captureToSubmit: timing("capture_to_submit"), tcpDispatch: timing("tcp_dispatch"),
             ackSamples: number("ack_samples").flatMap { $0 < Double(Int.max) ? Int($0) : nil }, ackSampleMs: number("ack_sample_uptime_ms"),
             ackRttMs: number("ack_rtt_ms"), ackQueueMs: number("ack_queue_ms"))
     }
@@ -80,6 +99,8 @@ struct PerformanceSample: Identifiable {
     let tcpBackpressure: Double?
     let encoderSubmissionErrors: Double?
     let videoShippingErrors: Double?
+    let captureToSubmitMs: Double?
+    let tcpDispatchMs: Double?
 }
 
 struct PerformanceHistory {
@@ -133,7 +154,9 @@ struct PerformanceHistory {
             captureSuperseded: delta(live.captureSuperseded, before.captureSuperseded),
             tcpBackpressure: delta(live.tcpBackpressure, before.tcpBackpressure),
             encoderSubmissionErrors: delta(live.encoderSubmissionErrors, before.encoderSubmissionErrors),
-            videoShippingErrors: delta(live.videoShippingErrors, before.videoShippingErrors)))
+            videoShippingErrors: delta(live.videoShippingErrors, before.videoShippingErrors),
+            captureToSubmitMs: live.captureToSubmit?.averageMilliseconds(since: before.captureToSubmit),
+            tcpDispatchMs: live.tcpDispatch?.averageMilliseconds(since: before.tcpDispatch)))
         samples.removeAll { time.timeIntervalSince($0.time) > 60 }
         if samples.count > 30 { samples.removeFirst(samples.count - 30) }
     }

@@ -85,10 +85,11 @@ automatic). Invalid FPS, bitrate, and client IP values prevent Apply. Turning of
 H.264 also turns off dependent AVC444 and UDP video migration settings. Choosing
 a bitrate removes old `--bitrate` overrides from Extra flags.
 
-The Connection tab includes the same practical presets as `start.sh`:
+The Connection tab includes these performance profiles.
 
 | Profile | Intended use |
 |---|---|
+| **Stable** | 1080p AVC420 at 60 FPS with a 60 Mbps adaptive encoder target over TCP, tested on wired LAN. |
 | **Ultimate** | Recommended overall mode: AVC420, 60 FPS, 25 Mbps adaptive, UDP offered and AAC. |
 | **LAN Max** | Highest live-verified LAN quality: HiDPI AVC420, 60 FPS, 50 Mbps, stable TCP and PCM. |
 | **Native** | Sharpest text/UI: HiDPI bitmap/RemoteFX at a stable 12 FPS. |

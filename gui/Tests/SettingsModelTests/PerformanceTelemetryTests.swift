@@ -11,14 +11,19 @@ final class PerformanceTelemetryTests: XCTestCase {
             "uptime_ms": 3000, "encode_prepared": 10, "encode_prepare_total_us": 25_000,
             "capture_superseded": 2, "encode_tcp_backpressure": 5,
             "encode_submit_errors": 1, "video_ship_errors": 4,
+            "capture_to_submit_samples": 5, "capture_to_submit_total_us": 10_000,
+            "tcp_dispatch_samples": 2, "tcp_dispatch_total_us": 8_000,
         ])
         XCTAssertTrue(baseline.hasVideoDiagnostics)
         history.record(baseline)
         XCTAssertNil(history.latest?.prepareMs)
+        XCTAssertNil(history.latest?.tcpDispatchMs)
         history.record(try snapshot([
             "uptime_ms": 5000, "encode_prepared": 20, "encode_prepare_total_us": 55_000,
             "capture_superseded": 6, "encode_tcp_backpressure": 14,
             "encode_submit_errors": 1, "video_ship_errors": 5,
+            "capture_to_submit_samples": 15, "capture_to_submit_total_us": 40_000,
+            "tcp_dispatch_samples": 6, "tcp_dispatch_total_us": 28_000,
         ]))
         let latest = try XCTUnwrap(history.latest)
         XCTAssertEqual(latest.prepareMs, 3)
@@ -26,6 +31,8 @@ final class PerformanceTelemetryTests: XCTestCase {
         XCTAssertEqual(latest.tcpBackpressure, 9)
         XCTAssertEqual(latest.encoderSubmissionErrors, 0)
         XCTAssertEqual(latest.videoShippingErrors, 1)
+        XCTAssertEqual(latest.captureToSubmitMs, 3)
+        XCTAssertEqual(latest.tcpDispatchMs, 5)
     }
 
     private func snapshot(_ updates: [String: Any] = [:]) throws -> LiveStats {

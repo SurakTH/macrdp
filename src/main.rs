@@ -17,6 +17,8 @@ mod auth_status;
 mod avc444;
 mod camera;
 mod capture;
+#[cfg(any(target_os = "macos", test))]
+mod capture_fairness;
 mod clipboard;
 mod clipboard_rich;
 mod conn_hooks;

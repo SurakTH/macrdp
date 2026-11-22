@@ -65,6 +65,16 @@ def summary(samples):
         prepare_us = delta("encode_prepare_total_us")
         if prepared > 0 and prepare_us >= 0:
             preparation = f" | mean AVC420 buffer preparation {prepare_us / prepared / 1000:.2f} ms"
+    timings = ""
+    for name, label in (
+        ("capture_to_submit", "capture callback to encoder submit"),
+        ("tcp_dispatch", "queue to TCP write completion"),
+    ):
+        count_key, total_key = f"{name}_samples", f"{name}_total_us"
+        if all(count_key in sample and total_key in sample for sample in samples):
+            completed, total_us = delta(count_key), delta(total_key)
+            if completed > 0 and total_us >= 0:
+                timings += f" | mean {label} {total_us / completed / 1000:.2f} ms (n={completed})"
     tcp_pacing = ""
     if all("encode_tcp_backpressure" in sample for sample in samples):
         tcp_pacing = f" | TCP-paced submissions deferred {delta('encode_tcp_backpressure')}"
@@ -95,7 +105,7 @@ def summary(samples):
             f"mean encoder completion {encode} | sampled ACK queue {ack_delay} | "
             f"encoder errors {delta('encode_output_errors')} | "
             f"keyboard events {delta('keyboard_events')}{retained}{preparation}{tcp_pacing}"
-            f"{submit_errors}{ship_errors}{superseded}")
+            f"{submit_errors}{ship_errors}{superseded}{timings}")
 
 
 def main():

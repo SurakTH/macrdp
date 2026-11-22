@@ -84,13 +84,14 @@ transport and the Windows decoder, run the release-mode benchmark with
 synthetic frames:
 
 ```sh
-cargo test --locked --release bench_avc420_4k_pipeline_depth -- --ignored --nocapture
+cargo test --locked --release bench_4k_at_50_and_60hz_with_bounded_encoder_queue -- --ignored --nocapture
 ```
 
-The benchmark limits in-flight encoder submissions to one and two frames,
-and counts completed pictures in standard and VideoToolbox low-latency
-modes. The low-latency mode is available in the benchmark only. Other
-processes, including an active macrdp session, can affect the rates.
+The benchmark compares 50 and 60 FPS at 4K NV12, 60 Mbps and two in-flight
+submissions. The 60 FPS runs also show the effect of different inputs and
+queue depths. On the M3, 50 FPS completed 150/150 pictures at 19.0 ms p95,
+while 60 FPS completed 172/180 at 34.9 ms p95. Other processes, including
+an active macrdp session, can affect the rates.
 
 For an ACK delay spike around minimize or restore, compare the change in
 queued frames and ACKs in adjacent samples. A flat frame count while ACKs

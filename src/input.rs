@@ -1620,7 +1620,10 @@ mod macos {
             // keystroke. Triggers on key-down; the matching key-up is
             // tracked in `consumed_keys` so the bare key-up doesn't reach
             // the focused app either.
-            if down && vk == VK_SPACE && self.consumed_keys.contains(&vk) {
+            if down
+                && matches!(vk, VK_SPACE | VK_3 | VK_4 | VK_5)
+                && self.consumed_keys.contains(&vk)
+            {
                 return;
             }
             if down && self.try_symbolic_hotkey(vk) {
@@ -2005,6 +2008,11 @@ mod macos {
                 return true;
             }
 
+            if cmd && shift && !opt && matches!(vk, VK_3 | VK_4) {
+                screencapture(vk == VK_4, ctrl);
+                return true;
+            }
+
             if !cmd {
                 return false;
             }
@@ -2026,14 +2034,6 @@ mod macos {
                 }
                 (false, VK_SPACE) if !self.posted_keys.contains(&vk) => {
                     self.dispatch_system_shortcut(Shortcut::CommandSpace);
-                    true
-                }
-                (true, VK_3) => {
-                    screencapture(&["-x"]);
-                    true
-                }
-                (true, VK_4) => {
-                    screencapture(&["-i"]);
                     true
                 }
                 (true, VK_5) => {
@@ -4687,24 +4687,18 @@ mod macos {
         }
     }
 
-    /// Run /usr/sbin/screencapture with the given args. `-x` = silent
-    /// (no shutter sound), `-i` = interactive region. Output path is
-    /// the default (~/Desktop) when not provided.
-    fn screencapture(args: &[&str]) {
-        // Default to the same path Cmd+Shift+3 produces natively.
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let Some(home) = home else {
-            warn!("screencapture: $HOME unset");
-            return;
-        };
-        let now = chrono_like_filename();
-        let path = home.join("Desktop").join(format!("Screenshot {now}.png"));
-        let res = Command::new("/usr/sbin/screencapture")
-            .args(args)
-            .arg(&path)
-            .spawn();
-        if let Err(e) = res {
-            warn!(error = %e, "screencapture spawn failed");
+    fn screencapture(interactive: bool, clipboard: bool) {
+        let mut command = Command::new("/usr/sbin/screencapture");
+        if interactive {
+            command.arg("-i");
+        } else {
+            command.arg("-x");
+        }
+        // Let Screenshot manage the Save to destination and file naming.
+        // Adding Control requests the clipboard for just this capture.
+        command.arg(if clipboard { "-c" } else { "-p" });
+        if let Err(error) = command.spawn() {
+            warn!(%error, "screencapture spawn failed");
         }
     }
 
@@ -4716,32 +4710,6 @@ mod macos {
         if let Err(e) = res {
             warn!(error = %e, "open Screenshot.app failed");
         }
-    }
-
-    /// "2026-05-18 at 14.32.05" — matches macOS's native screenshot
-    /// filename suffix closely enough that the result feels indigenous
-    /// in Finder's sort order.
-    fn chrono_like_filename() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Local-time conversion without pulling in chrono: use libc.
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        let t = secs as libc::time_t;
-        unsafe {
-            libc::localtime_r(&t, &mut tm);
-        }
-        format!(
-            "{:04}-{:02}-{:02} at {:02}.{:02}.{:02}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        )
     }
 
     #[cfg(test)]

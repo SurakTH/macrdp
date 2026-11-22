@@ -93,11 +93,43 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(model.resolution, "2560x1440")
         XCTAssertEqual(model.bindDisplay, "127.0.0.1:4390")
         XCTAssertEqual(model.draft["EXTRA_FLAGS"], "--stretch")
+        let preview = model.draft
+        model.applyProfile(.fourKText)
+        XCTAssertEqual(model.selectedProfile, .fourKText)
+        XCTAssertEqual(model.bitrateMbps, "100")
+        XCTAssertEqual(model.draft, preview.merging(["BITRATE": "100"]) { _, new in new })
         model.applyProfile(.stable)
         XCTAssertEqual(model.selectedProfile, .stable)
         XCTAssertEqual(model.captureResolutionChoice, "1920x1080")
         XCTAssertEqual(model.encoderQueueDepth, "1")
         XCTAssertFalse(model.bool("CAPTURE_NV12"))
+    }
+
+    func testPerformanceProfilesPreviewEffectiveChangesAndPreserveShortcuts() {
+        var initial = PerformanceProfile.stable.settings
+        initial["MAP_CTRL_TO_CMD"] = "0"
+        initial["EXTRA_FLAGS"] = "--alt-tab-switch"
+        let model = SettingsModel(controller: controller, initialConfig: initial)
+        XCTAssertEqual(model.selectedProfile, .stable)
+        XCTAssertTrue(model.pendingProfileChanges.isEmpty)
+        model.applyProfile(.fourKText)
+        XCTAssertEqual(model.selectedProfile, .fourKText)
+        XCTAssertEqual(model.draft["MAP_CTRL_TO_CMD"], "0")
+        XCTAssertNil(model.draft["ALT_TAB_SWITCH"])
+        XCTAssertEqual(model.draft["EXTRA_FLAGS"], "--alt-tab-switch")
+        XCTAssertTrue(model.pendingProfileChanges.contains(.init(
+            label: "Capture size", saved: "1920 × 1080", pending: "3840 × 2160")))
+        XCTAssertTrue(model.pendingProfileChanges.contains(.init(
+            label: "Bitrate ceiling", saved: "60 Mbps", pending: "100 Mbps")))
+        XCTAssertNil(model.profileVirtualDisplaySize)
+        model.revert()
+        XCTAssertTrue(model.pendingProfileChanges.isEmpty)
+
+        initial.merge(["VIRTUAL_DISPLAY": "1", "VD_WIDTH": "2560", "VD_HEIGHT": "1440"]) { _, new in new }
+        let virtual = SettingsModel(controller: controller, initialConfig: initial)
+        virtual.applyProfile(.fourKText)
+        XCTAssertEqual(virtual.profileVirtualDisplaySize, "2560 × 1440")
+        XCTAssertFalse(virtual.pendingProfileChanges.contains { $0.label == "Capture size" })
     }
 
     func testLegacyAndNewPersonalPresetsPreservePacingAndIndependentSettings() throws {
@@ -437,11 +469,13 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(model.selectedProfile, .stable)
         XCTAssertEqual(model.draft["CAPTURE_SIZE"], "1920x1080")
         XCTAssertEqual(model.frameRate, "60")
-        XCTAssertEqual(model.bitrateMbps, "25")
+        XCTAssertEqual(model.bitrateMbps, "60")
         XCTAssertEqual(model.draft["FLUSH_FRAMES"], "2")
         XCTAssertEqual(model.draft["H264_FRAMES_IN_FLIGHT"], "1")
         XCTAssertEqual(model.draft["ENABLE_UDP_MULTITRANSPORT"], "0")
         XCTAssertFalse(model.fastFlushEnabled)
+        XCTAssertFalse(model.bool("RESPONSIVE_CAPTURE"))
+        XCTAssertFalse(model.bool("CAPTURE_NV12"))
         XCTAssertEqual(model.bindDisplay, "0.0.0.0:3390")
     }
 

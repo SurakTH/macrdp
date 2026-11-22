@@ -2776,16 +2776,23 @@ mod version_comparison {
 
     #[test]
     #[ignore = "requires the macOS hardware encoder; run in release mode"]
-    fn bench_4k_at_60hz_with_bounded_encoder_queue() -> anyhow::Result<()> {
+    fn bench_4k_at_50_and_60hz_with_bounded_encoder_queue() -> anyhow::Result<()> {
         const WIDTH: usize = 3840;
         const HEIGHT: usize = 2160;
-        const CAPTURES: u32 = 180;
-        const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
+        const SECONDS: u32 = 3;
 
         let frames = motion_fixture(WIDTH, HEIGHT);
 
-        for (direct_nv12, depth) in [(false, 1), (true, 1), (true, 2), (true, 3)] {
-            let mut encoder = Encoder::new(WIDTH as u16, HEIGHT as u16, 60, 60_000_000, 2.0)?;
+        for (fps, direct_nv12, depth) in [
+            (60, false, 1),
+            (60, true, 1),
+            (60, true, 2),
+            (60, true, 3),
+            (50, true, 2),
+        ] {
+            let captures = SECONDS * fps;
+            let tick_interval = Duration::from_nanos(1_000_000_000 / u64::from(fps));
+            let mut encoder = Encoder::new(WIDTH as u16, HEIGHT as u16, fps, 60_000_000, 2.0)?;
             let nv12 = if direct_nv12 {
                 frames
                     .iter()
@@ -2809,8 +2816,8 @@ mod version_comparison {
             let mut latency = Vec::new();
             let mut skips = 0;
             let mut drops = 0;
-            for tick in 0..CAPTURES {
-                let capture_at = start + TICK * tick;
+            for tick in 0..captures {
+                let capture_at = start + tick_interval * tick;
                 while !in_flight.is_empty() {
                     match outputs.recv_timeout(capture_at.saturating_duration_since(Instant::now()))
                     {
@@ -2848,12 +2855,12 @@ mod version_comparison {
             let p95 = latency[(latency.len() * 95).div_ceil(100) - 1];
             let input = if direct_nv12 { "NV12" } else { "BGRA" };
             println!(
-                "4K60 {input}, depth {depth}: {}/{} pictures ({:.1} fps), {skips} capture skips, {drops} encoder drops, p95 {p95:.2} ms",
+                "4K{fps} {input}, depth {depth}: {}/{} pictures ({:.1} fps), {skips} capture skips, {drops} encoder drops, p95 {p95:.2} ms",
                 latency.len(),
-                CAPTURES,
-                latency.len() as f64 / (CAPTURES * TICK).as_secs_f64(),
+                captures,
+                latency.len() as f64 / (captures * tick_interval).as_secs_f64(),
             );
-            assert_eq!(latency.len() as u32 + skips + drops, CAPTURES);
+            assert_eq!(latency.len() as u32 + skips + drops, captures);
         }
         Ok(())
     }
