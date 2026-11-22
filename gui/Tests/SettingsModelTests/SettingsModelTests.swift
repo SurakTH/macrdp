@@ -101,7 +101,7 @@ final class SettingsModelTests: XCTestCase {
         model.applyProfile(.stable)
         XCTAssertEqual(model.selectedProfile, .stable)
         XCTAssertEqual(model.captureResolutionChoice, "1920x1080")
-        XCTAssertEqual(model.encoderQueueDepth, "1")
+        XCTAssertEqual(model.encoderQueueDepth, "2")
         XCTAssertFalse(model.bool("CAPTURE_NV12"))
     }
 
@@ -471,7 +471,7 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(model.frameRate, "60")
         XCTAssertEqual(model.bitrateMbps, "60")
         XCTAssertEqual(model.draft["FLUSH_FRAMES"], "2")
-        XCTAssertEqual(model.draft["H264_FRAMES_IN_FLIGHT"], "1")
+        XCTAssertEqual(model.draft["H264_FRAMES_IN_FLIGHT"], "2")
         XCTAssertEqual(model.draft["ENABLE_UDP_MULTITRANSPORT"], "0")
         XCTAssertFalse(model.fastFlushEnabled)
         XCTAssertFalse(model.bool("RESPONSIVE_CAPTURE"))

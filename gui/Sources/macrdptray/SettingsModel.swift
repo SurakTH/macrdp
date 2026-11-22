@@ -67,7 +67,7 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
                 "ENABLE_AAC": "0", "ADAPTIVE_BITRATE": "1", "ENABLE_UDP_MULTITRANSPORT": "0",
                 "BITRATE": "60", "FPS": "60", "KEYFRAME_ON_CHANGE": "1",
                 "KEYFRAME_CHANGE_PCT": "15", "KEYFRAME_CLICK_PCT": "3",
-                "H264_FRAMES_IN_FLIGHT": "1", "FLUSH_FRAMES": "2",
+                "H264_FRAMES_IN_FLIGHT": "2", "FLUSH_FRAMES": "2",
                 "UNMINIMIZE": "0", "BLANK_RECOVERY": "0",
             ]) { _, new in new }
         case .ultimate:

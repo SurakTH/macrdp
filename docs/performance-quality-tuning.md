@@ -261,7 +261,9 @@ MACRDP_LAN_TRANSPORT=udp ./start.sh lan
 
 The Controller's **4K/60 Preview** profile uses NV12 capture, H.264 AVC420,
 an encoder queue of two frames, and the standard flush cadence. The Stable
-profile keeps BGRA and a one-frame encoder queue for 1080p typing.
+1080p/60 profile uses BGRA capture over TCP with up to two frames in flight.
+On the wired Windows test client, motion felt smoother with two slots than
+with one, and typing remained responsive at the same 60 Mbps target.
 
 A local release benchmark submitted the same 4K motion fixture at 60 Hz to
 VideoToolbox. The 4K NV12 path with two frames in flight produced 172 of 180
