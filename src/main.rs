@@ -2690,6 +2690,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push(get("VD_WIDTH", "1920"));
         argv.push("--height".into());
         argv.push(get("VD_HEIGHT", "1080"));
+        if cfg.contains_key("VD_FIXED_SIZE") {
+            configured_switch_flags.push("--no-client-resolution");
+            if on("VD_FIXED_SIZE", false) {
+                argv.push("--no-client-resolution".into());
+            }
+        }
         if get("VD_HIDPI", "0").eq_ignore_ascii_case("auto") {
             argv.push("--virtual-display-hidpi=auto".into());
         } else if on("VD_HIDPI", false) {
@@ -4578,6 +4584,23 @@ mod config_tests {
         let args = args_from_config(&path).unwrap();
         assert_eq!(args.flush_interval_ms, None);
         assert_eq!(args.fps, Some(60));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn virtual_4k_resolution_can_override_legacy_client_sizing() {
+        let path = write_temp(
+            "virtual-4k",
+            "VIRTUAL_DISPLAY=1\nVD_WIDTH=3840\nVD_HEIGHT=2160\nVD_FIXED_SIZE=1\n",
+        );
+        let args = args_from_config(&path).unwrap();
+        assert_eq!((args.width, args.height), (Some(3840), Some(2160)));
+        assert!(args.no_client_resolution);
+
+        fs::write(&path, "VIRTUAL_DISPLAY=1\nVD_WIDTH=3840\nVD_HEIGHT=2160\nVD_FIXED_SIZE=0\nEXTRA_FLAGS=--no-client-resolution\n").unwrap();
+        let args = args_from_config(&path).unwrap();
+        assert_eq!((args.width, args.height), (Some(3840), Some(2160)));
+        assert!(!args.no_client_resolution);
         fs::remove_file(path).unwrap();
     }
 

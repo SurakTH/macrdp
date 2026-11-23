@@ -74,6 +74,22 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertTrue(model.bool("RICH_CLIPBOARD"))
     }
 
+    func testFixedVirtualFourKStagesSizeAndOverridesLegacyFlag() {
+        let model = SettingsModel(controller: controller, initialConfig: [
+            "VIRTUAL_DISPLAY": "1", "EXTRA_FLAGS": "--no-client-resolution --stretch",
+        ])
+        XCTAssertTrue(model.fixedVirtualResolution)
+        model.applyProfile(.stable)
+        XCTAssertTrue(model.fixedVirtualResolution)
+        model.setResolution("3840x2160")
+        model.setFixedVirtualResolution(false)
+        XCTAssertEqual(model.resolution, "3840x2160")
+        XCTAssertEqual(model.draft["VD_FIXED_SIZE"], "0")
+        XCTAssertEqual(model.draft["EXTRA_FLAGS"], "--stretch")
+        model.setFixedVirtualResolution(true)
+        XCTAssertEqual(model.draft["VD_FIXED_SIZE"], "1")
+    }
+
     func testFourKPreviewStagesVideoAndStableCanRestoreItsDefaults() {
         var initial = PerformanceProfile.stable.settings
         initial.merge(["VIRTUAL_DISPLAY": "1", "VD_WIDTH": "2560", "VD_HEIGHT": "1440",

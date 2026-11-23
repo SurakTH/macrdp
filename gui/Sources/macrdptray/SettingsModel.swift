@@ -722,10 +722,13 @@ final class SettingsModel: ObservableObject {
 
     private func clearLegacyVideoProfileFlags() {
         cleanExtraFlags([
-            "--flush-interval-ms", "--width", "--height", "--hidpi", "--no-client-resolution",
+            "--flush-interval-ms", "--width", "--height", "--hidpi",
             "--enable-h264", "--avc444", "--adaptive-bitrate",
             "--enable-aac", "--enable-udp-multitransport", "--udp-migrate-egfx",
         ])
+        if !bool("VIRTUAL_DISPLAY") {
+            cleanExtraFlags(["--no-client-resolution"])
+        }
     }
 
     static func pacingLimit(in config: [String: String]) -> String {
@@ -865,6 +868,17 @@ final class SettingsModel: ObservableObject {
     }
 
     var resolution: String { Self.virtualResolution(draft) }
+
+    var fixedVirtualResolution: Bool {
+        if let value = draft["VD_FIXED_SIZE"] { return value == "1" }
+        return string("EXTRA_FLAGS").split(whereSeparator: { $0.isWhitespace })
+            .contains("--no-client-resolution")
+    }
+
+    func setFixedVirtualResolution(_ fixed: Bool) {
+        draft["VD_FIXED_SIZE"] = fixed ? "1" : "0"
+        cleanExtraFlags(["--no-client-resolution"])
+    }
 
     private static func virtualResolution(_ config: [String: String]) -> String {
         "\(config["VD_WIDTH"] ?? "1920")x\(config["VD_HEIGHT"] ?? "1080")"

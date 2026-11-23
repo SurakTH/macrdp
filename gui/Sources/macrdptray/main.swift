@@ -986,12 +986,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // Standard 16:9 virtual-display resolutions, highest 1440p; default 1920×1080.
+    // Standard 16:9 virtual-display resolutions; default 1920×1080.
     static let resolutions: [(Int, Int, String)] = [
         (1280, 720, "1280 × 720"),
         (1600, 900, "1600 × 900"),
         (1920, 1080, "1920 × 1080 (1080p)"),
         (2560, 1440, "2560 × 1440 (1440p)"),
+        (3840, 2160, "3840 × 2160 (4K)"),
     ]
 
     /// (bundle id, menu label) curated shortcuts for the Ctrl→Cmd exclude list —

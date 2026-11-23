@@ -582,6 +582,11 @@ motion sequence.
 for finer lettering during scrolling. It uses the same capture, encoder queue and
 flush settings as 4K/60 Preview. The higher ceiling suits a fast wired link.
 
+**Display → Virtual display → Resolution** includes 3840 × 2160 (4K).
+Enable **Keep the selected resolution** (`VD_FIXED_SIZE=1`) to retain that
+size when the client connects or resizes its window. With it off, macrdp can
+adopt the client's requested dimensions.
+
 **Display → Virtual display → Scaling** offers Standard (1×), Retina (2×)
 and Automatic (`VD_HIDPI=auto`). Automatic follows the client scale
 announcement. At 2×, 3840 × 2160 pixels give a 1920 × 1080 point workspace.

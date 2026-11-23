@@ -602,6 +602,12 @@ private struct DisplayTab: View {
                     }
                 }
                 .disabled(!model.bool("VIRTUAL_DISPLAY"))
+                Toggle("Keep the selected resolution", isOn: Binding(
+                    get: { model.fixedVirtualResolution },
+                    set: { model.setFixedVirtualResolution($0) }))
+                    .disabled(!model.bool("VIRTUAL_DISPLAY"))
+                Text("Turn this off to let the client request a different resolution.")
+                    .font(.caption).foregroundColor(.secondary)
                 Picker("Scaling", selection: Binding(
                     get: { model.virtualDisplayScaling }, set: { model.setVirtualDisplayScaling($0) })) {
                     ForEach(VirtualDisplayScaling.allCases, id: \.self) { scaling in
