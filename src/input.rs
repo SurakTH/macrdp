@@ -844,7 +844,7 @@ mod macos {
 
     use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode, to_iso_key_order};
     use super::{is_remappable_shortcut, CtrlArrowAction, CtrlArrowEvent, CtrlArrows};
-    use system_shortcuts::{Dispatcher, Shortcut};
+    use system_shortcuts::{Dispatcher, Shortcut, ShortcutDisplay};
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -1547,6 +1547,9 @@ mod macos {
                 );
                 if changed {
                     self.post_flags_changed(vk);
+                    if down && matches!(vk, VK_LCTRL | VK_RCTRL) {
+                        self.dispatch_system_shortcut(Shortcut::Prepare);
+                    }
                 }
                 // Commit any active Cmd+Tab session the moment both
                 // Cmd halves are released. Matches native macOS: the
@@ -1603,7 +1606,11 @@ mod macos {
                     .event(vk, plain_ctrl, down, already_handled)
                 {
                     CtrlArrowEvent::Invoke(action) => {
-                        self.dispatch_system_shortcut(Shortcut::ControlArrow(action));
+                        let display = self.target_display_id.map(|id| ShortcutDisplay {
+                            id,
+                            last_pointer: CGPoint::new(self.last_x, self.last_y),
+                        });
+                        self.dispatch_system_shortcut(Shortcut::ControlArrow(action, display));
                         return;
                     }
                     CtrlArrowEvent::Consume => return,
@@ -1859,7 +1866,12 @@ mod macos {
                     Err(error) => {
                         warn!(%error, "System shortcut dispatcher could not start");
                         match shortcut {
-                            Shortcut::ControlArrow(action) => invoke_ctrl_arrow(action),
+                            Shortcut::Prepare => {}
+                            Shortcut::ControlArrow(action, display) => {
+                                if display.is_none_or(ShortcutDisplay::route) {
+                                    invoke_ctrl_arrow(action);
+                                }
+                            }
                             Shortcut::CommandSpace => invoke_spotlight(),
                         }
                         return;

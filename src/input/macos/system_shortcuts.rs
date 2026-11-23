@@ -8,6 +8,12 @@ use core_foundation::{
     number::CFNumber,
     string::{CFString, CFStringRef},
 };
+use core_graphics::{
+    display::CGDisplay,
+    event::CGEvent,
+    event_source::{CGEventSource, CGEventSourceStateID},
+    geometry::{CGPoint, CGRect},
+};
 use std::{
     io::{self, BufRead, BufReader, Write},
     process::{Child, ChildStdin, Command, Stdio},
@@ -27,8 +33,70 @@ const COMPLETED: &str = "macrdp-shortcut-complete";
 const FAILED: &str = "macrdp-shortcut-error: ";
 
 pub(super) enum Shortcut {
-    ControlArrow(CtrlArrowAction),
+    Prepare,
+    ControlArrow(CtrlArrowAction, Option<ShortcutDisplay>),
     CommandSpace,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ShortcutDisplay {
+    pub(super) id: u32,
+    pub(super) last_pointer: CGPoint,
+}
+
+impl ShortcutDisplay {
+    pub(super) fn route(self) -> bool {
+        let display = CGDisplay::new(self.id);
+        let bounds = display.bounds();
+        if !display.is_active() || bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+            tracing::debug!(display_id = self.id, "Shortcut target display inactive");
+            return false;
+        }
+        let current = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .and_then(CGEvent::new)
+            .ok()
+            .map(|event| event.location());
+        let Some(point) = target_pointer(bounds, current, self.last_pointer) else {
+            return true;
+        };
+        match CGDisplay::warp_mouse_cursor_position(point) {
+            Ok(()) => {
+                tracing::debug!(
+                    display_id = self.id,
+                    "Routed shortcut pointer to virtual display"
+                );
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    display_id = self.id,
+                    ?error,
+                    "Could not route shortcut to virtual display"
+                );
+                false
+            }
+        }
+    }
+}
+
+fn target_pointer(bounds: CGRect, current: Option<CGPoint>, previous: CGPoint) -> Option<CGPoint> {
+    let contains = |point: CGPoint| {
+        point.x >= bounds.origin.x
+            && point.x < bounds.origin.x + bounds.size.width
+            && point.y >= bounds.origin.y
+            && point.y < bounds.origin.y + bounds.size.height
+    };
+    if current.is_some_and(contains) {
+        return None;
+    }
+    Some(if contains(previous) {
+        previous
+    } else {
+        CGPoint::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        )
+    })
 }
 
 pub(super) struct Dispatcher {
@@ -79,10 +147,18 @@ fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
             continue;
         }
 
-        let (keycode, modifier, label) = match shortcut {
-            Shortcut::ControlArrow(action) => (action as u16, "control", "Ctrl+Arrow"),
+        let (keycode, modifier, label, display) = match shortcut {
+            Shortcut::Prepare => {
+                if !reuse_failed && process.is_none() {
+                    process = ScriptProcess::start().ok();
+                }
+                continue;
+            }
+            Shortcut::ControlArrow(action, display) => {
+                (action as u16, "control", "Ctrl+Arrow", display)
+            }
             Shortcut::CommandSpace if cmd_space_selects_input_source() => {
-                (49, "command", "Cmd+Space")
+                (49, "command", "Cmd+Space", None)
             }
             Shortcut::CommandSpace => {
                 objc2::rc::autoreleasepool(|_| super::invoke_spotlight());
@@ -93,7 +169,9 @@ fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
             r#"tell application "System Events" to key code {keycode} using {{{modifier} down}}"#
         );
         if reuse_failed {
-            super::run_system_events_key(script, label);
+            if display.is_none_or(ShortcutDisplay::route) {
+                super::run_system_events_key(script, label);
+            }
             continue;
         }
 
@@ -104,24 +182,41 @@ fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
         {
             process = None;
         }
+        let helper_reused = process.is_some();
         if process.is_none() {
             match ScriptProcess::start() {
                 Ok(child) => process = Some(child),
                 Err(error) => {
                     tracing::debug!(%error, "Reusable System Events helper unavailable");
                     reuse_failed = true;
-                    super::run_system_events_key(script, label);
+                    if display.is_none_or(ShortcutDisplay::route) {
+                        super::run_system_events_key(script, label);
+                    }
                     continue;
                 }
             }
         }
+        if closed.load(Ordering::Acquire) || !display.is_none_or(ShortcutDisplay::route) {
+            continue;
+        }
         if let Some(child) = process.as_mut() {
+            let started = Instant::now();
+            let target_display_id = display.map(|target| target.id);
             if let Err(error) = child.run(&script) {
                 // After writing, the action may already have happened. Never
                 // replay it, which could toggle the language or Space twice.
                 tracing::warn!(shortcut = label, %error, "System Events shortcut failed");
                 process = None;
                 reuse_failed = true;
+            } else {
+                tracing::debug!(
+                    shortcut = label,
+                    display_id = target_display_id,
+                    queued_ms = started.duration_since(queued).as_millis() as u64,
+                    execution_ms = started.elapsed().as_millis() as u64,
+                    helper_reused,
+                    "System Events shortcut completed"
+                );
             }
         }
     }
@@ -249,6 +344,21 @@ fn is_cmd_space(bindings: &CFDictionary, id: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_graphics::geometry::CGSize;
+
+    #[test]
+    fn shortcut_pointer_stays_on_target_and_recovers_after_layout_changes() {
+        let bounds = CGRect::new(&CGPoint::new(-1920.0, 100.0), &CGSize::new(1920.0, 1080.0));
+        let remembered = CGPoint::new(-1400.0, 250.0);
+        assert!(target_pointer(bounds, Some(remembered), CGPoint::new(0.0, 0.0)).is_none());
+
+        let outside = Some(CGPoint::new(0.0, 250.0));
+        let remembered_target = target_pointer(bounds, outside, remembered).unwrap();
+        assert_eq!((remembered_target.x, remembered_target.y), (-1400.0, 250.0));
+
+        let center = target_pointer(bounds, outside, CGPoint::new(300.0, 250.0)).unwrap();
+        assert_eq!((center.x, center.y), (-960.0, 640.0));
+    }
 
     #[test]
     fn interactive_worker_reuses_process_after_multiple_requests() {
