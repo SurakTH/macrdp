@@ -593,6 +593,13 @@ announcement. At 2×, 3840 × 2160 pixels give a 1920 × 1080 point workspace.
 This setting applies to the virtual display. Physical-screen capture
 continues to use its independent resolution setting.
 
+The virtual display has its own Spaces when **Displays have separate Spaces**
+is enabled in macOS. Create a second Space on the virtual display to use
+Ctrl+Left/Right there. To diagnose a slow remote Ctrl+Arrow, use
+`RUST_LOG=info,macrdp::input::macos::system_shortcuts=debug`. The shortcut log
+reports queue time and System Events execution time. Compare those with the
+visible transition in the client to isolate display or capture delay.
+
 **Input** includes Option+Space for Spotlight and Option+Backtick for cycling
 windows in the active app. **Redirection → Clipboard** controls HTML/RTF
 formatting, which defaults to on. **Advanced → Connection quality** sends

@@ -35,7 +35,7 @@ const FAILED: &str = "macrdp-shortcut-error: ";
 pub(super) enum Shortcut {
     Prepare,
     ControlArrow(CtrlArrowAction, Option<ShortcutDisplay>),
-    CommandSpace,
+    CommandSpace(Option<ShortcutDisplay>),
 }
 
 #[derive(Clone, Copy)]
@@ -157,11 +157,11 @@ fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
             Shortcut::ControlArrow(action, display) => {
                 (action as u16, "control", "Ctrl+Arrow", display)
             }
-            Shortcut::CommandSpace if cmd_space_selects_input_source() => {
+            Shortcut::CommandSpace(_) if cmd_space_selects_input_source() => {
                 (49, "command", "Cmd+Space", None)
             }
-            Shortcut::CommandSpace => {
-                objc2::rc::autoreleasepool(|_| super::invoke_spotlight());
+            Shortcut::CommandSpace(display) => {
+                objc2::rc::autoreleasepool(|_| super::invoke_spotlight(display));
                 continue;
             }
         };

@@ -1606,11 +1606,10 @@ mod macos {
                     .event(vk, plain_ctrl, down, already_handled)
                 {
                     CtrlArrowEvent::Invoke(action) => {
-                        let display = self.target_display_id.map(|id| ShortcutDisplay {
-                            id,
-                            last_pointer: CGPoint::new(self.last_x, self.last_y),
-                        });
-                        self.dispatch_system_shortcut(Shortcut::ControlArrow(action, display));
+                        self.dispatch_system_shortcut(Shortcut::ControlArrow(
+                            action,
+                            self.shortcut_display(),
+                        ));
                         return;
                     }
                     CtrlArrowEvent::Consume => return,
@@ -1859,6 +1858,13 @@ mod macos {
         /// Match the current modifier state + non-modifier vk against the
         /// set of symbolic hotkeys we re-implement. Returns true if we
         /// handled it (and the caller should suppress the keystroke).
+        fn shortcut_display(&self) -> Option<ShortcutDisplay> {
+            self.target_display_id.map(|id| ShortcutDisplay {
+                id,
+                last_pointer: CGPoint::new(self.last_x, self.last_y),
+            })
+        }
+
         fn dispatch_system_shortcut(&mut self, shortcut: Shortcut) {
             if self.system_shortcuts.is_none() {
                 match Dispatcher::start() {
@@ -1872,7 +1878,7 @@ mod macos {
                                     invoke_ctrl_arrow(action);
                                 }
                             }
-                            Shortcut::CommandSpace => invoke_spotlight(),
+                            Shortcut::CommandSpace(display) => invoke_spotlight(display),
                         }
                         return;
                     }
@@ -1972,7 +1978,7 @@ mod macos {
                 && !shift
                 && vk == VK_SPACE
             {
-                invoke_spotlight();
+                invoke_spotlight(self.shortcut_display());
                 return true;
             }
 
@@ -2021,7 +2027,7 @@ mod macos {
             }
 
             if cmd && shift && !opt && matches!(vk, VK_3 | VK_4) {
-                screencapture(vk == VK_4, ctrl);
+                screencapture(vk == VK_4, ctrl, self.shortcut_display());
                 return true;
             }
 
@@ -2045,11 +2051,11 @@ mod macos {
                     true
                 }
                 (false, VK_SPACE) if !self.posted_keys.contains(&vk) => {
-                    self.dispatch_system_shortcut(Shortcut::CommandSpace);
+                    self.dispatch_system_shortcut(Shortcut::CommandSpace(self.shortcut_display()));
                     true
                 }
                 (true, VK_5) => {
-                    open_screenshot_app();
+                    open_screenshot_app(self.shortcut_display());
                     true
                 }
                 // Cmd+` / Cmd+Shift+` — cycle windows of the currently
@@ -4429,14 +4435,16 @@ mod macos {
     /// in System Settings → Keyboard → Shortcuts (a custom binding
     /// goes through the normal app-shortcut path our CGEventPost
     /// handles fine).
-    fn invoke_spotlight() {
+    fn invoke_spotlight(display: Option<ShortcutDisplay>) {
         debug!("invoke_spotlight: trying AX menu-bar press");
-        if ax_press_spotlight_menu_extra() {
+        if ax_press_spotlight_menu_extra(display.map(|target| target.id)) {
             debug!("invoke_spotlight: AX menu-bar press ok");
             return;
         }
         debug!("invoke_spotlight: AX menu-bar press failed, falling back to osascript");
-        invoke_spotlight_via_osascript();
+        if display.is_none_or(ShortcutDisplay::route) {
+            invoke_spotlight_via_osascript();
+        }
     }
 
     /// Open Spotlight by synthesizing a real mouse click on its
@@ -4451,7 +4459,7 @@ mod macos {
     /// the symbolic-hotkey dispatcher that rejects our synthesized
     /// Cmd+Space, so this drives normal click-handling and actually
     /// opens Spotlight.
-    fn ax_press_spotlight_menu_extra() -> bool {
+    fn ax_press_spotlight_menu_extra(display_id: Option<u32>) -> bool {
         use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex};
         use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
         use core_foundation::string::CFString;
@@ -4519,77 +4527,87 @@ mod macos {
                 return false;
             }
 
-            let item = CFArrayGetValueAtIndex(children.cast(), 0) as *mut c_void;
+            // Search the target display's menu bar for virtual sessions.
+            // Retain the first-item behavior on the physical capture path.
+            let bounds = display_id.map(|id| CGDisplay::new(id).bounds());
+            let indices = 0..if bounds.is_some() { count } else { 1 };
+            let center = indices
+                .filter_map(|index| {
+                    let item = CFArrayGetValueAtIndex(children.cast(), index) as *mut c_void;
 
-            // Pull AXPosition (top-left of the icon, screen-space).
-            let pos_attr = CFString::from_static_string("AXPosition");
-            let mut pos_value: CFTypeRef = ptr::null();
-            let pos_err = AXUIElementCopyAttributeValue(
-                item,
-                pos_attr.as_concrete_TypeRef().cast(),
-                &mut pos_value,
-            );
-            if pos_err != AX_ERROR_SUCCESS || pos_value.is_null() {
-                debug!(pid, pos_err, "ax_press_spotlight: AXPosition copy failed");
-                CFRelease(children);
-                CFRelease(extras);
-                CFRelease(app_ref as *const c_void);
-                return false;
-            }
-            let mut pos = CGPoint { x: 0.0, y: 0.0 };
-            let pos_ok = AXValueGetValue(
-                pos_value,
-                K_AX_VALUE_CG_POINT_TYPE,
-                &mut pos as *mut _ as *mut c_void,
-            );
-            CFRelease(pos_value);
-            if pos_ok == 0 {
-                debug!(pid, "ax_press_spotlight: AXValueGetValue(point) failed");
-                CFRelease(children);
-                CFRelease(extras);
-                CFRelease(app_ref as *const c_void);
-                return false;
-            }
-
-            // Pull AXSize so we can click the icon center.
-            let size_attr = CFString::from_static_string("AXSize");
-            let mut size_value: CFTypeRef = ptr::null();
-            let size_err = AXUIElementCopyAttributeValue(
-                item,
-                size_attr.as_concrete_TypeRef().cast(),
-                &mut size_value,
-            );
-            let size = if size_err == AX_ERROR_SUCCESS && !size_value.is_null() {
-                let mut s = CGSize {
-                    width: 0.0,
-                    height: 0.0,
-                };
-                let ok = AXValueGetValue(
-                    size_value,
-                    K_AX_VALUE_CG_SIZE_TYPE,
-                    &mut s as *mut _ as *mut c_void,
-                );
-                CFRelease(size_value);
-                if ok != 0 {
-                    s
-                } else {
-                    // Best-effort fallback — typical menu-bar icon is
-                    // ~24x24 points.
-                    CGSize {
-                        width: 24.0,
-                        height: 24.0,
+                    // Pull AXPosition (top-left of the icon, screen-space).
+                    let pos_attr = CFString::from_static_string("AXPosition");
+                    let mut pos_value: CFTypeRef = ptr::null();
+                    let pos_err = AXUIElementCopyAttributeValue(
+                        item,
+                        pos_attr.as_concrete_TypeRef().cast(),
+                        &mut pos_value,
+                    );
+                    if pos_err != AX_ERROR_SUCCESS || pos_value.is_null() {
+                        debug!(pid, pos_err, "ax_press_spotlight: AXPosition copy failed");
+                        return None;
                     }
-                }
-            } else {
-                CGSize {
-                    width: 24.0,
-                    height: 24.0,
-                }
-            };
+                    let mut pos = CGPoint { x: 0.0, y: 0.0 };
+                    let pos_ok = AXValueGetValue(
+                        pos_value,
+                        K_AX_VALUE_CG_POINT_TYPE,
+                        &mut pos as *mut _ as *mut c_void,
+                    );
+                    CFRelease(pos_value);
+                    if pos_ok == 0 {
+                        debug!(pid, "ax_press_spotlight: AXValueGetValue(point) failed");
+                        return None;
+                    }
 
-            let center = CGPoint {
-                x: pos.x + size.width / 2.0,
-                y: pos.y + size.height / 2.0,
+                    // Pull AXSize so we can click the icon center.
+                    let size_attr = CFString::from_static_string("AXSize");
+                    let mut size_value: CFTypeRef = ptr::null();
+                    let size_err = AXUIElementCopyAttributeValue(
+                        item,
+                        size_attr.as_concrete_TypeRef().cast(),
+                        &mut size_value,
+                    );
+                    let size = if size_err == AX_ERROR_SUCCESS && !size_value.is_null() {
+                        let mut s = CGSize {
+                            width: 0.0,
+                            height: 0.0,
+                        };
+                        let ok = AXValueGetValue(
+                            size_value,
+                            K_AX_VALUE_CG_SIZE_TYPE,
+                            &mut s as *mut _ as *mut c_void,
+                        );
+                        CFRelease(size_value);
+                        if ok != 0 {
+                            s
+                        } else {
+                            // Best-effort fallback — typical menu-bar icon is
+                            // ~24x24 points.
+                            CGSize {
+                                width: 24.0,
+                                height: 24.0,
+                            }
+                        }
+                    } else {
+                        CGSize {
+                            width: 24.0,
+                            height: 24.0,
+                        }
+                    };
+
+                    Some(CGPoint {
+                        x: pos.x + size.width / 2.0,
+                        y: pos.y + size.height / 2.0,
+                    })
+                })
+                .find(|point| bounds.is_none_or(|rect| rect.contains(point)));
+
+            CFRelease(children);
+            CFRelease(extras);
+            CFRelease(app_ref as *const c_void);
+
+            let Some(center) = center else {
+                return false;
             };
             debug!(
                 pid,
@@ -4597,10 +4615,6 @@ mod macos {
                 center_y = center.y,
                 "ax_press_spotlight: clicking icon center"
             );
-
-            CFRelease(children);
-            CFRelease(extras);
-            CFRelease(app_ref as *const c_void);
 
             // Build a CGEvent source — fresh for this click so we
             // don't tangle with the keyboard-input source state.
@@ -4699,11 +4713,26 @@ mod macos {
         }
     }
 
-    fn screencapture(interactive: bool, clipboard: bool) {
+    fn screencapture(interactive: bool, clipboard: bool, display: Option<ShortcutDisplay>) {
         let mut command = Command::new("/usr/sbin/screencapture");
         if interactive {
+            if !display.is_none_or(ShortcutDisplay::route) {
+                return;
+            }
             command.arg("-i");
         } else {
+            if let Some(target) = display {
+                // screencapture uses one-based display numbers, with the
+                // main display first, as in the active Core Graphics list.
+                let number = CGDisplay::active_displays()
+                    .ok()
+                    .and_then(|active| screenshot_display_number(&active, target.id));
+                let Some(number) = number else {
+                    warn!(display_id = target.id, "Screenshot target display inactive");
+                    return;
+                };
+                command.arg(format!("-D{number}"));
+            }
             command.arg("-x");
         }
         // Let Screenshot manage the Save to destination and file naming.
@@ -4714,7 +4743,17 @@ mod macos {
         }
     }
 
-    fn open_screenshot_app() {
+    fn screenshot_display_number(active: &[u32], target_id: u32) -> Option<usize> {
+        active
+            .iter()
+            .position(|&id| id == target_id)
+            .map(|index| index + 1)
+    }
+
+    fn open_screenshot_app(display: Option<ShortcutDisplay>) {
+        if !display.is_none_or(ShortcutDisplay::route) {
+            return;
+        }
         let res = Command::new("/usr/bin/open")
             .arg("-a")
             .arg("/System/Applications/Utilities/Screenshot.app")
@@ -4727,6 +4766,14 @@ mod macos {
     #[cfg(test)]
     mod cycle_mru_tests {
         use super::*;
+
+        #[test]
+        fn screenshot_display_number_follows_active_display_order() {
+            assert_eq!(screenshot_display_number(&[17, 42], 17), Some(1));
+            assert_eq!(screenshot_display_number(&[17, 42], 42), Some(2));
+            assert_eq!(screenshot_display_number(&[42, 17], 42), Some(1));
+            assert_eq!(screenshot_display_number(&[17, 42], 99), None);
+        }
 
         /// Only the app you LAND on (commit) becomes most-recent — apps passed
         /// through mid-cycle must not, so a quick Alt+Tab afterwards goes back
