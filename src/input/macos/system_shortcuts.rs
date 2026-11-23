@@ -130,7 +130,6 @@ impl Drop for Dispatcher {
 
 fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
     let mut process = None;
-    let mut reuse_failed = false;
     loop {
         let (shortcut, queued) = match pending.recv_timeout(IDLE_TIMEOUT) {
             Ok(value) => value,
@@ -149,7 +148,7 @@ fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
 
         let (keycode, modifier, label, display) = match shortcut {
             Shortcut::Prepare => {
-                if !reuse_failed && process.is_none() {
+                if process.is_none() {
                     process = ScriptProcess::start().ok();
                 }
                 continue;
@@ -168,13 +167,6 @@ fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
         let script = format!(
             r#"tell application "System Events" to key code {keycode} using {{{modifier} down}}"#
         );
-        if reuse_failed {
-            if display.is_none_or(ShortcutDisplay::route) {
-                super::run_system_events_key(script, label);
-            }
-            continue;
-        }
-
         // A known-dead child has received no new command and can be replaced.
         if process
             .as_mut()
@@ -188,7 +180,6 @@ fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
                 Ok(child) => process = Some(child),
                 Err(error) => {
                     tracing::debug!(%error, "Reusable System Events helper unavailable");
-                    reuse_failed = true;
                     if display.is_none_or(ShortcutDisplay::route) {
                         super::run_system_events_key(script, label);
                     }
@@ -202,21 +193,25 @@ fn dispatch(pending: Receiver<(Shortcut, Instant)>, closed: &AtomicBool) {
         if let Some(child) = process.as_mut() {
             let started = Instant::now();
             let target_display_id = display.map(|target| target.id);
-            if let Err(error) = child.run(&script) {
-                // After writing, the action may already have happened. Never
-                // replay it, which could toggle the language or Space twice.
-                tracing::warn!(shortcut = label, %error, "System Events shortcut failed");
-                process = None;
-                reuse_failed = true;
-            } else {
-                tracing::debug!(
+            match child.run(&script) {
+                Ok(Ok(())) => tracing::debug!(
                     shortcut = label,
+                    keycode,
                     display_id = target_display_id,
                     queued_ms = started.duration_since(queued).as_millis() as u64,
                     execution_ms = started.elapsed().as_millis() as u64,
                     helper_reused,
                     "System Events shortcut completed"
-                );
+                ),
+                Ok(Err(error)) => {
+                    tracing::warn!(shortcut = label, keycode, %error, "System Events shortcut failed");
+                }
+                Err(error) => {
+                    // The action may already have happened. Replace the helper
+                    // for the next key press without replaying this shortcut.
+                    tracing::warn!(shortcut = label, keycode, %error, "Lost System Events helper");
+                    process = None;
+                }
             }
         }
     }
@@ -273,17 +268,19 @@ impl ScriptProcess {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    fn run(&mut self, script: &str) -> Result<(), String> {
+    fn run(&mut self, script: &str) -> io::Result<Result<(), String>> {
         // Interactive results and uncaught script errors go to buffered
         // stdout. Log exactly one explicit result to stderr instead.
         writeln!(
             self.input,
             "try\n{script}\nlog \"{COMPLETED}\"\non error detail\nlog (\"{FAILED}\" & detail)\nend try"
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         self.reply
             .recv_timeout(REPLY_TIMEOUT)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut.into(),
+                mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe.into(),
+            })
     }
 }
 
@@ -364,9 +361,9 @@ mod tests {
     fn interactive_worker_reuses_process_after_multiple_requests() {
         let mut process = ScriptProcess::start().unwrap();
         let pid = process.child.id();
-        process.run("set fixture to 1 + 1").unwrap();
-        assert!(process.run("error \"test error\"").is_err());
-        process.run("set fixture to 2 + 2").unwrap();
+        process.run("set fixture to 1 + 1").unwrap().unwrap();
+        assert!(process.run("error \"test error\"").unwrap().is_err());
+        process.run("set fixture to 2 + 2").unwrap().unwrap();
         assert_eq!(process.child.id(), pid);
     }
 

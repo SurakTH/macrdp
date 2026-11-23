@@ -549,6 +549,11 @@ private struct VideoTab: View {
                 Text("Can reduce encoding delay at 4K. Fine detail may look softer at the same bitrate.")
                     .font(.caption).foregroundColor(.secondary)
             }
+            if model.videoCodecPreference == .h264 && !model.bool("AVC444") {
+                Toggle("H.264 Main Profile (Preview)", isOn: model.boolBinding("H264_MAIN_PROFILE"))
+                Text("Try clearer detail at the same bitrate on compatible clients.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
             Toggle("NV12 capture for AVC420 and HEVC", isOn: model.boolBinding("CAPTURE_NV12"))
                 .disabled(model.bool("AVC444"))
             Text(model.bool("AVC444") || !usesVideoEncoder
@@ -579,6 +584,11 @@ private struct AudioTab: View {
                     .disabled(!lossy && (!model.bool("ENABLE_AAC") || !model.bool("ENABLE_H264")
                         || model.bool("UDP_MIGRATE_EGFX")))
                 Text("Requires AAC and H.264. Offers UDP automatically and uses TCP if the client or link can't use it. Keep Move video onto UDP off when using UDP audio.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("Audio capture") {
+                Toggle("Prefer Core Audio Tap", isOn: model.boolBinding("AUDIO_CORE_TAP"))
+                Text("Uses Core Audio for system sound when available. macrdp can fall back to ScreenCaptureKit.")
                     .font(.caption).foregroundColor(.secondary)
             }
         }
@@ -622,15 +632,20 @@ private struct DisplayTab: View {
                 Picker("Physical panel", selection: Binding(
                     get: { model.primaryMode }, set: { model.setPrimaryMode($0) })) {
                     Text("Keep local screen on").tag("none")
-                    Text("Detach — move apps to remote").tag("detach")
+                    Text("Blank — move apps to remote").tag("detach")
                     Text("Blank — keep apps on Mac (lockable)").tag("shield")
                     Text("Blank — keep apps on Mac (can't lock)").tag("capture")
                 }
                 .pickerStyle(.radioGroup)
-                Text("Detach/Blank auto-enable the virtual display. “Blank (can't lock)” uses capture — "
-                    + "while engaged the Mac CANNOT be locked. “Blank (lockable)” shields with a black "
-                    + "window and stays lockable.")
+                Text("Blank modes auto-enable the virtual display. “Blank — move apps to remote” covers "
+                    + "the local screen and moves windows back when you disconnect.")
                     .font(.caption).foregroundColor(.secondary)
+                if model.primaryMode == "capture" {
+                    Text("The Mac cannot lock while this mode is active. It can also disable Mission Control "
+                        + "and Space shortcuts on the virtual display. "
+                        + "Choose “Keep local screen on” to use them.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
             }
             Section("Lock while away (experimental)") {
                 let headless = model.primaryMode != "none"
@@ -641,7 +656,7 @@ private struct DisplayTab: View {
                        isOn: model.boolBinding("AUTO_UNLOCK"))
                     .disabled(!headless)
                 if !headless {
-                    Text("Needs one of the Detach/Blank modes above.")
+                    Text("Needs one of the Blank modes above.")
                         .font(.caption).foregroundColor(.secondary)
                 } else if model.bool("LOCK_ON_DISCONNECT") && !model.bool("AUTO_UNLOCK") {
                     Text("Without automatic unlock you'll need to be at the Mac to unlock it — "
@@ -819,6 +834,8 @@ private struct AdvancedTab: View {
             }
             Section("Diagnostics") {
                 Toggle("Live statistics endpoint", isOn: model.boolBinding("STATS_ENDPOINT"))
+                TextField("Statistics port", text: model.stringBinding("STATS_PORT"), prompt: Text("40245"))
+                    .disabled(!model.bool("STATS_ENDPOINT"))
                 Text("Lets the Status tab show live video bitrate, link RTT and frame-rate. "
                     + "Loopback-only (127.0.0.1), read-only, no disk writes. Takes effect after Apply.")
                     .font(.caption).foregroundColor(.secondary)
@@ -1216,7 +1233,7 @@ extension AppController {
         // The port is interpolated into a shell command below, and config.env is
         // user-editable — so validate it's a real port number (digits, 1…65535).
         // A non-numeric value can never reach the shell; it falls back to 40245.
-        let raw = readConfig()["STATS_PORT"].flatMap { $0.isEmpty ? nil : $0 } ?? "40245"
+        let raw = readConfig()["STATS_PORT"]?.trimmingCharacters(in: .whitespaces) ?? ""
         let port = UInt16(raw).flatMap { $0 == 0 ? nil : String($0) } ?? "40245"
         let out = run("/bin/bash", ["-c", "/usr/bin/nc -w 1 127.0.0.1 \(port) </dev/null 2>/dev/null"])
         guard out.code == 0, let data = out.stdout.data(using: .utf8) else { return nil }

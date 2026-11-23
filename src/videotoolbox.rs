@@ -67,6 +67,13 @@ pub(crate) enum PictureCodec {
     Hevc420,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EncoderProfile {
+    AvcBaseline,
+    AvcMain,
+    HevcMain,
+}
+
 struct OutputContext {
     tx: mpsc::Sender<EncodeOutput>,
     codec: PictureCodec,
@@ -314,6 +321,35 @@ impl Encoder {
         keyframe_secs: f32,
         codec: PictureCodec,
     ) -> Result<Self> {
+        let profile = match codec {
+            PictureCodec::Hevc420 => EncoderProfile::HevcMain,
+            PictureCodec::Avc420
+                if std::env::var("MACRDP_H264_MAIN_PROFILE").as_deref() == Ok("1") =>
+            {
+                EncoderProfile::AvcMain
+            }
+            _ => EncoderProfile::AvcBaseline,
+        };
+        Self::new_with_profile(
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            keyframe_secs,
+            codec,
+            profile,
+        )
+    }
+
+    fn new_with_profile(
+        width: u16,
+        height: u16,
+        fps: u32,
+        bitrate_bps: u32,
+        keyframe_secs: f32,
+        codec: PictureCodec,
+        profile: EncoderProfile,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<EncodeOutput>();
         // Keep the callback context alive until the compression session is invalidated.
         let tx_box = Box::new(OutputContext {
@@ -334,15 +370,30 @@ impl Encoder {
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let session = ffi::create_session(
-            (width, height),
-            fps,
-            bitrate_bps,
-            VT_KEYFRAME_BACKSTOP,
-            tx_ptr,
-            full_range,
-            codec,
-        )?;
+        let create_session = |profile| {
+            ffi::create_session(
+                (width, height),
+                fps,
+                bitrate_bps,
+                VT_KEYFRAME_BACKSTOP,
+                tx_ptr,
+                full_range,
+                profile,
+            )
+        };
+        let session = match create_session(profile) {
+            Ok(session) => {
+                if profile == EncoderProfile::AvcMain {
+                    tracing::info!("H.264 AVC420 Main Profile encoder initialized");
+                }
+                session
+            }
+            Err(error) if profile == EncoderProfile::AvcMain => {
+                tracing::warn!(%error, "H.264 Main Profile unavailable in VideoToolbox; using Baseline");
+                create_session(EncoderProfile::AvcBaseline)?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -711,7 +762,7 @@ pub fn nv12_full_range_to_bgra(
 }
 
 mod ffi {
-    use super::{EncodeOutput, EncodedFrame, OutputContext, PictureCodec};
+    use super::{EncodeOutput, EncodedFrame, EncoderProfile, OutputContext, PictureCodec};
     use anyhow::{anyhow, bail, Result};
     use std::ffi::c_void;
     use std::ptr;
@@ -811,6 +862,7 @@ mod ffi {
         static kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: CFStringRef;
         static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
+        static kVTProfileLevel_H264_Main_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         // Color-space signaling so the encoded SPS VUI describes its color
         // space explicitly instead of leaving the decoder to guess (which is
@@ -999,7 +1051,7 @@ mod ffi {
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
         full_range: bool,
-        codec: PictureCodec,
+        profile: EncoderProfile,
     ) -> Result<SessionGuard> {
         // Supplying explicit source attributes makes VideoToolbox expose a
         // matching CVPixelBufferPool. Allocating frames from that pool lets VT
@@ -1069,7 +1121,8 @@ mod ffi {
             bail!("CFDictionaryCreate failed for source pixel-buffer attributes");
         }
 
-        let specification = if codec == PictureCodec::Hevc420 {
+        let hevc = profile == EncoderProfile::HevcMain;
+        let specification = if hevc {
             unsafe {
                 let key = kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder;
                 let value = kCFBooleanTrue;
@@ -1091,7 +1144,7 @@ mod ffi {
                 ptr::null(),
                 i32::from(width),
                 i32::from(height),
-                if codec == PictureCodec::Hevc420 {
+                if hevc {
                     u32::from_be_bytes(*b"hvc1")
                 } else {
                     K_CM_VIDEO_CODEC_TYPE_H264
@@ -1144,10 +1197,10 @@ mod ffi {
             set_string(
                 session,
                 kVTCompressionPropertyKey_ProfileLevel,
-                if codec == PictureCodec::Hevc420 {
-                    kVTProfileLevel_HEVC_Main_AutoLevel
-                } else {
-                    kVTProfileLevel_H264_Baseline_AutoLevel
+                match profile {
+                    EncoderProfile::AvcBaseline => kVTProfileLevel_H264_Baseline_AutoLevel,
+                    EncoderProfile::AvcMain => kVTProfileLevel_H264_Main_AutoLevel,
+                    EncoderProfile::HevcMain => kVTProfileLevel_HEVC_Main_AutoLevel,
                 },
             )?;
             // Tag the bitstream's color space explicitly (BT.709). Without this
@@ -1199,9 +1252,7 @@ mod ffi {
             )?;
         }
 
-        if codec == PictureCodec::Hevc420
-            && std::env::var("MACRDP_HEVC_HIGH_SPEED").as_deref() == Ok("1")
-        {
+        if hevc && std::env::var("MACRDP_HEVC_HIGH_SPEED").as_deref() == Ok("1") {
             match unsafe {
                 set_bool(
                     session,
@@ -1218,7 +1269,7 @@ mod ffi {
         if prepared != 0 {
             bail!("VTCompressionSessionPrepareToEncodeFrames failed: OSStatus {prepared}");
         }
-        if codec == PictureCodec::Hevc420 {
+        if hevc {
             unsafe {
                 let mut value = ptr::null();
                 let status = VTSessionCopyProperty(
@@ -2772,7 +2823,7 @@ fn prepared_nv12(encoder: &Encoder, bgra: &[u8]) -> Result<screencapturekit::cv:
 
 #[cfg(test)]
 mod version_comparison {
-    use super::{prepared_nv12, EncodeOutput, Encoder};
+    use super::{prepared_nv12, EncodeOutput, Encoder, EncoderProfile, PictureCodec};
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
@@ -2845,6 +2896,39 @@ mod version_comparison {
                 assert_eq!(pictures, FRAMES, "the hardware encoder dropped pictures");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a VideoToolbox encoder that supports H.264 Main Profile"]
+    fn avc420_main_profile_preserves_explicit_idrs_and_picture_order() -> anyhow::Result<()> {
+        let mut encoder = Encoder::new_with_profile(
+            320,
+            240,
+            60,
+            2_000_000,
+            10.0,
+            PictureCodec::Avc420,
+            EncoderProfile::AvcMain,
+        )?;
+        let frame = prepared_nv12(&encoder, &vec![90; 320 * 240 * 4])?;
+        let mut keyframes = Vec::new();
+        for index in 0..8 {
+            encoder.encode_pixel_buffer(&frame, index == 4)?;
+            let output = encoder.flush()?;
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].pts, index);
+            if output[0].is_keyframe {
+                keyframes.push(index);
+                let sps = output[0]
+                    .parameter_sets
+                    .iter()
+                    .find(|nal| nal.len() >= 2 && nal[0] & 0x1f == 7)
+                    .expect("SPS for each keyframe");
+                assert_eq!(sps[1], 77, "Main Profile SPS");
+            }
+        }
+        assert_eq!(keyframes, [0, 4]);
         Ok(())
     }
 

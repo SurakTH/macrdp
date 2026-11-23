@@ -18,6 +18,8 @@ use ironrdp_rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler}
 #[cfg(target_os = "macos")]
 use ironrdp_rdpsnd::server::RdpsndServerMessage;
 use ironrdp_server::{AudioWave, ServerEvent, ServerEventSender, SoundServerFactory};
+#[cfg(target_os = "macos")]
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -42,6 +44,8 @@ const RESAMPLE_CHUNK: usize = (SCK_SAMPLE_RATE / 100) as usize;
 const PCM_SCREEN_PENDING_WAVES: usize = 8;
 #[cfg(target_os = "macos")]
 const PCM_TAP_PENDING_WAVES: usize = 12;
+#[cfg(target_os = "macos")]
+const PCM_WAVE_MS: u32 = 10;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreMedia", kind = "framework")]
@@ -631,9 +635,10 @@ async fn capture_loop(
             }
         };
         let pcm_pending_wave_limit = source.pcm_pending_wave_limit();
+        let mut pcm_queue = PcmDispatchQueue::new(pcm_pending_wave_limit, stats);
         if !use_aac {
             info!(
-                wave_ms = 10,
+                wave_ms = PCM_WAVE_MS,
                 pending_wave_limit = pcm_pending_wave_limit,
                 "PCM audio pacing"
             );
@@ -659,7 +664,36 @@ async fn capture_loop(
                 );
                 continue 'reconnect;
             }
-            let Some((in_left, in_right)) = source.next(stats).await else {
+            let samples = if let Some(audio_ref) = audio_s.as_ref().filter(|_| !use_aac) {
+                let next_input = source.next(stats);
+                tokio::pin!(next_input);
+                loop {
+                    if audio_ref.is_closed() || generation.load(Ordering::SeqCst) != my_gen {
+                        return Ok(());
+                    }
+                    if mute_on_minimize
+                        && suppressed_since
+                            .is_some_and(|start| start.elapsed() >= SUPPRESS_DEBOUNCE)
+                        && display_suppressed
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                    {
+                        pcm_queue.waves.clear();
+                    }
+                    let now_ms = start_instant.elapsed().as_millis() as u32;
+                    waves_dropped_at_latency_limit += pcm_queue.dispatch(audio_ref, now_ms);
+                    if pcm_queue.waves.is_empty() {
+                        break next_input.await;
+                    }
+                    tokio::select! {
+                        result = &mut next_input => break result,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {}
+                    }
+                }
+            } else {
+                source.next(stats).await
+            };
+            let Some((in_left, in_right)) = samples else {
                 let tapped = matches!(source, CaptureSource::Tap(_));
                 source.stop();
                 if tapped {
@@ -828,13 +862,9 @@ async fn capture_loop(
                         audio_s = audio_sender.lock().unwrap().clone();
                     }
                     if let Some(audio_ref) = audio_s.as_ref() {
-                        // Video can hold the shared TCP writer while this
-                        // channel keeps accepting waves. The Tap can use a
-                        // slightly larger budget because it delivers audio
-                        // sooner than ScreenCaptureKit. Neither path waits
-                        // to fill this queue before sending.
-                        if !use_aac && pcm_queue_at_limit(audio_ref, pcm_pending_wave_limit) {
-                            waves_dropped_at_latency_limit += 1;
+                        if !use_aac {
+                            waves_dropped_at_latency_limit +=
+                                pcm_queue.push((data, ts_ms, duration_ms));
                             continue;
                         }
                         // Bounded channel: send().await applies backpressure if
@@ -877,8 +907,65 @@ async fn capture_loop(
 }
 
 #[cfg(target_os = "macos")]
-fn pcm_queue_at_limit(sender: &mpsc::Sender<AudioWave>, limit: usize) -> bool {
-    sender.max_capacity() - sender.capacity() >= limit
+pub(crate) struct PcmDispatchQueue<'a> {
+    waves: VecDeque<AudioWave>,
+    limit: usize,
+    stats: Option<&'a crate::stats::SessionStats>,
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> PcmDispatchQueue<'a> {
+    pub(crate) fn new(limit: usize, stats: Option<&'a crate::stats::SessionStats>) -> Self {
+        Self {
+            waves: VecDeque::with_capacity(limit),
+            limit,
+            stats,
+        }
+    }
+
+    pub(crate) fn push(&mut self, wave: AudioWave) -> u64 {
+        let full = self.waves.len() == self.limit;
+        if full {
+            self.waves.pop_front();
+            if let Some(stats) = self.stats {
+                stats.pcm_queue_drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.waves.push_back(wave);
+        u64::from(full)
+    }
+
+    pub(crate) fn dispatch(&mut self, sender: &mpsc::Sender<AudioWave>, now_ms: u32) -> u64 {
+        let mut expired = 0;
+        while self
+            .waves
+            .front()
+            .is_some_and(|wave| now_ms.wrapping_sub(wave.1) >= self.limit as u32 * PCM_WAVE_MS)
+        {
+            self.waves.pop_front();
+            expired += 1;
+        }
+        if expired > 0 {
+            if let Some(stats) = self.stats {
+                stats.pcm_queue_drops.fetch_add(expired, Ordering::Relaxed);
+            }
+        }
+        // Keep at most one wave waiting in IronRDP. Audio still held here can
+        // expire while the shared TCP writer is busy sending graphics.
+        if !self.waves.is_empty() && sender.capacity() == sender.max_capacity() {
+            if let Ok(permit) = sender.try_reserve() {
+                let wave = self.waves.pop_front().expect("PCM queue is nonempty");
+                if let Some(stats) = self.stats {
+                    let elapsed_ms = u64::from(now_ms.wrapping_sub(wave.1));
+                    stats
+                        .pcm_queue_age
+                        .record(std::time::Duration::from_millis(elapsed_ms));
+                }
+                permit.send(wave);
+            }
+        }
+        expired
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -991,22 +1078,37 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn pcm_tap_queue_absorbs_a_hundred_millisecond_stall_and_stays_bounded() {
+    fn pcm_queue_keeps_recent_audio_after_a_stall() {
         let (sender, mut receiver) = mpsc::channel(50);
+        let stats = crate::stats::SessionStats::default();
+        let mut queue = PcmDispatchQueue::new(PCM_TAP_PENDING_WAVES, Some(&stats));
+        for timestamp in (0..=200).step_by(10) {
+            queue.push((Vec::new(), timestamp, None));
+            queue.dispatch(&sender, timestamp);
+        }
+        assert_eq!(queue.waves.len(), PCM_TAP_PENDING_WAVES);
+        assert_eq!(receiver.try_recv().unwrap().1, 0);
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(queue.dispatch(&sender, 220), 2);
+        for timestamp in (110..=200).step_by(10) {
+            assert_eq!(receiver.try_recv().unwrap().1, timestamp);
+            assert_eq!(queue.dispatch(&sender, 220), 0);
+        }
+        assert_eq!(stats.pcm_queue_drops.load(Ordering::Relaxed), 10);
+        assert_eq!(stats.pcm_queue_age.sample_count(), 11);
+        assert!(queue.waves.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pcm_queue_does_not_wait_for_more_waves_on_a_healthy_link() {
+        let (sender, mut receiver) = mpsc::channel(50);
+        let mut queue = PcmDispatchQueue::new(PCM_SCREEN_PENDING_WAVES, None);
         for timestamp in (0..100).step_by(10) {
-            assert!(!pcm_queue_at_limit(&sender, PCM_TAP_PENDING_WAVES));
-            sender.try_send((Vec::new(), timestamp, None)).unwrap();
-        }
-        assert!(pcm_queue_at_limit(&sender, PCM_SCREEN_PENDING_WAVES));
-        for timestamp in [100, 110] {
-            assert!(!pcm_queue_at_limit(&sender, PCM_TAP_PENDING_WAVES));
-            sender.try_send((Vec::new(), timestamp, None)).unwrap();
-        }
-        assert!(pcm_queue_at_limit(&sender, PCM_TAP_PENDING_WAVES));
-        for timestamp in (0..120).step_by(10) {
+            assert_eq!(queue.push((Vec::new(), timestamp, None)), 0);
+            assert_eq!(queue.dispatch(&sender, timestamp), 0);
             assert_eq!(receiver.try_recv().unwrap().1, timestamp);
         }
-        assert!(!pcm_queue_at_limit(&sender, PCM_TAP_PENDING_WAVES));
     }
 
     #[cfg(target_os = "macos")]

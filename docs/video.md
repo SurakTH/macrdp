@@ -45,7 +45,7 @@ With **Responsive capture** and the standard flush cadence, macrdp waits
 another half of a capture interval before the first duplicate frame. If the
 latest capture has yet to be submitted, it still retries at the normal cadence.
 
-HEVC with TCP video pacing watches for a pending local graphics write. After
+HEVC and H.264 AVC420 with TCP video pacing watch for a pending local graphics write. After
 50 ms it defers new encoder submissions. When the pending write completes,
 it wakes the capture loop to retry an unsent picture ahead of the normal
 flush timer. The diagnostic recording counts local-write deferrals
@@ -117,6 +117,64 @@ Pass **`--stretch`** to instead fill the whole frame (the old behavior) — no b
 ## Video (H.264)
 
 By default the display is sent as legacy bitmaps (RemoteFx/QOI to mstsc, NSCodec/raw to others) — works everywhere, but bandwidth-heavy. Pass **`--enable-h264`** to stream the desktop as **H.264 over the EGFX virtual channel** (MS-RDPEGFX, AVC420), hardware-encoded with VideoToolbox. Far less bandwidth, especially for video/scrolling/photos.
+
+**Main Profile (Preview).** In Controller, select H.264 and open **Video →
+Advanced Video → H.264 Main Profile (Preview)**. With a config file, use
+`H264_MAIN_PROFILE=1`. With a direct command-line launch, set
+`MACRDP_H264_MAIN_PROFILE=1` and pass `--enable-h264`. This option applies
+to AVC420 and keeps frame reordering disabled. macrdp retries with Baseline
+if VideoToolbox cannot initialize Main. Client compatibility still needs
+verification, so the default and the built-in presets use Baseline.
+
+A synthetic VideoToolbox encode/decode comparison at 1080p/60 and a 20 Mbps
+target measured 28.1 dB luma PSNR with Main at 19.6 Mbps, compared with
+24.9 dB at 22.0 Mbps with Baseline. At 4K/60 and a 60 Mbps target, Main used
+60.3 Mbps compared with 82.9 Mbps with Baseline in the same workload, with a
+0.7 dB luma PSNR gain. Both produced the requested keyframes. These figures
+measure encoder output for the test pattern. Check Windows playback and text
+while scrolling with the same settings before drawing conclusions about an
+RDP session.
+
+In a 4K trial with a Windows RDP client and the Mac on Wi-Fi, both modes
+used a 60 FPS limit, a 60 Mbps target, direct NV12 and an acknowledgement
+limit of two. Each run played the same scrolling-text animation.
+
+| Session stage | Profile | Queued FPS | H.264 payload | Sampled ACK queue p95 |
+| --- | --- | ---: | ---: | ---: |
+| Shortly after connecting | Baseline | 42.3 | 13.36 Mbps | 191 ms |
+| Shortly after connecting | Main | 46.3 | 11.66 Mbps | 49 ms |
+| Established | Main | 51.0 | 46.57 Mbps | 15 ms |
+| Established | Baseline | 50.4 | 55.65 Mbps | 55 ms |
+
+In the established-session comparison, mean encoder completion time was
+29.1 ms for Baseline and 29.7 ms for Main. The bitrate varied substantially
+between freshly connected and established runs. All four short runs
+completed without reported encode or dispatch errors. The ACK samples
+describe queueing observed at the server. Input-to-display delay and
+sustained 60 FPS still need separate tests.
+
+On a direct Ethernet link capturing a physical 4K display, the same short
+scene queued 48.1 FPS with Baseline at 85.51 Mbps and 48.8 FPS with Main at
+68.45 Mbps. Sampled ACK queue p95 was 102 ms and 9 ms respectively. Capture
+delivered about 58 FPS in both runs, and the encoder queue was frequently
+full.
+
+With **Responsive capture**, the capture loop can now retry its newest
+unsent picture as soon as the encoder and dispatch pipeline has room. It
+still gives a newer capture priority when one is already available. In a
+follow-up run on the same wired setup, Main queued 54.7 FPS at 56.96 Mbps,
+with sampled ACK queue p95 of 7 ms. Mean encoder completion time rose from
+30.9 ms to 35.3 ms, consistent with keeping the two-slot queue busier.
+All three wired runs reported zero encode and dispatch errors. These short
+runs measured server stages and do not establish sustained client FPS.
+
+On the same 60 Hz physical display, lowering the H.264 target from 60 to
+55 FPS reduced the capture rate from 59.7–60.0 to 44.4–44.5 content
+samples per second over two runs at each setting. Queued output fell from
+53.9–54.1 to 49.6–50.6 FPS, while sampled ACK queue p95 stayed at 7–8 ms.
+The 55 FPS target activates ScreenCaptureKit's minimum frame interval on
+this display. The client operator preferred the 60 FPS setting, which was
+restored. This test did not time keystrokes on the client.
 
 How it behaves:
 

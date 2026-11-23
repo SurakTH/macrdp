@@ -90,6 +90,8 @@ pub struct SessionStats {
     pub encode_tcp_write_stall: AtomicU64,
     /// Capture-loop wakeups that advanced a still-unsent picture.
     pub tcp_resume_wakes: AtomicU64,
+    /// Capture-loop wakeups after a deferred picture can enter the encoder.
+    pub encoder_resume_wakes: AtomicU64,
     pub encoded_pictures: AtomicU64,
     pub encode_output_errors: AtomicU64,
     pub encode_submit_errors: AtomicU64,
@@ -109,6 +111,10 @@ pub struct SessionStats {
     pub capture_to_submit: StageTiming,
     /// First sample timestamp to receipt by the system-audio capture loop.
     pub audio_capture_age: StageTiming,
+    /// PCM packet assembly to handoff to the RDPSND transport channel.
+    pub pcm_queue_age: StageTiming,
+    /// PCM packets evicted or expired before handoff to RDPSND.
+    pub pcm_queue_drops: AtomicU64,
     /// Encoded picture to DVC messages, including graphics lock waits.
     pub video_packetize: StageTiming,
     pub tcp_dispatch: StageTiming,
@@ -270,6 +276,10 @@ impl SessionStats {
             self.tcp_resume_wakes.load(Ordering::Relaxed)
         ));
         json.push_str(&format!(
+            ",\"encoder_resume_wakes\":{}",
+            self.encoder_resume_wakes.load(Ordering::Relaxed)
+        ));
+        json.push_str(&format!(
             ",\"encoded_pictures\":{}",
             self.encoded_pictures.load(Ordering::Relaxed)
         ));
@@ -311,9 +321,14 @@ impl SessionStats {
             ",\"client_qoe_reports\":{}",
             self.client_qoe_reports.load(Ordering::Relaxed)
         ));
+        json.push_str(&format!(
+            ",\"pcm_queue_drops\":{}",
+            self.pcm_queue_drops.load(Ordering::Relaxed)
+        ));
         for (name, stage) in [
             ("capture_to_submit", &self.capture_to_submit),
             ("audio_capture_age", &self.audio_capture_age),
+            ("pcm_queue_age", &self.pcm_queue_age),
             ("video_packetize", &self.video_packetize),
             ("tcp_dispatch", &self.tcp_dispatch),
             ("client_frame_parse", &self.client_frame_parse),

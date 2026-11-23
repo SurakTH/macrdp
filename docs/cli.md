@@ -123,7 +123,10 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   per-dimension. Each dimension must be in [200,
                           #   8192]. No effect off the auto-adopt path. Config:
                           #   MAX_CLIENT_SIZE. Mirrors upstream IronRDP #1404.
---shield-primary          # Third headless blanking mechanism, alternative to
+--detach-primary          # Cover local screens and move app windows to the
+                          #   virtual display. On disconnect, uncover the
+                          #   screens and move windows back.
+--shield-primary          # Window-based headless blanking, alternative to
                           #   --detach-primary / --capture-primary (mutually
                           #   exclusive with both; needs --virtual-display).
                           #   Covers every physical panel with an opaque BLACK

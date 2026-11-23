@@ -137,6 +137,25 @@ struct PerformanceTab: View {
                             }.padding(.top, 8)
                         }
                     }
+                    if live.hasAudioDiagnostics {
+                        DisclosureGroup("Audio diagnostics") {
+                            VStack(spacing: 8) {
+                                if live.audioCaptureAge != nil {
+                                    row("Sample age at capture", value(history.latest?.audioCaptureAgeMs, unit: "ms"))
+                                }
+                                if live.pcmQueueAge != nil {
+                                    row("PCM queue to transport handoff",
+                                        history.latest?.pcmQueueAgeMs.map { String(format: "%.3f ms", $0) } ?? "—")
+                                }
+                                if live.pcmQueueDrops != nil {
+                                    row("PCM packets discarded", count(history.latest?.pcmQueueDrops))
+                                }
+                                Text("Measured on the Mac before transport. Playback timing on the client is measured separately.")
+                                    .font(.caption).foregroundColor(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }.padding(.top, 8)
+                        }
+                    }
                     Text("Rates are measured between samples. Queued FPS counts encoded video frames handed to the transport, including trailing flush pictures; it does not measure client presentation. Payload rate excludes network headers, audio and retransmits. Encoder time runs from submission to callback. ACK timing is not key-to-screen latency. An idle desktop may report 0 FPS.")
                         .font(.caption).foregroundColor(.secondary)
                 } else {

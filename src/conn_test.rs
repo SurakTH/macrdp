@@ -378,7 +378,6 @@ async fn connect_client_with_cookie<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
-    // pre-TLS negotiation
     let mut connector = ClientConnector::new(
         client_config(client_w, client_h),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -386,6 +385,23 @@ where
     if let Some(cookie) = cookie {
         connector = connector.with_auto_reconnect_cookie(cookie);
     }
+    let (result, framed) = connect_client_with_channels(client_io, connector).await?;
+    Ok((
+        (result.desktop_size.width, result.desktop_size.height),
+        framed,
+    ))
+}
+
+async fn connect_client_with_channels<S>(
+    client_io: S,
+    mut connector: ClientConnector,
+) -> anyhow::Result<(
+    ironrdp_connector::ConnectionResult,
+    TokioFramed<tokio_rustls::client::TlsStream<S>>,
+)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
     let mut framed = TokioFramed::new(client_io);
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
     let initial = framed.into_inner_no_leftover();
@@ -416,10 +432,7 @@ where
         None,
     )
     .await?;
-    Ok((
-        (result.desktop_size.width, result.desktop_size.height),
-        tls_framed,
-    ))
+    Ok((result, tls_framed))
 }
 
 /// Run one full client→server connect over an in-memory duplex with the given
@@ -528,6 +541,13 @@ async fn server_size_kept_when_not_honored() -> anyhow::Result<()> {
         (1024, 768),
         "without honoring, server size is served"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fixed_4k_is_negotiated_when_client_requests_a_smaller_desktop() -> anyhow::Result<()> {
+    let size = negotiate(3840, 2160, 2560, 1440, false, None, crate::bitmap_codecs()).await?;
+    assert_eq!(size, (3840, 2160));
     Ok(())
 }
 
@@ -1334,6 +1354,196 @@ fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
             other => panic!("expected VerticalScroll for {units}, got {other:?}"),
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(start_paused = true)]
+async fn pcm_audio_recovers_after_the_client_stops_reading() -> anyhow::Result<()> {
+    let baseline = pcm_delivery_after_stall(false).await?;
+    let updated = pcm_delivery_after_stall(true).await?;
+    for timestamps in [&baseline, &updated] {
+        assert_eq!(timestamps[0], 0);
+        assert!(timestamps.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(timestamps.last().is_some_and(|timestamp| *timestamp >= 330));
+    }
+    let replays_stale_pcm = |timestamps: &[u32]| (90..200).any(|ts| timestamps.contains(&ts));
+    assert!(
+        replays_stale_pcm(&baseline),
+        "expected a stale baseline: {baseline:?}"
+    );
+    assert!(
+        !replays_stale_pcm(&updated),
+        "stale PCM replayed: {updated:?}"
+    );
+    eprintln!("330 ms write stall. Baseline: {baseline:?}. Updated: {updated:?}");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn pcm_delivery_after_stall(evict_stale: bool) -> anyhow::Result<Vec<u32>> {
+    use ironrdp_pdu::{mcs::McsMessage, x224::X224};
+    use ironrdp_rdpsnd::{
+        client::{Rdpsnd, RdpsndClientHandler},
+        pdu::{AudioFormat, PitchPdu, VolumePdu},
+        server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler},
+    };
+    use ironrdp_tokio::FramedWrite as _;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    struct SoundFactory {
+        formats: Vec<AudioFormat>,
+        sender: Option<mpsc::Sender<ironrdp_server::AudioWave>>,
+        evict_stale: bool,
+    }
+    impl ironrdp_server::ServerEventSender for SoundFactory {
+        fn set_sender(&mut self, _: mpsc::UnboundedSender<ironrdp_server::ServerEvent>) {}
+    }
+    impl ironrdp_server::SoundServerFactory for SoundFactory {
+        fn set_audio_sender(&mut self, sender: mpsc::Sender<ironrdp_server::AudioWave>) {
+            self.sender = Some(sender);
+        }
+
+        fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
+            Box::new(SoundBackend(
+                self.formats.clone(),
+                self.sender.clone().unwrap(),
+                self.evict_stale,
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SoundBackend(
+        Vec<AudioFormat>,
+        mpsc::Sender<ironrdp_server::AudioWave>,
+        bool,
+    );
+    impl RdpsndServerHandler for SoundBackend {
+        fn get_formats(&self) -> &[AudioFormat] {
+            &self.0
+        }
+        fn choose_format<'a>(
+            &mut self,
+            formats: &'a [NegotiatedFormat],
+        ) -> Option<&'a NegotiatedFormat> {
+            formats.first()
+        }
+        fn start(&mut self, _: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+            let sender = self.1.clone();
+            let evict_stale = self.2;
+            tokio::task::spawn_local(async move {
+                let mut queue = crate::audio::PcmDispatchQueue::new(12, None);
+                let started = tokio::time::Instant::now();
+                for timestamp in (0..=500_u32).step_by(10) {
+                    let at = started + Duration::from_millis(u64::from(timestamp));
+                    tokio::time::sleep_until(at).await;
+                    let mut data = vec![0; 1764]; // 10 ms of 44.1 kHz stereo PCM
+                    data[..4].copy_from_slice(&timestamp.to_le_bytes());
+                    let wave = (data, timestamp, None);
+                    if evict_stale {
+                        queue.push(wave);
+                        queue.dispatch(&sender, timestamp);
+                    } else if sender.max_capacity() - sender.capacity() < 12 {
+                        // The former policy drops the newest wave when the channel fills.
+                        let _ = sender.try_send(wave);
+                    }
+                }
+            });
+            Ok(())
+        }
+        fn stop(&mut self) {}
+    }
+
+    #[derive(Debug)]
+    struct ClientAudio(Vec<AudioFormat>, mpsc::UnboundedSender<u32>);
+    impl RdpsndClientHandler for ClientAudio {
+        fn get_formats(&self) -> &[AudioFormat] {
+            &self.0
+        }
+        fn wave(&mut self, _: &AudioFormat, timestamp: u32, data: std::borrow::Cow<'_, [u8]>) {
+            assert_eq!(data.len(), 1764);
+            assert_eq!(data[..4], timestamp.to_le_bytes());
+            let _ = self.1.send(timestamp);
+        }
+        fn set_volume(&mut self, _: VolumePdu) {}
+        fn set_pitch(&mut self, _: PitchPdu) {}
+        fn close(&mut self) {}
+    }
+
+    let formats = crate::audio::server_audio_formats(false, 0);
+    let size = ServerDesktopSize {
+        width: 320,
+        height: 240,
+    };
+    // Enough room for negotiation but only a few PCM packets once reads stop.
+    let (client_io, server_io) = tokio::io::duplex(8192);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 0))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(TestDisplay { size })
+        .with_sound_factory(Some(Box::new(SoundFactory {
+            formats: formats.clone(),
+            sender: None,
+            evict_stale,
+        })))
+        .with_bitmap_codecs(BitmapCodecs(Vec::new()))
+        .build();
+    let (received, mut timestamps) = mpsc::unbounded_channel();
+    let connector = ClientConnector::new(
+        client_config(size.width, size.height),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    )
+    .with_static_channel(Rdpsnd::new(Box::new(ClientAudio(formats, received))));
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task =
+                tokio::task::spawn_local(async move { server.run_connection(server_io).await });
+            let (result, mut framed) = connect_client_with_channels(client_io, connector).await?;
+            let mut channels = result.static_channels;
+            let channel_id = channels.get_channel_id_by_type::<Rdpsnd>().unwrap();
+            let mut delivered = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let (_action, frame) = framed.read_pdu().await?;
+                    let Ok(X224(McsMessage::SendDataIndication(data))) =
+                        ironrdp_core::decode::<X224<McsMessage<'_>>>(&frame)
+                    else {
+                        continue;
+                    };
+                    if data.channel_id != channel_id {
+                        continue;
+                    }
+                    let channel = channels.get_by_channel_id_mut(channel_id).unwrap();
+                    let replies = channel.process(&data.user_data)?;
+                    if !replies.is_empty() {
+                        let encoded = ironrdp_svc::client_encode_svc_messages(
+                            replies,
+                            channel_id,
+                            result.user_channel_id,
+                        )?;
+                        framed.write_all(&encoded).await?;
+                    }
+                    if let Ok(timestamp) = timestamps.try_recv() {
+                        delivered.push(timestamp);
+                        if delivered.len() == 1 {
+                            tokio::time::sleep(Duration::from_millis(330)).await;
+                        }
+                        if timestamp >= 330 {
+                            break;
+                        }
+                    }
+                }
+                anyhow::Ok(())
+            })
+            .await;
+            server_task.abort();
+            read??;
+            Ok(delivered)
+        })
+        .await
 }
 
 /// Input must keep flowing while a server write is blocked on a client that is

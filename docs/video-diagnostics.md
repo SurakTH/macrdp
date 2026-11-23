@@ -49,6 +49,9 @@ values sampled at slightly different times.
 - `transport_retired`: logical frames retired by the encoder dispatch loop,
   including failed or discarded outputs. A queued frame may still await a
   socket write.
+- `encoder_resume_wakes`: in Responsive capture, wakeups that advanced a
+  retained picture after a slot opened in the encoder and dispatch pipeline.
+  The normal cadence still supplies retries when other limits apply.
 - `capture_to_submit_*`: time from the ScreenCaptureKit callback to the
   return of a successful submit for a fresh picture.
 - `tcp_dispatch_*`: sampled time from EGFX enqueue through completion of

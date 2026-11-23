@@ -27,6 +27,12 @@ v0 — daily-driver usable on a trusted LAN and over a VPN (ZeroTier, high-laten
 
 ## Fork releases
 
+### v0.10.9.3
+
+Adds fixed 4K Virtual Display sizing, restores the local desktop on disconnect when using the window-shielding mode, and improves virtual-display keyboard shortcuts. The PCM queue resumes with newer audio after a stalled write, and the Controller can display audio diagnostics.
+
+[Download v0.10.9.3](https://github.com/SurakTH/macrdp/releases/tag/v0.10.9.3) or read the [full release notes](docs/releases/v0.10.9.3.md).
+
 ### v0.10.9.2
 
 - **Experimental H.265 (HEVC)** adds 1080p/60, 1440p/60 and 4K/60 profiles for compatible Windows App clients. macrdp falls back to H.264 when supported by the client. The Controller's Performance tab shows the codec in use.

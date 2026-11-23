@@ -1512,6 +1512,17 @@ impl GraphicsPipelineServer {
         })
     }
 
+    /// Queue AVC420 bitmap data that already includes the region metablock.
+    pub fn send_prepared_avc420_frame(
+        &mut self,
+        surface_id: u16,
+        bitmap_data: Vec<u8>,
+        regions: &[Avc420Region],
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        self.send_420_frame(surface_id, regions, timestamp_ms, Codec1Type::Avc420, || bitmap_data)
+    }
+
     /// Queue a V11.2 HEVC stream including its region metadata, NAL size table, and Annex B data.
     pub fn send_hevc420_frame(
         &mut self,

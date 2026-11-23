@@ -15,14 +15,13 @@ mod private_api;
 #[cfg(target_os = "macos")]
 pub use macos::{
     is_hidpi_virtual_display, run_select_mode_helper, screen_is_locked, shield_keeps_physical_main,
-    take_detach_reenable_failed, CapturedPrimary, DetachedPrimary, PrimaryOverride,
-    ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
+    CapturedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay, SELECT_MODE_ARG,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    is_hidpi_virtual_display, screen_is_locked, take_detach_reenable_failed, CapturedPrimary,
-    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    is_hidpi_virtual_display, screen_is_locked, CapturedPrimary, PrimaryOverride, ShieldedPrimary,
+    VirtualDisplay,
 };
 
 /// When the virtual display runs HiDPI (`--virtual-display-hidpi`).
@@ -129,19 +128,6 @@ mod macos {
     // race and reject the second with CGError 1001.
     const TX_SETTLE: Duration = Duration::from_millis(200);
 
-    /// Set true by `DetachedPrimary::drop` when its re-enable transaction is
-    /// exhausted (the panel is left disabled). On macOS 26.x the CGS app-scoped
-    /// display *disable* is not reversible in-process — only the process exiting
-    /// (which closes our CGS connection) reverts it — so a disconnect that hits
-    /// this leaves the built-in panel dark until macrdp restarts (#168). The
-    /// overlay watcher reads-and-clears this after `drop`, and under launchd
-    /// deliberately exits so KeepAlive restarts a fresh process (panel back in
-    /// ~2-3 s) instead of leaving it dark indefinitely. Process-global because
-    /// detach is single-instance and `Drop` can't return a value to the
-    /// (guard-type-generic) watcher.
-    static DETACH_REENABLE_FAILED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
     /// Display id of the HiDPI virtual display (0 = none). The capture path
     /// needs the display's backing pixel size, and `CGDisplayCopyDisplayMode`
     /// returns nothing for a virtual display, so the scale is recorded here
@@ -214,12 +200,6 @@ mod macos {
                 String::from_utf8_lossy(&out.stderr).trim()
             )),
         }
-    }
-
-    /// Read-and-clear the "detach left the physical panel stuck-disabled" flag
-    /// (see [`DETACH_REENABLE_FAILED`]). Returns true at most once per failure.
-    pub fn take_detach_reenable_failed() -> bool {
-        DETACH_REENABLE_FAILED.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether the local macOS session is currently screen-locked —
@@ -634,7 +614,7 @@ mod macos {
         /// stays the system MAIN display (the one holding the menu bar + Dock)
         /// after a live re-mode. A mode change (`applySettings`) can reset the
         /// display arrangement, knocking the vd off `(0, 0)` — and on the
-        /// headless capture/detach path (where `CapturedPrimary`/`DetachedPrimary`
+        /// headless capture/detach path (where `CapturedPrimary`/`ShieldedPrimary`
         /// placed the vd at `(0, 0)` precisely to make it main) that moves the
         /// menu bar + Dock back onto the now-blanked physical panel, so they
         /// vanish from the client's view. Headless-only helper: `capture.rs`
@@ -781,263 +761,6 @@ mod macos {
         }
     }
 
-    /// Makes the Mac headless except via the virtual display: every
-    /// active physical display (built-in panel, any attached external
-    /// monitors) is disabled at the WindowServer level — backlight
-    /// off, no menu bar, no windows can be placed there, cursor can't
-    /// cross onto them.
-    ///
-    /// Drop re-enables every detached display and restores its
-    /// original origin. All CGConfigure transactions here use
-    /// `ConfigureForAppOnly`: macOS automatically reverts every
-    /// change when this process exits, so even a hard crash (signal,
-    /// SIGKILL, panic past unwinding) leaves the panel re-enabled —
-    /// no logout dance required. ForAppOnly also avoids the
-    /// session-state accumulation that previously made the re-enable
-    /// transaction synchronously reject with CGError 1001 on the
-    /// second connect/disconnect cycle (and on first cycle of any
-    /// run that inherited dirty session state from a prior failed
-    /// run).
-    pub struct DetachedPrimary {
-        virtual_id: u32,
-        virtual_old_origin: (i32, i32),
-        /// Each physical display we disabled, with its origin at
-        /// install time (so Drop can put it back where it was).
-        detached: Vec<(u32, (i32, i32))>,
-        enabler: private_api::DisplayEnabler,
-    }
-
-    impl DetachedPrimary {
-        pub fn install(virtual_display_id: u32) -> Result<Self> {
-            let enabler = private_api::DisplayEnabler::load()
-                .context("loading CGSConfigureDisplayEnabled private symbol")?;
-
-            // Capture vd's pre-install bounds.
-            let vd = CGDisplay::new(virtual_display_id);
-            let vd_bounds = vd.bounds();
-            let virtual_old_origin = (
-                vd_bounds.origin.x.round() as i32,
-                vd_bounds.origin.y.round() as i32,
-            );
-            let vd_width = vd_bounds.size.width.round() as i32;
-
-            // Discover the displays that need detaching. The normal case is
-            // "everything active that isn't the virtual display." Recovery
-            // case: a previous DetachedPrimary::drop on this session may have
-            // failed to re-enable a physical display, leaving it online but
-            // inactive — those won't show up in active_displays. Fall back to
-            // online_displays so the reconnect path can pick up that stale
-            // disabled set and retry, rather than wedging until logout.
-            let actives = CGDisplay::active_displays()
-                .map_err(|e| anyhow!("CGGetActiveDisplayList: CGError {e}"))?;
-            let mut detached: Vec<(u32, (i32, i32))> = actives
-                .iter()
-                .copied()
-                .filter(|id| *id != virtual_display_id)
-                .map(|id| {
-                    let b = CGDisplay::new(id).bounds();
-                    (id, (b.origin.x.round() as i32, b.origin.y.round() as i32))
-                })
-                .collect();
-            if detached.is_empty() {
-                let online = online_displays()
-                    .map_err(|e| anyhow!("CGGetOnlineDisplayList: CGError {e}"))?;
-                let stuck: Vec<u32> = online
-                    .into_iter()
-                    .filter(|id| *id != virtual_display_id && !actives.contains(id))
-                    .collect();
-                if !stuck.is_empty() {
-                    tracing::warn!(
-                        stuck_count = stuck.len(),
-                        "found online-but-inactive physical displays — a previous \
-                         restore left them disabled; treating as already-detached"
-                    );
-                    // No reliable way to recover their original origin (the
-                    // disabled state hides their pre-detach bounds). (0, 0)
-                    // is the conventional "back to primary" target so Drop
-                    // at least won't park them somewhere weirder.
-                    detached = stuck.into_iter().map(|id| (id, (0, 0))).collect();
-                }
-            }
-            if detached.is_empty() {
-                return Err(anyhow!(
-                    "no physical display to detach — the virtual display is the \
-                     only active one already"
-                ));
-            }
-
-            // Any CGDisplay handle works for begin/complete; the config is global.
-            let any = CGDisplay::new(virtual_display_id);
-
-            // Tx 1: only origin moves. Mixing the disable into this tx tripped
-            // SkyLight badly — the move never reached the disabled display,
-            // which then refused to re-enable on Drop (CGError 1001 at
-            // complete-time). Keep each transaction single-purpose so the
-            // display's state machine stays consistent.
-            let config = any
-                .begin_configuration()
-                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (move-tx): CGError {e}"))?;
-            vd.configure_display_origin(&config, 0, 0)
-                .map_err(|e| anyhow!("CGConfigureDisplayOrigin(vd, 0, 0): CGError {e}"))?;
-            let mut x_off = vd_width;
-            for (id, _) in &detached {
-                let d = CGDisplay::new(*id);
-                if d.is_active() {
-                    d.configure_display_origin(&config, x_off, 0).map_err(|e| {
-                        anyhow!("CGConfigureDisplayOrigin(physical {id}, {x_off}, 0): CGError {e}")
-                    })?;
-                    x_off += d.bounds().size.width.round() as i32;
-                }
-            }
-            any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (move-tx): CGError {e}"))?;
-
-            std::thread::sleep(TX_SETTLE);
-
-            // Tx 2: only disables. By now the move has propagated, so disable
-            // applies cleanly and the display's last-known position is the
-            // shifted one — important because that's what SkyLight will
-            // validate against on the eventual re-enable.
-            let config = any
-                .begin_configuration()
-                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (disable-tx): CGError {e}"))?;
-            for (id, _) in &detached {
-                if CGDisplay::new(*id).is_active() {
-                    enabler.set(config, *id, false)?;
-                }
-            }
-            any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (disable-tx): CGError {e}"))?;
-
-            tracing::info!(
-                detached_count = detached.len(),
-                "physical displays detached"
-            );
-
-            Ok(Self {
-                virtual_id: virtual_display_id,
-                virtual_old_origin,
-                detached,
-                enabler,
-            })
-        }
-    }
-
-    impl Drop for DetachedPrimary {
-        fn drop(&mut self) {
-            tracing::info!(
-                detached_count = self.detached.len(),
-                "DetachedPrimary::drop running — re-enabling physical displays"
-            );
-            let any = CGDisplay::new(self.virtual_id);
-
-            // Two transactions: re-enable in tx 1, reposition in tx 2.
-            // Mixing both in a single transaction trips CGError 1001
-            // (kCGErrorIllegalArgument) at complete-time — configure_display_origin
-            // on a display that's transitioning disabled→enabled inside the
-            // same transaction is rejected, which rolls back the enable too,
-            // leaving the displays dark until process exit (ForAppOnly).
-            //
-            // Enable-tx is retried on failure as a defensive measure; with
-            // ForAppOnly scope the per-cycle state stacking that historically
-            // forced retries should no longer occur, but CG occasionally
-            // returns transient 1001s during display state transitions so the
-            // retry stays in as cheap insurance. If retries do exhaust, the
-            // ForAppOnly scope guarantees the displays come back the moment
-            // this process exits — no logout required.
-            const MAX_ENABLE_ATTEMPTS: u32 = 3;
-            const ENABLE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
-            let mut enable_ok = false;
-            for attempt in 1..=MAX_ENABLE_ATTEMPTS {
-                let config = match any.begin_configuration() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            attempt,
-                            "could not begin enable-tx during detach restore (CGError {e})"
-                        );
-                        if attempt < MAX_ENABLE_ATTEMPTS {
-                            std::thread::sleep(ENABLE_RETRY_BACKOFF);
-                        }
-                        continue;
-                    }
-                };
-                for (id, _) in &self.detached {
-                    if let Err(e) = self.enabler.set(config, *id, true) {
-                        tracing::warn!(attempt, "could not queue enable for display {id} ({e})");
-                    }
-                }
-                match any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly) {
-                    Ok(()) => {
-                        if attempt > 1 {
-                            tracing::info!(attempt, "enable-tx succeeded on retry");
-                        }
-                        enable_ok = true;
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(attempt, "enable-tx complete failed (CGError {e})");
-                        if attempt < MAX_ENABLE_ATTEMPTS {
-                            std::thread::sleep(ENABLE_RETRY_BACKOFF);
-                        }
-                    }
-                }
-            }
-            if !enable_ok {
-                // The panel is left disabled. On macOS 26.x this is not
-                // recoverable in-process (the CGS app-scoped disable only
-                // reverts when our CGS connection closes, i.e. on process
-                // exit) — so flag it for the overlay watcher, which under
-                // launchd will exit to trigger a clean restart (#168).
-                DETACH_REENABLE_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
-                tracing::warn!(
-                    "exhausted enable-tx retries; the built-in display is left \
-                     disabled — it re-enables only when this process exits \
-                     (ForAppOnly scope). Under launchd macrdp will restart to \
-                     restore it (#168)."
-                );
-                return;
-            }
-
-            std::thread::sleep(TX_SETTLE);
-
-            // Now the displays are live again; queue origin restores in a
-            // second transaction. Best-effort — a wrong origin is far less
-            // bad than a dark display.
-            let config = match any.begin_configuration() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        "displays re-enabled but could not begin reposition-tx \
-                         (CGError {e}); layout will be wrong until logout"
-                    );
-                    return;
-                }
-            };
-            for (id, origin) in &self.detached {
-                let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
-            }
-            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
-                &config,
-                self.virtual_old_origin.0,
-                self.virtual_old_origin.1,
-            );
-            if let Err(e) =
-                any.complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-            {
-                tracing::warn!(
-                    "displays re-enabled but reposition-tx failed (CGError {e}); \
-                     layout will revert to original on process exit"
-                );
-            } else {
-                tracing::info!(
-                    detached_count = self.detached.len(),
-                    "re-enabled detached displays and restored layout"
-                );
-            }
-        }
-    }
-
     // CGSetDisplayTransferByFormula / CGDisplayRestoreColorSyncSettings —
     // public CoreGraphics gamma-LUT API, not surfaced by the core_graphics
     // crate. Used to force each captured display to render pure black at
@@ -1093,7 +816,7 @@ mod macos {
     /// black, and the capture token sinks any local input on the
     /// physical displays.
     ///
-    /// Why not `DetachedPrimary`'s approach:
+    /// Historical physical-detach behavior:
     /// - No `CGSConfigureDisplayEnabled` private symbol involved.
     /// - No `CGError 1001` window because there is no second
     ///   reconfigure transaction interleaved with the state change.
@@ -1358,7 +1081,7 @@ mod macos {
     /// Headless blanking via an opaque black **shield window** over each
     /// physical panel, drawn by the `macrdpshield` helper process.
     ///
-    /// Third headless mode alongside [`DetachedPrimary`] and
+    /// Window-based headless mode, alongside
     /// [`CapturedPrimary`]. The arrangement half is identical to
     /// `CapturedPrimary` — vd to `(0, 0)` as system main, physicals shifted
     /// aside, completed `ConfigureForSession` (see that type for why ForSession
@@ -1405,6 +1128,18 @@ mod macos {
         /// shows the desktop again between sessions. Empty on hardware where
         /// the vd extends rather than mirrors.
         broke_mirror: Vec<u32>,
+        refit_active: std::sync::Arc<std::sync::Mutex<bool>>,
+        session_helper: Option<SessionShieldHelper>,
+    }
+
+    struct SessionShieldHelper(std::process::Child);
+
+    impl Drop for SessionShieldHelper {
+        fn drop(&mut self) {
+            // Even if HIDE failed, ending the window owner clears the panel.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     /// Whether `--shield-primary` should keep the PHYSICAL panel as the system
@@ -1475,6 +1210,19 @@ mod macos {
 
     impl ShieldedPrimary {
         pub fn install(virtual_display_id: u32) -> Result<Self> {
+            Self::install_with_layout(virtual_display_id, shield_keeps_physical_main(), None)
+        }
+
+        pub fn install_move_apps(virtual_display_id: u32) -> Result<Self> {
+            let helper = SessionShieldHelper(crate::spawn_shield_helper()?);
+            Self::install_with_layout(virtual_display_id, false, Some(helper))
+        }
+
+        fn install_with_layout(
+            virtual_display_id: u32,
+            keep_physical_main: bool,
+            session_helper: Option<SessionShieldHelper>,
+        ) -> Result<Self> {
             let vd = CGDisplay::new(virtual_display_id);
             let vd_bounds = vd.bounds();
             let virtual_old_origin = (
@@ -1505,7 +1253,7 @@ mod macos {
                 // VISIBLE, silently defeating the whole point of the mode. Fall
                 // back to CGGetOnlineDisplayList (which includes mirrored /
                 // disabled panels) and shield those, exactly as
-                // DetachedPrimary/CapturedPrimary already do. The origin is
+                // the capture path does. The origin is
                 // unknowable while mirrored/disabled, so use (0, 0) — Drop only
                 // repositions when it actually moved the arrangement, and the
                 // default keep-physical-main path moves nothing.
@@ -1812,7 +1560,6 @@ mod macos {
             // keep_physical_main = false: the old behaviour — move vd → (0,0),
             // physicals aside. Remote gets the menu bar + Dock, but the lock
             // screen renders on the invisible headless vd (refuted 2026-07-20).
-            let keep_physical_main = shield_keeps_physical_main();
             if keep_physical_main {
                 tracing::info!(
                     "--shield-primary: keeping the PHYSICAL panel as system main so a \
@@ -1937,6 +1684,8 @@ mod macos {
                 shielded: targets,
                 moved_arrangement: !keep_physical_main,
                 broke_mirror,
+                refit_active: std::sync::Arc::new(std::sync::Mutex::new(true)),
+                session_helper,
             })
         }
 
@@ -1961,7 +1710,12 @@ mod macos {
         /// logged from the thread.
         pub fn reassert_blanking(&self) -> usize {
             let vd = self.virtual_id;
+            let active = self.refit_active.clone();
             std::thread::spawn(move || {
+                let active = active.lock().expect("shield refit mutex poisoned");
+                if !*active {
+                    return;
+                }
                 if let Err(e) = crate::shield::show(&[vd]) {
                     tracing::warn!("could not re-fit shields after a display change: {e:#}");
                 }
@@ -1979,12 +1733,17 @@ mod macos {
 
             // Lower the shields first so the panels are usable again even if
             // the arrangement restore below fails.
+            *self
+                .refit_active
+                .lock()
+                .expect("shield refit mutex poisoned") = false;
             if let Err(e) = crate::shield::hide() {
                 tracing::warn!(
                     "could not lower the shield windows: {e:#} — they will vanish \
                      when the helper exits with this process"
                 );
             }
+            drop(self.session_helper.take());
 
             // Restore any vd→physical mirror `install` broke, so the built-in
             // panel shows the desktop again between sessions. The un-mirror was
@@ -2046,11 +1805,6 @@ mod macos {
 mod stub {
     use anyhow::{anyhow, Result};
 
-    /// No detach path off macOS, so nothing ever leaves a panel stuck.
-    pub fn take_detach_reenable_failed() -> bool {
-        false
-    }
-
     /// No screen-lock concept off macOS — definitively not locked, not
     /// "unknown" (there's nothing to fail to look up).
     pub fn screen_is_locked() -> Option<bool> {
@@ -2108,14 +1862,6 @@ mod stub {
         }
     }
 
-    pub struct DetachedPrimary;
-
-    impl DetachedPrimary {
-        pub fn install(_virtual_display_id: u32) -> Result<Self> {
-            Err(anyhow!("primary-display detach is macOS-only"))
-        }
-    }
-
     pub struct CapturedPrimary;
 
     impl CapturedPrimary {
@@ -2130,6 +1876,10 @@ mod stub {
     pub struct ShieldedPrimary;
 
     impl ShieldedPrimary {
+        pub fn install_move_apps(virtual_display_id: u32) -> Result<Self> {
+            Self::install(virtual_display_id)
+        }
+
         pub fn install(_virtual_display_id: u32) -> Result<Self> {
             Err(anyhow!("primary-display shielding is macOS-only"))
         }

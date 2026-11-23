@@ -446,6 +446,8 @@ pub struct CaptureDisplay {
     /// so the AppKit notification very likely does not fire either. Re-fitting
     /// from the capture path does not depend on any notification. `None` unless
     /// `--shield-primary` is active.
+    #[cfg(target_os = "macos")]
+    pub shield_keep_physical_main: bool,
     pub shielded_primary:
         Option<Arc<std::sync::Mutex<Option<crate::virtual_display::ShieldedPrimary>>>>,
 }
@@ -838,8 +840,10 @@ impl CaptureDisplay {
                     // does NOT make the vd the system main display (so the lock
                     // screen stays on the visible physical panel). Re-anchoring
                     // it as main here would undo that on every resize, so skip it.
-                    let skip_reanchor = self.shielded_primary.is_some()
-                        && crate::virtual_display::shield_keeps_physical_main();
+                    let skip_reanchor = self.shielded_primary.as_ref().is_some_and(|slot| {
+                        self.shield_keep_physical_main
+                            || slot.lock().expect("shielded_primary poisoned").is_none()
+                    });
                     if !skip_reanchor {
                         if let Err(e) = vd.reanchor_as_main() {
                             tracing::warn!(error = ?e, "re-anchoring the vd as main after re-mode failed");
@@ -2354,6 +2358,7 @@ mod macos {
                     };
                     let poll_at = now + poll_interval;
                     let wake_at = flush_at.map_or(poll_at, |deadline| deadline.min(poll_at));
+                    let responsive_capture = self.stream.responsive_capture;
                     let sample = tokio::time::timeout_at(wake_at.into(), self.stream.next());
                     let sample = if let Some(gfx) = self
                         .gfx
@@ -2367,6 +2372,13 @@ mod macos {
                                 self.flush_burst.retry_deferred_now(Instant::now());
                                 if let Some(stats) = crate::stats::global() {
                                     stats.tcp_resume_wakes.fetch_add(1, Ordering::Relaxed);
+                                }
+                                continue;
+                            }
+                            () = gfx.wait_for_encoder_slot(), if responsive_capture => {
+                                self.flush_burst.retry_deferred_now(Instant::now());
+                                if let Some(stats) = crate::stats::global() {
+                                    stats.encoder_resume_wakes.fetch_add(1, Ordering::Relaxed);
                                 }
                                 continue;
                             }

@@ -12,11 +12,40 @@ The capture loop also **self-heals a dead SCK audio stream**: over a long sessio
 **Mute on minimize** (default-on, opt out with `--no-mute-on-minimize`). When the client minimizes its window it sends the standard `SuppressOutput { None }` PDU; the server stops emitting both EGFX video frames and RDPSND waves until the client refocuses (`RefreshRectangle` / `SuppressOutput { Some(rect) }`). Without this, mstsc accumulates a backlog of video frames + audio waves during a long minimize that has to chew through on refocus, producing several seconds of input lockout, audio drift, and a video catch-up storm. With it, you get a brief audio gap on refocus and audio + video resume in sync. Both gates are debounced (1 s) so transient `SuppressOutput` flaps mstsc emits under wire pressure (e.g., during a heavy local `cargo build`) don't oscillate the mute and cause stutter. Pass `--no-mute-on-minimize` if you specifically want audio to keep playing while the client window is minimized — accepting that audio will drift by however long was spent minimized.
 
 **PCM queue during video stalls.** PCM is sent in 10 ms waves as soon as the
-writer is available. With `--audio-core-tap`, up to 12 waves (120 ms of PCM)
-can wait in the send queue so a brief TCP write stall is less likely to cut
-out audio. ScreenCaptureKit uses an eight-wave (80 ms) limit. These limits are
-queue capacities. Audio playback delay also depends on the client and the
-network. When the queue fills, the server drops new waves and logs the count.
+writer is available. The capture loop keeps a short backlog to carry audio
+through brief TCP write stalls. Queued waves expire after 120 ms with
+`--audio-core-tap` or 80 ms with ScreenCaptureKit. If the backlog fills, the
+capture loop discards the oldest pending wave and logs the drop count. At most
+one additional wave waits in the transport channel. Client playback buffering
+and network transit also contribute to the delay heard at the speakers.
+
+On the local `--stats-endpoint`, `pcm_queue_age_samples` and
+`pcm_queue_age_total_us` measure time from packet assembly to transport handoff.
+`pcm_queue_drops` counts expired and evicted packets. These process-wide values
+exclude packets already in the TCP writer and client playback buffering.
+
+To compare RDPSND acknowledgements with TCP stalls, run a diagnostic session
+with `RUST_LOG=info,ironrdp_rdpsnd::server=trace`, then summarize the log using
+a time window for that connection.
+
+```sh
+python3 scripts/summarize-audio-diagnostics.py \
+  --since 2026-11-22T19:12:00Z --until 2026-11-22T19:13:07Z
+```
+
+The report groups first and second confirmations separately. Their timestamps
+measure the client's receive-to-confirm time. TCP stall summaries cover only
+writes the server logged as stalled and can include other graphics or
+redirection channels. Compare audio with a matching flash and beep recorded
+on the client to measure playback sync.
+
+For a screen recording with five flash-and-beep pulses and system audio, run
+`swift scripts/measure-av-sync.swift recording.mp4` on the Mac. The script uses
+the middle half of the frame in both dimensions. To measure a smaller flash
+area, pass its normalized `x,y,width,height` as the next argument. It reports
+each pair and the median in milliseconds. A positive value means the beep
+occurred after the flash. Allow for the recording's video frame interval and the
+script's 5 ms audio windows when comparing results.
 
 ## Microphone redirection (experimental)
 

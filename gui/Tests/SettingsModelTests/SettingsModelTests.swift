@@ -51,16 +51,22 @@ final class SettingsModelTests: XCTestCase {
         let model = SettingsModel(controller: controller, initialConfig: [
             "ENABLE_H264": "1",
             "VIRTUAL_DISPLAY": "1",
-            "EXTRA_FLAGS": "--virtual-display-hidpi auto --network-autodetect --no-rich-clipboard --stretch",
+            "EXTRA_FLAGS": "--virtual-display-hidpi auto --network-autodetect --no-rich-clipboard --audio-core-tap --stretch",
         ], saveSettings: { writes.append($0) })
         XCTAssertEqual(model.virtualDisplayScaling, .automatic)
         XCTAssertTrue(model.bool("NETWORK_AUTODETECT"))
         XCTAssertFalse(model.bool("RICH_CLIPBOARD"))
+        XCTAssertTrue(model.bool("AUDIO_CORE_TAP"))
         model.setVirtualDisplayScaling(.retina)
         model.setBool("NETWORK_AUTODETECT", false)
         model.setBool("RICH_CLIPBOARD", true)
         model.setBool("CAPTURE_NV12", true)
         model.setBool("ALT_SPACE_SPOTLIGHT", true)
+        model.setBool("AUDIO_CORE_TAP", false)
+        model.setString("STATS_PORT", "65536")
+        XCTAssertNotNil(model.validationError)
+        model.setString("STATS_PORT", "41234")
+        XCTAssertNil(model.validationError)
         XCTAssertTrue(writes.isEmpty)
         model.apply()
         XCTAssertEqual(writes.count, 1)
@@ -69,6 +75,8 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(writes[0]["RICH_CLIPBOARD"], "1")
         XCTAssertEqual(writes[0]["CAPTURE_NV12"], "1")
         XCTAssertEqual(writes[0]["ALT_SPACE_SPOTLIGHT"], "1")
+        XCTAssertEqual(writes[0]["AUDIO_CORE_TAP"], "0")
+        XCTAssertEqual(writes[0]["STATS_PORT"], "41234")
         XCTAssertEqual(writes[0]["EXTRA_FLAGS"], "--stretch")
         XCTAssertFalse(model.bool("NETWORK_AUTODETECT"))
         XCTAssertTrue(model.bool("RICH_CLIPBOARD"))
@@ -158,21 +166,29 @@ final class SettingsModelTests: XCTestCase {
             "ENABLE_H264": "1", "VD_HIDPI": "auto", "VIRTUAL_DISPLAY": "1",
             "EXTRA_FLAGS": "--h264-max-unacked-frames=8 --network-autodetect",
             "ALT_SPACE_SPOTLIGHT": "1", "RICH_CLIPBOARD": "0",
+            "H264_MAIN_PROFILE": "1",
         ], presetStore: store)
         model.selectPersonalPreset(legacy.id)
         model.loadPersonalPreset()
         XCTAssertEqual(model.tcpPacingLimit, "3")
+        XCTAssertFalse(model.bool("H264_MAIN_PROFILE"))
         XCTAssertTrue(model.bool("ALT_SPACE_SPOTLIGHT"))
         XCTAssertEqual(model.virtualDisplayScaling, .automatic)
         model.setTCPPacingLimit("5")
         model.setBool("CAPTURE_NV12", true)
+        model.setBool("H264_MAIN_PROFILE", true)
+        model.setBool("AUDIO_CORE_TAP", true)
         model.personalPresetName = "New"
         model.savePersonalPreset()
         model.applyProfile(.stable)
         XCTAssertFalse(model.bool("CAPTURE_NV12"))
+        XCTAssertFalse(model.bool("H264_MAIN_PROFILE"))
+        model.setBool("AUDIO_CORE_TAP", false)
         model.loadPersonalPreset()
         XCTAssertEqual(model.tcpPacingLimit, "5")
         XCTAssertTrue(model.bool("CAPTURE_NV12"))
+        XCTAssertTrue(model.bool("H264_MAIN_PROFILE"))
+        XCTAssertTrue(model.bool("AUDIO_CORE_TAP"))
         XCTAssertTrue(model.bool("NETWORK_AUTODETECT"))
         XCTAssertFalse(model.bool("RICH_CLIPBOARD"))
         XCTAssertEqual(model.virtualDisplayScaling, .automatic)

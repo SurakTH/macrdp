@@ -339,10 +339,10 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           # Explicitly requested Surak fork releases publish after all builds pass.
-          draft: ${{ !contains(fromJSON('["v0.96.1","v0.9.6.2"]'), inputs.tag || github.ref_name) && !(github.repository == 'SurakTH/macrdp' && contains(fromJSON('["v0.10.9.1","v0.10.9.2"]'), inputs.tag || github.ref_name)) }}
+          draft: ${{ !contains(fromJSON('["v0.96.1","v0.9.6.2"]'), inputs.tag || github.ref_name) && !(github.repository == 'SurakTH/macrdp' && contains(fromJSON('["v0.10.9.1","v0.10.9.2","v0.10.9.3"]'), inputs.tag || github.ref_name)) }}
           prerelease: ${{ contains(fromJSON('["v0.96.1","v0.9.6.2"]'), inputs.tag || github.ref_name) || contains(inputs.tag || github.ref_name, '-') }}
-          name: ${{ (github.repository == 'SurakTH/macrdp' && (inputs.tag || github.ref_name) == 'v0.10.9.2') && 'S'' MacRDP v0.10.9.2' || contains(fromJSON('["v0.96.1","v0.9.6.2","v0.10.9.1"]'), inputs.tag || github.ref_name) && format('macrdp Surak {0}', inputs.tag || github.ref_name) || (inputs.tag || github.ref_name) }}
-          body_path: ${{ contains(fromJSON('["v0.96.1","v0.9.6.2","v0.10.9.1","v0.10.9.2"]'), inputs.tag || github.ref_name) && format('docs/releases/{0}.md', inputs.tag || github.ref_name) || '' }}
+          name: ${{ (github.repository == 'SurakTH/macrdp' && contains(fromJSON('["v0.10.9.2","v0.10.9.3"]'), inputs.tag || github.ref_name)) && format('S'' MacRDP {0}', inputs.tag || github.ref_name) || contains(fromJSON('["v0.96.1","v0.9.6.2","v0.10.9.1"]'), inputs.tag || github.ref_name) && format('macrdp Surak {0}', inputs.tag || github.ref_name) || (inputs.tag || github.ref_name) }}
+          body_path: ${{ contains(fromJSON('["v0.96.1","v0.9.6.2","v0.10.9.1","v0.10.9.2","v0.10.9.3"]'), inputs.tag || github.ref_name) && format('docs/releases/{0}.md', inputs.tag || github.ref_name) || '' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

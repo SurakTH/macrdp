@@ -2,6 +2,28 @@ import XCTest
 @testable import macrdptray
 
 final class PerformanceTelemetryTests: XCTestCase {
+    func testAudioDiagnosticsShowIntervalDeltasAndHandleOlderServers() throws {
+        var history = PerformanceHistory()
+        let legacy = try snapshot()
+        XCTAssertFalse(legacy.hasAudioDiagnostics)
+        history.record(legacy)
+        let first = try snapshot([
+            "uptime_ms": 3000, "audio_capture_age_samples": 100, "audio_capture_age_total_us": 3_000_000,
+            "pcm_queue_age_samples": 200, "pcm_queue_age_total_us": 4000, "pcm_queue_drops": 1,
+        ])
+        XCTAssertTrue(first.hasAudioDiagnostics)
+        history.record(first)
+        XCTAssertNil(history.latest?.pcmQueueAgeMs)
+        history.record(try snapshot([
+            "uptime_ms": 5000, "audio_capture_age_samples": 200, "audio_capture_age_total_us": 5_800_000,
+            "pcm_queue_age_samples": 400, "pcm_queue_age_total_us": 8800, "pcm_queue_drops": 4,
+        ]))
+        let interval = try XCTUnwrap(history.latest)
+        XCTAssertEqual(interval.audioCaptureAgeMs, 28)
+        XCTAssertEqual(try XCTUnwrap(interval.pcmQueueAgeMs), 0.024, accuracy: 0.0001)
+        XCTAssertEqual(interval.pcmQueueDrops, 3)
+    }
+
     func testVideoDiagnosticsShowIntervalDeltasAndHandleOlderServers() throws {
         var history = PerformanceHistory()
         let oldServer = try snapshot()

@@ -281,16 +281,14 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           stays untouched. Requires --width and --height.
 --make-primary            Promote the virtual display to system primary (the one
                           with the menu bar). Only valid with --virtual-display.
---detach-primary          While a client is connected, disable every physical
-                          display (backlights off, no menu bar). Restored on
-                          disconnect / exit. Only with --virtual-display.
+--detach-primary          Cover physical displays and move app windows to the
+                          virtual display while a client is connected. Restores
+                          the local workspace on disconnect.
 --capture-primary         Alternative to --detach-primary: exclusive
                           CGDisplayCapture of every physical display, then
                           gamma-clamp to black. Panels stay backlit but render
-                          solid black. Use when --detach-primary doesn't
-                          actually blank the panel on your hardware. Mutually
-                          exclusive with --detach-primary. Only with
-                          --virtual-display.
+                          solid black. Mutually exclusive with
+                          --detach-primary. Only with --virtual-display.
                           ⚠ SECURITY: while this is engaged the Mac CANNOT BE
                           LOCKED — Apple menu > Lock Screen silently does nothing
                           (loginwindow can't draw onto a CGDisplayCaptured
@@ -460,10 +458,12 @@ notes in `docs/known-quirks.md` for the full story and the tuning history.
 
 To go *fully* headless while a client is connected, pick one:
 
-- **`--detach-primary`** — turns the backlight off on every built-in / external panel via `CGSConfigureDisplayEnabled`. Cleanest visually. On some macOS versions / displays the disable transaction succeeds but the panel keeps showing the desktop; if you hit that, switch to:
+- **`--detach-primary`** — **Blank — move apps to remote** in Controller. Covers physical displays with black windows, moves app windows onto the virtual display, and moves them back after the last client disconnects. Physical displays remain enabled so macOS can show the local workspace when the covers are removed.
 - **`--capture-primary`** — takes exclusive `CGDisplayCapture` of every physical display and forces the gamma LUT to map every input to black. Backlight stays on but panels render solid black. Works everywhere capture is allowed; uses only public CG symbols.
 
-Both restore the original layout when the last client disconnects, and both auto-revert on `SIGKILL` / panic (no logout required). Pick `--detach-primary` first; fall back to `--capture-primary` if your hardware doesn't honor the disable.
+Old configurations with `PRIMARY_MODE=detach` use **Blank — move apps to
+remote** automatically. The old display-disable operation could leave the
+MacBook panel missing after disconnect.
 
 > **⚠ Security caveat for `--capture-primary`: the Mac cannot be locked while it's engaged.**
 > Choosing Apple menu → Lock Screen (or ⌃⌘Q) appears to work but silently does nothing — the
@@ -516,10 +516,10 @@ Both restore the original layout when the last client disconnects, and both auto
 # Same, but the virtual display owns the menu bar (drive it as your main desktop).
 ./macrdp --virtual-display --width 2560 --height 1440 --make-primary
 
-# Fully headless on connect: physical panels go dark, revived on disconnect.
+# Cover the physical panels and move app windows to the virtual display.
 ./macrdp --virtual-display --width 2560 --height 1440 --detach-primary
 
-# Same idea, for hardware where --detach-primary doesn't actually blank the panel.
+# Exclusive capture with gamma blanking.
 ./macrdp --virtual-display --width 2560 --height 1440 --capture-primary
 
 # Non-interactive launch (used by dist/install.sh): password from Keychain.
@@ -595,10 +595,19 @@ continues to use its independent resolution setting.
 
 The virtual display has its own Spaces when **Displays have separate Spaces**
 is enabled in macOS. Create a second Space on the virtual display to use
-Ctrl+Left/Right there. To diagnose a slow remote Ctrl+Arrow, use
+Ctrl+Left/Right there. **Blank — keep apps on Mac (can't lock)** takes
+exclusive control of the physical display and can prevent Mission Control
+from opening, even while you are viewing the virtual display. Choose
+**Keep local screen on** to use Mission Control and Spaces over RDP.
+
+To diagnose a slow remote Ctrl+Arrow, use
 `RUST_LOG=info,macrdp::input::macos::system_shortcuts=debug`. The shortcut log
 reports queue time and System Events execution time. Compare those with the
-visible transition in the client to isolate display or capture delay.
+visible transition in the client. The shortcut timer starts after macrdp
+receives the keystroke. A nearby `dispatch_pdu delayed acquiring this.lock`
+warning reports time spent waiting before RDP dispatches an inbound message.
+Compare the remote shortcut with the same shortcut on the Mac's keyboard
+to check how much of the transition comes from macOS itself.
 
 **Input** includes Option+Space for Spotlight and Option+Backtick for cycling
 windows in the active app. **Redirection → Clipboard** controls HTML/RTF

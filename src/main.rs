@@ -374,15 +374,10 @@ struct Args {
     #[arg(long)]
     make_primary: bool,
 
-    /// While an RDP client is connected, disable every physical display
-    /// (built-in panel + any external monitors) so the Mac is headless
-    /// via the virtual display alone: backlights off, no menu bar, no
-    /// windows can be placed there, cursor can't cross onto them. As
-    /// soon as the last client disconnects, the displays come back and
-    /// the local workspace is restored. Also restored on clean exit
-    /// and — even if Drop doesn't run (signal, crash) — at the next
-    /// user logout via the session-scoped CGConfigure. Only valid with
-    /// --virtual-display.
+    /// While an RDP client is connected, shield the physical displays and
+    /// move app windows onto the virtual display. When the last client
+    /// disconnects, uncover the displays and move windows back. The flag keeps
+    /// its historical name for existing configurations. Requires --virtual-display.
     #[arg(long)]
     detach_primary: bool,
 
@@ -391,11 +386,8 @@ struct Args {
     /// CGDisplayCapture. The panels go solid black (backlight stays
     /// on) and the cursor can't be moved onto them. Drops the capture
     /// on last disconnect. Captures are process-scoped, so a signal /
-    /// crash auto-releases — no logout dance. Use this when
-    /// --detach-primary doesn't actually go headless on your machine
-    /// (e.g. the disable transaction succeeds but the panel keeps
-    /// showing the desktop). Mutually exclusive with --detach-primary.
-    /// Only valid with --virtual-display.
+    /// crash auto-releases. Mutually exclusive with --detach-primary.
+    /// Requires --virtual-display.
     #[arg(long)]
     capture_primary: bool,
 
@@ -2014,35 +2006,6 @@ fn attempt_auto_unlock(_password: &str) -> AutoUnlockOutcome {
     AutoUnlockOutcome::NotLocked
 }
 
-/// Exit code used when a stuck `--detach-primary` disconnect bounces the process
-/// so launchd restarts it (#168). **Deliberately non-zero** (`EX_UNAVAILABLE`,
-/// distinct from the health watchdog's `70`): with the shipped LaunchAgent
-/// (`KeepAlive = true`, unconditional) any exit restarts, but a non-zero code
-/// also restarts under a `KeepAlive = { SuccessfulExit: false }` plist — so the
-/// fix doesn't silently depend on KeepAlive being unconditional — and it makes
-/// the intentional bounce distinguishable from a clean shutdown in telemetry.
-const DETACH_STUCK_EXIT_CODE: i32 = 69;
-
-/// Whether a `--detach-primary` disconnect that couldn't re-enable the physical
-/// panel should `process::exit` so launchd restarts a fresh process (which is
-/// the only thing that reverts the CGS disable on macOS 26.x — see #168).
-///
-/// Mirrors [`health::should_arm`]: an explicit `MACRDP_DETACH_RESTART_ON_STUCK=
-/// 1/0` wins; otherwise **on when headless** (stdout not a TTY ⇒ under launchd,
-/// which will restart the bounce) and **off** interactively (a `cargo run`
-/// session has nothing to restart it, so self-exiting would just kill the dev
-/// server and leave the panel stuck anyway — strictly worse). Pure + unit-tested.
-fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> bool {
-    match env_override
-        .map(|s| s.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("1") | Some("on") | Some("true") | Some("yes") => true,
-        Some("0") | Some("off") | Some("false") | Some("no") => false,
-        _ => !stdout_is_tty,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
@@ -2239,6 +2202,9 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             tokio::time::sleep(wait).await;
                         }
                     }
+                    if tracker.count.load(Ordering::SeqCst) > 0 {
+                        continue;
+                    }
                     if let Some(ovr) = slot.lock().expect("overlay mutex poisoned").take() {
                         // Drop runs the actual restore + emits its own
                         // success/warn logs; don't claim a result here.
@@ -2246,51 +2212,6 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         installed_at = None;
                         info!(label, "last RDP client disconnected");
 
-                        // #168: on --detach-primary, macOS 26.x can't re-enable
-                        // the physical panel in-process — only process exit
-                        // reverts the CGS disable. If Drop just flagged that
-                        // failure, restart (under launchd) so the panel comes
-                        // back, rather than leaving it dark until the next manual
-                        // kickstart. Only DetachedPrimary::drop sets the flag, so
-                        // this is a guaranteed no-op for --capture-primary (and
-                        // off macOS, where the stub returns false). The take_*
-                        // read clears the flag.
-                        if virtual_display::take_detach_reenable_failed() {
-                            if detach_restart_on_stuck(
-                                std::io::stdout().is_terminal(),
-                                std::env::var("MACRDP_DETACH_RESTART_ON_STUCK")
-                                    .ok()
-                                    .as_deref(),
-                            ) {
-                                warn!(
-                                    label,
-                                    "detach could not re-enable the built-in display \
-                                     (macOS won't do it in-process, #168) — exiting so \
-                                     launchd restarts a fresh process to restore it. \
-                                     Set MACRDP_DETACH_RESTART_ON_STUCK=0 to disable."
-                                );
-                                // Mirror the signal handler's cleanup before a
-                                // process::exit (which bypasses Drop): flush lazy-
-                                // paste state + unmount RDPDR NFS volumes. On this
-                                // disconnect edge the per-connection Drops have
-                                // usually already run, so these are near-no-ops —
-                                // but they keep the bounce as clean as the signal
-                                // path, and the startup reaper backstops anything
-                                // that slips through on the relaunch.
-                                #[cfg(target_os = "macos")]
-                                file_promise_lazy::shutdown_cleanup();
-                                rdpdr::shutdown_cleanup();
-                                std::process::exit(DETACH_STUCK_EXIT_CODE);
-                            } else {
-                                warn!(
-                                    label,
-                                    "detach could not re-enable the built-in display \
-                                     (#168) and restart-on-stuck is off — the panel \
-                                     stays dark until macrdp restarts (launchctl \
-                                     kickstart -k, or quit + relaunch)."
-                                );
-                            }
-                        }
                         // (--restore-windows-on-disconnect) Sweep windows off the
                         // virtual display back onto the built-in panel so the Mac
                         // is usable locally. MUST run AFTER `drop(ovr)` — that's
@@ -2321,7 +2242,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         // `tracker.count` before actually locking, canceling if the
                         // session came back. Off-thread so the watcher loop isn't
                         // blocked; naturally abandoned (never fires) if the process
-                        // exits in the meantime (e.g. the #168 restart-on-stuck
+                        // exits in the meantime (e.g. a service restart
                         // path) — lock-on-disconnect only ever fires on a genuine
                         // watcher-observed last-client-disconnect, never on server
                         // shutdown/kill. Heuristic, not a guarantee — see
@@ -2937,10 +2858,6 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // bridged so it can be flipped in config.env when debugging the camera.
         ("CAMERA_DUMP", "MACRDP_CAMERA_DUMP"),
         ("MIC_DUMP", "MACRDP_MIC_DUMP"),
-        // #168 stopgap: when --detach-primary can't re-enable the physical panel
-        // on disconnect (macOS 26.x won't do it in-process), restart under
-        // launchd to restore it. Env-read at the disconnect edge.
-        ("DETACH_RESTART_ON_STUCK", "MACRDP_DETACH_RESTART_ON_STUCK"),
         // Extra safety-buffer delay (--lock-on-disconnect) on top of the
         // overlay watcher's REACTIVATION_GRACE before actually locking the
         // screen. Env-read at the disconnect edge via lock_on_disconnect_delay_ms().
@@ -2953,6 +2870,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // above so STATS_PORT can be set from config.env.
         ("PREFER_HEVC", "MACRDP_EXPERIMENTAL_HEVC"),
         ("HEVC_HIGH_SPEED", "MACRDP_HEVC_HIGH_SPEED"),
+        ("H264_MAIN_PROFILE", "MACRDP_H264_MAIN_PROFILE"),
         ("RESPONSIVE_CAPTURE", "MACRDP_RESPONSIVE_CAPTURE"),
         ("STATS_PORT", "MACRDP_STATS_PORT"),
         ("AVC444_ALL_INTRA", "MACRDP_AVC444_ALL_INTRA"),
@@ -3252,9 +3170,6 @@ async fn async_main() -> Result<()> {
     let primary_override: std::sync::Arc<
         std::sync::Mutex<Option<virtual_display::PrimaryOverride>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let detached_primary: std::sync::Arc<
-        std::sync::Mutex<Option<virtual_display::DetachedPrimary>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let captured_primary: std::sync::Arc<
         std::sync::Mutex<Option<virtual_display::CapturedPrimary>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -3268,20 +3183,15 @@ async fn async_main() -> Result<()> {
     // any other non-cooperative native threads — instead of relying on the
     // tokio runtime to unwind cleanly.
     //
-    // The display RAII guards (PrimaryOverride / DetachedPrimary) are
+    // The display RAII guards are
     // dropped here first so the user's layout is restored before exit.
-    // Without this, Ctrl-C would leave the virtual display promoted or
-    // the built-in panel disabled until logout.
+    // This restores the local display layout before the forced exit.
     let cleanup_primary = primary_override.clone();
-    let cleanup_detach = detached_primary.clone();
     let cleanup_capture = captured_primary.clone();
     let cleanup_shield = shielded_primary.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         info!("shutdown signal received — exiting");
-        if let Some(ovr) = cleanup_detach.lock().expect("detach mutex poisoned").take() {
-            drop(ovr); // re-enables the built-in display
-        }
         if let Some(ovr) = cleanup_capture
             .lock()
             .expect("capture mutex poisoned")
@@ -3542,9 +3452,9 @@ async fn async_main() -> Result<()> {
             "detach",
             vd_id,
             session_tracker.clone(),
-            detached_primary.clone(),
-            virtual_display::DetachedPrimary::install,
-            args.restore_windows_on_disconnect,
+            shielded_primary.clone(),
+            virtual_display::ShieldedPrimary::install_move_apps,
+            true,
             physical_main_id,
             lock_activity.clone(),
             Arc::clone(&password),
@@ -3803,6 +3713,10 @@ async fn async_main() -> Result<()> {
     } else {
         None
     };
+    #[cfg(target_os = "macos")]
+    if args.detach_primary && locate_shield_helper().is_none() {
+        return Err(anyhow!("--detach-primary requires the macrdpshield helper"));
+    }
 
     #[cfg(target_os = "macos")]
     let _hud_helper = if args.app_switcher_hud {
@@ -3927,8 +3841,11 @@ async fn async_main() -> Result<()> {
             None
         },
         // Shared so a live re-mode can re-fit the shield windows to the panels'
-        // new frames. Only for --shield-primary.
-        shielded_primary: if args.shield_primary {
+        // new frames for both window-shielding modes.
+        #[cfg(target_os = "macos")]
+        shield_keep_physical_main: args.shield_primary
+            && virtual_display::shield_keeps_physical_main(),
+        shielded_primary: if args.shield_primary || args.detach_primary {
             Some(shielded_primary.clone())
         } else {
             None
@@ -4340,35 +4257,6 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-#[cfg(test)]
-mod detach_restart_tests {
-    use super::detach_restart_on_stuck;
-
-    #[test]
-    fn explicit_override_wins_over_tty() {
-        // Forced on even interactively (for testing on a TTY).
-        assert!(detach_restart_on_stuck(true, Some("1")));
-        assert!(detach_restart_on_stuck(true, Some("on")));
-        assert!(detach_restart_on_stuck(true, Some("TRUE")));
-        // Forced off even headless.
-        assert!(!detach_restart_on_stuck(false, Some("0")));
-        assert!(!detach_restart_on_stuck(false, Some("off")));
-        assert!(!detach_restart_on_stuck(false, Some(" no ")));
-    }
-
-    #[test]
-    fn defaults_on_when_headless_off_interactively() {
-        // Headless (not a TTY, i.e. under launchd) ⇒ default on.
-        assert!(detach_restart_on_stuck(false, None));
-        // Interactive (a TTY, e.g. `cargo run`) ⇒ default off (nothing to
-        // restart it, so self-exit would just kill the dev server).
-        assert!(!detach_restart_on_stuck(true, None));
-        // An unrecognized value falls back to the headless default.
-        assert!(detach_restart_on_stuck(false, Some("maybe")));
-        assert!(!detach_restart_on_stuck(true, Some("maybe")));
     }
 }
 

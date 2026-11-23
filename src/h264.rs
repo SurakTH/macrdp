@@ -269,6 +269,7 @@ struct ConnectionContext {
     shipped: Arc<AtomicU64>,
     tcp_dispatch: Option<TcpDispatchPending>,
     tcp_dispatch_resumed: Arc<tokio::sync::Notify>,
+    encoder_slot: Arc<EncoderSlotRetry>,
     /// Dimensions the surface + encoder were created with (in
     /// `setup_locked`, from the live `SharedDesktopSize`). `ship_frames`
     /// builds its AVC420 regions from these — not from a fresh
@@ -1822,7 +1823,52 @@ pub(crate) enum FrameSubmission {
     Submitted,
 }
 
+/// Coalesce retries while the capture loop is waiting for encoder capacity.
+#[derive(Default)]
+struct EncoderSlotRetry {
+    waiting: AtomicBool,
+    ready: tokio::sync::Notify,
+}
+
+impl EncoderSlotRetry {
+    fn is_full(&self, submitted: u64, retired: &AtomicU64, limit: u64) -> bool {
+        if submitted.saturating_sub(retired.load(Ordering::Relaxed)) < limit {
+            return false;
+        }
+        self.waiting.store(true, Ordering::SeqCst);
+        // A completion between the first load and registration may not have
+        // signalled. Recheck so capture never sleeps through the free slot.
+        if submitted.saturating_sub(retired.load(Ordering::SeqCst)) < limit {
+            self.waiting.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    fn retire(&self, retired: &AtomicU64) {
+        retired.fetch_add(1, Ordering::SeqCst);
+        if self.waiting.swap(false, Ordering::SeqCst) {
+            self.ready.notify_one();
+        }
+    }
+}
+
 impl Gfx {
+    pub(crate) async fn wait_for_encoder_slot(&self) {
+        let slot = self
+            .ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|ctx| ctx.is_ready && ctx.encoder.is_some())
+            .map(|ctx| Arc::clone(&ctx.encoder_slot));
+        if let Some(slot) = slot {
+            slot.ready.notified().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+
     pub(crate) async fn wait_for_tcp_dispatch_resume(&self) {
         if self.tcp_max_frame_lag == 0 || self.egfx_on_udp.load(Ordering::Relaxed) {
             return std::future::pending().await;
@@ -1832,7 +1878,7 @@ impl Gfx {
             .lock()
             .unwrap()
             .as_ref()
-            .filter(|ctx| ctx.hevc420)
+            .filter(|ctx| matches!(ctx.encoder, Some(VideoEncoder::Avc420(_))))
             .map(|ctx| Arc::clone(&ctx.tcp_dispatch_resumed));
         if let Some(wake) = wake {
             wake.notified().await;
@@ -2591,7 +2637,7 @@ impl Gfx {
             // A local write stall cannot be drained by submitting more
             // pictures. Apply this gate to retained pictures too. The capture
             // loop keeps the latest pixels and retries once the writer clears.
-            let watch_tcp = ctx.hevc420
+            let watch_tcp = matches!(ctx.encoder, Some(VideoEncoder::Avc420(_)))
                 && self.tcp_max_frame_lag > 0
                 && !self.egfx_on_udp.load(Ordering::Relaxed);
             if let Some(pending) = ctx
@@ -2615,18 +2661,15 @@ impl Gfx {
             // capture before encode doesn't break the reference chain — the next
             // encoded frame is a valid P-frame against the last encoded one — and
             // an armed `need_keyframe` persists across the skip.
-            let outstanding = ctx
-                .submitted
-                .load(Ordering::Relaxed)
-                .saturating_sub(ctx.shipped.load(Ordering::Relaxed));
-            if outstanding >= u64::from(self.max_in_flight) {
+            if ctx.encoder_slot.is_full(
+                ctx.submitted.load(Ordering::Relaxed),
+                &ctx.shipped,
+                u64::from(self.max_in_flight),
+            ) {
                 if let Some(stats) = crate::stats::global() {
                     stats.encode_deferred.fetch_add(1, Ordering::Relaxed);
                 }
-                trace!(
-                    outstanding,
-                    "EGFX pipeline full; dropping capture to latest"
-                );
+                trace!("EGFX pipeline full; deferring the latest capture");
                 return Ok(Deferred); // still the active path; just dropped this frame
             }
             // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
@@ -3038,6 +3081,7 @@ impl Gfx {
         &self,
         rx: std::sync::mpsc::Receiver<EncodeOutput>,
         shipped: Arc<AtomicU64>,
+        encoder_slot: Arc<EncoderSlotRetry>,
         avc444: bool,
         mut tcp_probe: Option<TcpDispatchProbe>,
     ) {
@@ -3048,7 +3092,7 @@ impl Gfx {
             let (main, auxiliary) = if avc444 {
                 if output.pts() & 1 == 0 {
                     if main_view.replace(output).is_some() {
-                        shipped.fetch_add(1, Ordering::Relaxed);
+                        encoder_slot.retire(&shipped);
                         needs_idr = true;
                     }
                     continue;
@@ -3091,7 +3135,7 @@ impl Gfx {
                     ctx.need_keyframe = true;
                 }
             }
-            shipped.fetch_add(1, Ordering::Relaxed);
+            encoder_slot.retire(&shipped);
             if let Some(stats) = crate::stats::global() {
                 stats.transport_retired.fetch_add(1, Ordering::Relaxed);
                 if failed_dispatch {
@@ -3210,17 +3254,19 @@ impl Gfx {
             ctx.shipped = Arc::new(AtomicU64::new(0));
             ctx.tcp_dispatch = None;
             ctx.tcp_dispatch_resumed = Arc::default();
+            ctx.encoder_slot = Arc::default();
             let gfx = self.clone();
             let shipped = ctx.shipped.clone();
+            let encoder_slot = ctx.encoder_slot.clone();
             let stats = crate::stats::global().cloned();
-            let watch_tcp = ctx.hevc420 && self.tcp_max_frame_lag > 0;
+            let watch_tcp = !use_avc444 && self.tcp_max_frame_lag > 0;
             let tcp_probe = (stats.is_some() || watch_tcp)
                 .then(tokio::runtime::Handle::try_current)
                 .and_then(Result::ok)
                 .map(|runtime| TcpDispatchProbe::new(runtime, stats, watch_tcp));
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped, use_avc444, tcp_probe))
+                .spawn(move || gfx.ship_loop(rx, shipped, encoder_slot, use_avc444, tcp_probe))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
@@ -3529,7 +3575,16 @@ impl Gfx {
             // few seconds" stall, far more likely once acks ride the UDP tunnel).
             // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
             // lock order consistent (server_handle is never nested under ctx).
-            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
+            let (
+                surface_id,
+                width,
+                height,
+                epoch,
+                server_handle,
+                last_shipped,
+                ship_times,
+                hevc420,
+            ) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let Some(ctx) = guard
                     .as_mut()
@@ -3556,8 +3611,22 @@ impl Gfx {
                     ctx.server_handle.clone(),
                     ctx.last_shipped_frame_id.clone(),
                     ctx.ship_times.clone(),
+                    ctx.hevc420,
                 )
             };
+
+            let regions = [Avc420Region {
+                left: 0,
+                top: 0,
+                right: width.saturating_sub(1),
+                bottom: height.saturating_sub(1),
+                quantization_parameter: 22,
+                quality: 100,
+            }];
+            // Prepare AVC420 outside the graphics lock, which also handles
+            // ACKs. Copy the encoded slices directly into the final bitmap.
+            let avc420 = (auxiliary.is_none() && !hevc420)
+                .then(|| avc420_bitmap_payload(f, &regions, self.wire_format));
 
             // Phase 2: lock `server_handle` ALONE (ctx already released).
             let mut server = server_handle.lock().unwrap();
@@ -3566,17 +3635,6 @@ impl Gfx {
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
             let payload_len = {
-                // Region = full actual frame, inclusive bounds. QP 22 /
-                // quality 100 are first-light defaults; tuned in M3. Rebuilt
-                // per frame because `Avc420Region` isn't `Copy`.
-                let region = Avc420Region {
-                    left: 0,
-                    top: 0,
-                    right: width.saturating_sub(1),
-                    bottom: height.saturating_sub(1),
-                    quantization_parameter: 22,
-                    quality: 100,
-                };
                 let ts_ms =
                     u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
                 // Diagnostic for the reconnect-blank investigation: keyframes
@@ -3588,7 +3646,6 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                let regions = [region];
                 let (sent, payload_len) = match auxiliary {
                     Some(aux) => {
                         let payload = self.frame_payload_avc444(f);
@@ -3603,11 +3660,7 @@ impl Gfx {
                         );
                         (sent, payload.len() + chroma.len())
                     }
-                    None if matches!(
-                        server.negotiated_capabilities(),
-                        Some(CapabilitySet::Hevc420V112)
-                    ) =>
-                    {
+                    None if hevc420 => {
                         let metadata = encode_avc420_bitmap_stream(&regions, &[]);
                         let metadata_len = metadata.len();
                         let stream = hevc_v112_payload(f, metadata)?;
@@ -3618,10 +3671,11 @@ impl Gfx {
                         )
                     }
                     None => {
-                        let payload = self.frame_payload(f);
+                        let (bitmap, payload_len) =
+                            avc420.ok_or_else(|| anyhow!("EGFX AVC420 bitmap missing"))?;
                         (
-                            server.send_avc420_frame(surface_id, &payload, &regions, ts_ms),
-                            payload.len(),
+                            server.send_prepared_avc420_frame(surface_id, bitmap, &regions, ts_ms),
+                            payload_len,
                         )
                     }
                 };
@@ -3703,23 +3757,9 @@ impl Gfx {
     /// Frame the encoded NALs for the wire per the selected `WireFormat`,
     /// prepending SPS/PPS (from VT's format description) on keyframes.
     fn frame_payload(&self, f: &EncodedFrame) -> Vec<u8> {
-        match self.wire_format {
-            // VT data is already AVCC (length-prefixed); just prepend the
-            // parameter sets as length-prefixed NALs on keyframes.
-            WireFormat::LengthPrefixed => {
-                if !f.is_keyframe || f.parameter_sets.is_empty() {
-                    return f.data.clone();
-                }
-                let mut out = Vec::with_capacity(f.data.len() + 64);
-                for ps in &f.parameter_sets {
-                    out.extend_from_slice(&(ps.len() as u32).to_be_bytes());
-                    out.extend_from_slice(ps);
-                }
-                out.extend_from_slice(&f.data);
-                out
-            }
-            WireFormat::AnnexB => avcc_to_annex_b(&f.data, &f.parameter_sets, f.is_keyframe),
-        }
+        let mut out = Vec::with_capacity(f.data.len() + 64);
+        append_avc_payload(&mut out, f, self.wire_format);
+        out
     }
 }
 
@@ -3950,6 +3990,7 @@ impl GfxServerFactory for Gfx {
             shipped: Arc::new(AtomicU64::new(0)),
             tcp_dispatch: None,
             tcp_dispatch_resumed: Arc::default(),
+            encoder_slot: Arc::default(),
             dims: (0, 0),
             last_ack_at: Instant::now(),
             last_ack_advance_at: Instant::now(),
@@ -4447,15 +4488,22 @@ fn hevc_v112_payload(frame: &EncodedFrame, mut payload: Vec<u8>) -> Result<Vec<u
 /// Rewrite AVCC (4-byte length-prefixed NALs) to Annex-B (`00 00 00 01` start
 /// codes), prepending SPS/PPS on keyframes. Only used when `MACRDP_H264_ANNEXB`
 /// selects Annex-B framing.
+#[cfg(test)]
 fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -> Vec<u8> {
-    const START_CODE: [u8; 4] = [0, 0, 0, 1];
     let mut out = Vec::with_capacity(avcc.len() + 64);
+    append_annex_b(
+        &mut out,
+        avcc,
+        if is_keyframe { parameter_sets } else { &[] },
+    );
+    out
+}
 
-    if is_keyframe {
-        for ps in parameter_sets {
-            out.extend_from_slice(&START_CODE);
-            out.extend_from_slice(ps);
-        }
+fn append_annex_b(out: &mut Vec<u8>, avcc: &[u8], parameter_sets: &[Vec<u8>]) {
+    const START_CODE: [u8; 4] = [0, 0, 0, 1];
+    for ps in parameter_sets {
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(ps);
     }
 
     let mut i = 0;
@@ -4475,11 +4523,65 @@ fn avcc_to_annex_b(avcc: &[u8], parameter_sets: &[Vec<u8>], is_keyframe: bool) -
         out.extend_from_slice(&avcc[i..i + nal_len]);
         i += nal_len;
     }
-    out
+}
+
+fn avc420_bitmap_payload(
+    frame: &EncodedFrame,
+    regions: &[Avc420Region],
+    format: WireFormat,
+) -> (Vec<u8>, usize) {
+    let mut bitmap = encode_avc420_bitmap_stream(regions, &[]);
+    let metadata_len = bitmap.len();
+    append_avc_payload(&mut bitmap, frame, format);
+    let payload_len = bitmap.len() - metadata_len;
+    (bitmap, payload_len)
+}
+
+fn append_avc_payload(out: &mut Vec<u8>, frame: &EncodedFrame, format: WireFormat) {
+    let parameter_sets = if frame.is_keyframe {
+        frame.parameter_sets.as_slice()
+    } else {
+        &[]
+    };
+    let parameter_bytes = parameter_sets
+        .iter()
+        .map(|unit| 4 + unit.len())
+        .sum::<usize>();
+    out.reserve_exact(frame.data.len() + parameter_bytes);
+    match format {
+        WireFormat::AnnexB => append_annex_b(out, &frame.data, parameter_sets),
+        WireFormat::LengthPrefixed => {
+            for unit in parameter_sets {
+                out.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+                out.extend_from_slice(unit);
+            }
+            out.extend_from_slice(&frame.data);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn encoder_retirement_wakes_only_a_waiting_capture() {
+        use super::{AtomicU64, EncoderSlotRetry};
+        use std::time::Duration;
+        let slot = EncoderSlotRetry::default();
+        let retired = AtomicU64::new(0);
+
+        slot.retire(&retired);
+        assert!(tokio::time::timeout(Duration::ZERO, slot.ready.notified())
+            .await
+            .is_err());
+        assert!(!slot.is_full(2, &retired, 2));
+        assert!(slot.is_full(3, &retired, 2));
+        slot.retire(&retired);
+        assert!(tokio::time::timeout(Duration::ZERO, slot.ready.notified())
+            .await
+            .is_ok());
+        assert!(!slot.is_full(3, &retired, 2));
+    }
+
     #[test]
     fn hevc_inter_frame_uses_one_annex_b_nal_and_its_full_size() {
         let mut frame = super::EncodedFrame {
@@ -7196,6 +7298,81 @@ mod tests {
         assert_eq!(&out[18..20], &[0x65, 0x88]);
     }
 
+    #[test]
+    fn avc420_prepared_bitmap_matches_legacy_framing() {
+        let regions = [Avc420Region::new(0, 0, 1919, 1079, 22, 100)];
+        let mut frame = EncodedFrame {
+            data: vec![0, 0, 0, 2, 0x65, 0x88, 0, 0, 0, 3, 0x06, 0x01, 0x80],
+            parameter_sets: vec![vec![0x67, 0x42, 0x00], vec![0x68, 0xCE, 0x06]],
+            is_keyframe: true,
+            pts: 0,
+        };
+        for is_keyframe in [true, false] {
+            frame.is_keyframe = is_keyframe;
+            let annex_b = avcc_to_annex_b(&frame.data, &frame.parameter_sets, is_keyframe);
+            let mut avcc = Vec::new();
+            if is_keyframe {
+                avcc.extend_from_slice(&[0, 0, 0, 3, 0x67, 0x42, 0x00]);
+                avcc.extend_from_slice(&[0, 0, 0, 3, 0x68, 0xCE, 0x06]);
+            }
+            avcc.extend_from_slice(&frame.data);
+            for (format, expected) in [
+                (WireFormat::AnnexB, annex_b),
+                (WireFormat::LengthPrefixed, avcc),
+            ] {
+                let (prepared, payload_len) = avc420_bitmap_payload(&frame, &regions, format);
+                assert_eq!(prepared, encode_avc420_bitmap_stream(&regions, &expected));
+                assert_eq!(payload_len, expected.len());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "performance comparison; run in release mode"]
+    fn bench_avc420_packetization() {
+        use std::hint::black_box;
+
+        let regions = [Avc420Region::new(0, 0, 3839, 2159, 22, 100)];
+        for size in [16_384u32, 131_072, 524_288] {
+            let frame = EncodedFrame {
+                data: [size.to_be_bytes().to_vec(), vec![0x41; size as usize]].concat(),
+                is_keyframe: false,
+                parameter_sets: vec![],
+                pts: 0,
+            };
+            let old = || {
+                let payload = avcc_to_annex_b(&frame.data, &frame.parameter_sets, false);
+                encode_avc420_bitmap_stream(&regions, &payload)
+            };
+            let new = || avc420_bitmap_payload(&frame, &regions, WireFormat::AnnexB).0;
+            assert_eq!(old(), new());
+            let measure = |build: &dyn Fn() -> Vec<u8>| {
+                let start = Instant::now();
+                for _ in 0..1000 {
+                    black_box(build());
+                }
+                start.elapsed().as_secs_f64() * 1000.0
+            };
+            let mut old_us = Vec::new();
+            let mut new_us = Vec::new();
+            for round in 0..7 {
+                if round % 2 == 0 {
+                    old_us.push(measure(&old));
+                    new_us.push(measure(&new));
+                } else {
+                    new_us.push(measure(&new));
+                    old_us.push(measure(&old));
+                }
+            }
+            old_us.sort_by(f64::total_cmp);
+            new_us.sort_by(f64::total_cmp);
+            println!(
+                "AVC420 {size} bytes: old {:.2} µs, prepared {:.2} µs",
+                old_us[3], new_us[3]
+            );
+        }
+    }
+
     /// A real per-connection context, built the way the server builds one: at
     /// TCP accept, through `build_server_with_handle`.
     fn gfx_with_context() -> Gfx {
@@ -7276,24 +7453,29 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a VideoToolbox HEVC encoder"]
     async fn stalled_tcp_hevc_resumes_capture_after_dispatch() -> anyhow::Result<()> {
+        assert_stalled_tcp_resumes_capture(crate::videotoolbox::PictureCodec::Hevc420).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a VideoToolbox H.264 encoder"]
+    async fn stalled_tcp_avc420_resumes_capture_after_dispatch() -> anyhow::Result<()> {
+        assert_stalled_tcp_resumes_capture(crate::videotoolbox::PictureCodec::Avc420).await
+    }
+
+    async fn assert_stalled_tcp_resumes_capture(
+        codec: crate::videotoolbox::PictureCodec,
+    ) -> anyhow::Result<()> {
         use super::{FrameSubmission, TcpDispatchProbe, VideoEncoder, TCP_DISPATCH_STALL};
         use screencapturekit::cv::CVPixelBuffer;
 
         let mut gfx = gfx_with_context();
         gfx.tcp_max_frame_lag = 2;
-        let encoder = super::Encoder::new_with_codec(
-            320,
-            240,
-            60,
-            4_000_000,
-            2.0,
-            crate::videotoolbox::PictureCodec::Hevc420,
-        )?;
+        let encoder = super::Encoder::new_with_codec(320, 240, 60, 4_000_000, 2.0, codec)?;
         let shipped = {
             let mut guard = gfx.ctx.lock().unwrap();
             let ctx = guard.as_mut().unwrap();
             ctx.is_ready = true;
-            ctx.hevc420 = true;
+            ctx.hevc420 = codec == crate::videotoolbox::PictureCodec::Hevc420;
             ctx.need_keyframe = false;
             ctx.surface_id = Some(0);
             ctx.dims = (320, 240);
@@ -7350,7 +7532,7 @@ mod tests {
         assert_eq!(ctx.submitted.load(Ordering::Relaxed), 1);
         assert!(!ctx.need_keyframe);
         let Some(VideoEncoder::Avc420(encoder)) = ctx.encoder.as_mut() else {
-            panic!("expected HEVC encoder");
+            panic!("expected 4:2:0 encoder");
         };
         let frames = encoder.flush()?;
         assert_eq!(frames.len(), 1);

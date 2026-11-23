@@ -49,6 +49,12 @@ struct LiveStats {
     let videoShippingErrors: Double?
     let captureToSubmit: TimingTotals?
     let tcpDispatch: TimingTotals?
+    let audioCaptureAge: TimingTotals?
+    let pcmQueueAge: TimingTotals?
+    let pcmQueueDrops: Double?
+    var hasAudioDiagnostics: Bool {
+        audioCaptureAge != nil || pcmQueueAge != nil || pcmQueueDrops != nil
+    }
     var hasVideoDiagnostics: Bool {
         encodePrepared != nil || captureSuperseded != nil || tcpBackpressure != nil
             || encoderSubmissionErrors != nil || videoShippingErrors != nil
@@ -96,6 +102,8 @@ struct LiveStats {
             captureSuperseded: number("capture_superseded"), tcpBackpressure: number("encode_tcp_backpressure"),
             encoderSubmissionErrors: number("encode_submit_errors"), videoShippingErrors: number("video_ship_errors"),
             captureToSubmit: timing("capture_to_submit"), tcpDispatch: timing("tcp_dispatch"),
+            audioCaptureAge: timing("audio_capture_age"),
+            pcmQueueAge: timing("pcm_queue_age"), pcmQueueDrops: number("pcm_queue_drops"),
             ackSamples: number("ack_samples").flatMap { $0 < Double(Int.max) ? Int($0) : nil }, ackSampleMs: number("ack_sample_uptime_ms"),
             ackRttMs: number("ack_rtt_ms"), ackQueueMs: number("ack_queue_ms"))
     }
@@ -119,6 +127,9 @@ struct PerformanceSample: Identifiable {
     let videoShippingErrors: Double?
     let captureToSubmitMs: Double?
     let tcpDispatchMs: Double?
+    let audioCaptureAgeMs: Double?
+    let pcmQueueAgeMs: Double?
+    let pcmQueueDrops: Double?
 }
 
 struct PerformanceHistory {
@@ -174,7 +185,10 @@ struct PerformanceHistory {
             encoderSubmissionErrors: delta(live.encoderSubmissionErrors, before.encoderSubmissionErrors),
             videoShippingErrors: delta(live.videoShippingErrors, before.videoShippingErrors),
             captureToSubmitMs: live.captureToSubmit?.averageMilliseconds(since: before.captureToSubmit),
-            tcpDispatchMs: live.tcpDispatch?.averageMilliseconds(since: before.tcpDispatch)))
+            tcpDispatchMs: live.tcpDispatch?.averageMilliseconds(since: before.tcpDispatch),
+            audioCaptureAgeMs: live.audioCaptureAge?.averageMilliseconds(since: before.audioCaptureAge),
+            pcmQueueAgeMs: live.pcmQueueAge?.averageMilliseconds(since: before.pcmQueueAge),
+            pcmQueueDrops: delta(live.pcmQueueDrops, before.pcmQueueDrops)))
         samples.removeAll { time.timeIntervalSince($0.time) > 60 }
         if samples.count > 30 { samples.removeFirst(samples.count - 30) }
     }

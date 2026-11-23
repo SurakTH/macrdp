@@ -59,6 +59,7 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             "AVC444": "0",
             "PREFER_HEVC": "0",
             "HEVC_HIGH_SPEED": "0",
+            "H264_MAIN_PROFILE": "0",
             "CAPTURE_SIZE": "",
             "UDP_MIGRATE_EGFX": "0",
             "KEYFRAME_INTERVAL": "2.0",
@@ -146,7 +147,7 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
             if key == "H264_MAX_UNACKED_FRAMES" {
                 return UInt32(SettingsModel.pacingLimit(in: config)) == UInt32(value)
             }
-            if ["CAPTURE_NV12", "ENABLE_LOSSY_AUDIO", "PREFER_HEVC", "HEVC_HIGH_SPEED"].contains(key) {
+            if ["CAPTURE_NV12", "ENABLE_LOSSY_AUDIO", "PREFER_HEVC", "HEVC_HIGH_SPEED", "H264_MAIN_PROFILE"].contains(key) {
                 return SettingsModel.settingEnabled(key, in: config) == (value == "1")
             }
             return config[key, default: Self.settingFallback(key)] == value
@@ -154,7 +155,10 @@ enum PerformanceProfile: String, CaseIterable, Identifiable {
     }
 
     static func settingFallback(_ key: String) -> String {
-        key == "RESPONSIVE_CAPTURE" ? "0" : ""
+        switch key {
+        case "RESPONSIVE_CAPTURE", "H264_MAIN_PROFILE": return "0"
+        default: return ""
+        }
     }
 }
 
@@ -323,6 +327,7 @@ final class SettingsModel: ObservableObject {
             ("Frame rate limit", "\(fps) fps"),
             ("Bitrate ceiling", video ? "\(bitrate) Mbps" : "Unavailable"),
             ("Video codec", video ? codec : "Bitmap / RemoteFX"),
+            ("H.264 Main Profile", toggle("H264_MAIN_PROFILE", when: preference == .h264 && !avc444)),
             ("Prioritize HEVC encoding speed", toggle("HEVC_HIGH_SPEED", when: preference == .hevc)),
             ("Adaptive bitrate", toggle("ADAPTIVE_BITRATE", when: video)),
             ("Capture mode", video && !avc444 && settingEnabled("CAPTURE_NV12", in: config) ? "NV12" : "Standard"),
@@ -335,6 +340,7 @@ final class SettingsModel: ObservableObject {
             ("UDP network offer", toggle("ENABLE_UDP_MULTITRANSPORT")),
             ("Video over UDP", toggle("UDP_MIGRATE_EGFX", when: video)),
             ("Audio format", settingEnabled("ENABLE_AAC", in: config) ? "AAC when supported" : "PCM"),
+            ("Preferred audio capture", settingEnabled("AUDIO_CORE_TAP", in: config) ? "Core Audio Tap" : "ScreenCaptureKit"),
             ("Loss-resilient UDP audio", toggle("ENABLE_LOSSY_AUDIO")),
             ("Restore minimized windows", toggle("UNMINIMIZE")),
             ("Blank screen recovery", toggle("BLANK_RECOVERY")),
@@ -355,6 +361,11 @@ final class SettingsModel: ObservableObject {
         if portNumber.isEmpty || !portNumber.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 })
             || UInt16(portNumber).map({ $0 > 0 }) != true {
             return "Port must be a whole number from 1 to 65535."
+        }
+        let statsPort = string("STATS_PORT").trimmingCharacters(in: .whitespaces)
+        if !statsPort.isEmpty,
+           (!statsPort.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) || UInt16(statsPort).map({ $0 > 0 }) != true) {
+            return "Statistics port must be a whole number from 1 to 65535, or empty for 40245."
         }
         let invalid = allowedIPTokens.filter {
             IPv4Address($0) == nil && IPv6Address($0) == nil
@@ -476,6 +487,7 @@ final class SettingsModel: ObservableObject {
         "ALT_Q_QUIT": "--alt-q-quit",
         "REVERSE_SCROLL": "--reverse-scroll",
         "ENABLE_LOSSY_AUDIO": "--enable-lossy-audio",
+        "AUDIO_CORE_TAP": "--audio-core-tap",
         "ENABLE_MICROPHONE_REDIRECTION": "--enable-microphone-redirection",
         "NETWORK_AUTODETECT": "--network-autodetect",
         "RICH_CLIPBOARD": "--no-rich-clipboard",
@@ -703,7 +715,7 @@ final class SettingsModel: ObservableObject {
 
     private static let presetSwitches = [
         "CAPTURE_NV12", "REVERSE_SCROLL", "ALT_Q_QUIT", "ALT_BACKTICK_SWITCH",
-        "ALT_SPACE_SPOTLIGHT", "ENABLE_LOSSY_AUDIO",
+        "ALT_SPACE_SPOTLIGHT", "ENABLE_LOSSY_AUDIO", "AUDIO_CORE_TAP",
     ]
 
     func applyProfile(_ profile: PerformanceProfile) {
